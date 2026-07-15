@@ -15,10 +15,14 @@ The plugin declares handlers for:
 
 Tool matchers currently include `Bash`, `exec_command`, `apply_patch`, `Edit`, `Write`, and `mcp__.*`. Host naming is version-specific. A tool omitted by the host or matcher receives no protection from this plugin.
 
+Each command handler declares a POSIX `command` and a PowerShell `commandWindows`. Both resolve the script from host-provided `PLUGIN_ROOT`; Windows additionally requires host-provided `PLUGIN_DATA`. Hook stdin is decoded as strict UTF-8 and stdout is emitted as ASCII-safe JSON.
+
 ## Failure behavior
 
 - Invalid JSON blocks.
+- Invalid UTF-8 blocks.
 - Internal validation errors block stateful events.
+- Corrupt, unreadable, unsupported-schema, symlinked, or reparse-point state blocks and is not silently replaced.
 - Missing `session_id` blocks stateful events.
 - Unknown event names return an empty response because the plugin has no declared policy for them.
 - Hook timeout behavior belongs to the host and must be verified for each supported Codex version.

@@ -6,6 +6,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Checking prompt safety"
           }
@@ -19,6 +20,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Checking command and data safety"
           }
@@ -32,6 +34,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Reviewing approval boundary"
           }
@@ -45,6 +48,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Checking tool output"
           }
@@ -57,6 +61,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Recording Agent lifecycle"
           }
@@ -69,6 +74,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Closing Agent lifecycle"
           }
@@ -82,6 +88,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Saving control-plane handoff"
           }
@@ -94,6 +101,7 @@
           {
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
             "statusMessage": "Reconciling active Agents"
           }

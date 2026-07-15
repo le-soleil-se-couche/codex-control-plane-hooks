@@ -25,7 +25,7 @@ The plugin does not impose an Agent-count ceiling. Runtime capacity remains owne
 - Sensitive-disclosure approvals are disabled.
 - No organization markers or private data terms are bundled.
 - Release code initiates no network connections.
-- State expires after seven days and is removed after a successful Stop event.
+- Session state is logically expired after seven days. A successful Stop removes the session JSON while retaining a lock sentinel for cross-process ordering.
 - The Rules example contains no active allow rule.
 
 ## Install
@@ -40,6 +40,8 @@ codex plugin list --marketplace codex-control-plane-hooks
 
 Codex may require explicit Hook trust after installation. Review `plugins/codex-control-plane-hooks/hooks/hooks.json` and the invoked Python script before accepting trust in the Codex app.
 
+The `main` ref is convenient for review builds. Pin a reviewed commit SHA for reproducible or controlled deployments.
+
 To update the marketplace snapshot:
 
 ```bash
@@ -48,7 +50,7 @@ codex plugin marketplace upgrade codex-control-plane-hooks
 
 ## Configure
 
-The plugin reads `policy.json` from the host-provided `PLUGIN_DATA` directory. To use a separate file, set `CONTROL_PLANE_POLICY` for the Codex process only after reviewing the security impact.
+The plugin reads `policy.json` from the host-provided `PLUGIN_DATA` directory. On macOS and Linux, an absolute `CONTROL_PLANE_POLICY` path can select a separate file after its ownership and mode are reviewed. Windows keeps policy inside `PLUGIN_DATA` so it inherits the host-managed directory boundary.
 
 Start from [`examples/policy.example.json`](examples/policy.example.json). Keep real markers and terms in your private plugin-data directory; never commit that file.
 
@@ -68,29 +70,42 @@ See [Configuration](docs/configuration.md), [Hook contract](docs/hook-contract.m
 
 ## Verify locally
 
+macOS or Linux:
+
 ```bash
 python3 -B -m unittest discover -s tests -v
+python3 scripts/smoke_hook_manifest.py
 python3 scripts/check_release.py
 python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py \
   plugins/codex-control-plane-hooks
 ```
 
-For a private release-boundary check, create a UTF-8 file outside the repository with one literal marker per line, set its permissions to `0600`, and pass it explicitly:
+Windows PowerShell:
+
+```powershell
+python -B -m unittest discover -s tests -v
+python scripts/smoke_hook_manifest.py
+python scripts/check_release.py
+```
+
+For a private release-boundary check on macOS or Linux, create a UTF-8 file outside the repository with one literal marker per line, set its permissions to `0600`, and pass it explicitly:
 
 ```bash
 python3 scripts/check_release.py \
   --private-patterns-file /absolute/path/outside/repository/private-patterns
 ```
 
-The checker scans its own source, filenames, compound-suffix examples, and every bounded file that decodes as text. It reports rule identifiers without echoing private markers. GitHub Actions additionally runs Gitleaks against the complete reachable Git history. The plugin validator path may differ outside the Codex desktop distribution.
+The checker scans its own source, filenames, compound-suffix examples, and every bounded release file. Binary files are rejected. Findings report rule identifiers without echoing private markers. GitHub Actions additionally runs Gitleaks against the complete reachable Git history. The plugin validator path may differ outside the Codex desktop distribution. External private-marker files are intentionally rejected on Windows because this dependency-free checker cannot validate NTFS owner and DACL semantics.
 
 ## Compatibility
 
-| Codex | Surface | OS / arch | Python | Protocol tests | Live install smoke | Date |
-|---|---|---|---|---:|---|---|
-| 0.144.2 | bundled desktop CLI | macOS arm64 | 3.9.6 | 94 passed | [UNRUN] clean profile | 2026-07-15 |
+| Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
+|---|---|---|---|---|---|
+| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 113 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-15 |
+| GitHub Actions runtime | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Linux Codex host | 2026-07-15 |
+| GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Windows Codex host | 2026-07-15 |
 
-Compatibility is limited to the rows above. Hook event names, matchers, output schemas, and trust behavior can change between Codex versions.
+Runtime support and Codex-host compatibility are separate claims. Hook event names, matchers, output schemas, environment variables, and trust behavior can change between Codex versions.
 
 ## Known limits
 
@@ -101,7 +116,8 @@ Compatibility is limited to the rows above. Hook event names, matchers, output s
 - Natural-language approval parsing remains experimental even when explicitly enabled.
 - Browser, Computer Use, and connector behavior depends on the tool name and Hook events exposed by the host.
 - The project does not defend a compromised OS account, Python runtime, Codex binary, plugin cache, or writable policy file.
-- Windows is currently unsupported; Linux support depends on CI and remains version-scoped.
+- Native Windows uses `commandWindows`, requires an absolute host-provided `PLUGIN_DATA`, rejects external `CONTROL_PLANE_POLICY`, and relies on the host directory's inherited NTFS DACL. The Hook rejects observed symlinks and reparse points but does not independently audit every DACL ACE.
+- Linux and Windows Codex-host installation remain `[UNRUN]` until a clean-profile host smoke is recorded; their Python runtime and packaged Hook commands are CI-gated.
 
 ## Publishing sanitized configurations
 

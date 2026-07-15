@@ -25,6 +25,7 @@ REQUIRED = (
     PLUGIN / ".codex-plugin" / "plugin.json",
     PLUGIN / "hooks" / "hooks.json",
     PLUGIN / "scripts" / "control_plane_hook.py",
+    ROOT / "scripts" / "smoke_hook_manifest.py",
 )
 MAX_SCAN_FILE_BYTES = 2_000_000
 MAX_PRIVATE_PATTERNS_BYTES = 64_000
@@ -42,12 +43,36 @@ TEXT_LIKE_SUFFIXES = {
     ".yml",
 }
 FORBIDDEN_RELEASE_SUFFIXES = {".key", ".p12", ".pem", ".pfx"}
+_WINDOWS_SEPARATOR_PATTERN = r"(?:/|\\{1,4})"
+_WINDOWS_LEADING_BACKSLASH_PATTERN = r"\\{2,8}"
 GENERIC_PRIVATE_PATTERNS = (
     ("absolute-macos-home", re.compile(re.escape("/") + "Users/" + r"[^/\s\"']+", re.IGNORECASE)),
     ("absolute-linux-home", re.compile(re.escape("/") + "home/" + r"[^/\s\"']+", re.IGNORECASE)),
+    (
+        "absolute-windows-home",
+        re.compile(
+            rf"(?i)(?:\b[A-Z]:{_WINDOWS_SEPARATOR_PATTERN}|/mnt/[a-z]/|"
+            rf"{_WINDOWS_LEADING_BACKSLASH_PATTERN}\?{_WINDOWS_SEPARATOR_PATTERN}"
+            rf"[A-Z]:{_WINDOWS_SEPARATOR_PATTERN}|"
+            rf"{_WINDOWS_LEADING_BACKSLASH_PATTERN}"
+            rf"(?:\?{_WINDOWS_SEPARATOR_PATTERN}UNC{_WINDOWS_SEPARATOR_PATTERN})?"
+            rf"[^\\/\s\"']+{_WINDOWS_SEPARATOR_PATTERN}"
+            rf"[^\\/\s\"']+{_WINDOWS_SEPARATOR_PATTERN})"
+            rf"Users{_WINDOWS_SEPARATOR_PATTERN}[^\\/\s\"']+"
+        ),
+    ),
 )
 SECRET_PATTERNS = (
     ("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    ("bearer-token", re.compile(r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._~+/=-]{16,}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    (
+        "credential-assignment",
+        re.compile(
+            r"(?i)\b(api[_-]?key|token|secret|password|client[_-]?secret|access[_-]?key)"
+            r"\s*[:=]\s*['\"]?[A-Za-z0-9_./+=:-]{16,}"
+        ),
+    ),
     ("github-pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
@@ -78,6 +103,8 @@ def release_files(root: Path = ROOT) -> list[Path]:
 def _load_private_patterns(path: Path | None) -> list[tuple[str, re.Pattern[str]]]:
     if path is None:
         return []
+    if os.name == "nt":
+        raise ValueError("private pattern files require a POSIX host with owner and mode checks")
     candidate = path.expanduser()
     try:
         info = os.stat(candidate, follow_symlinks=False)
@@ -89,7 +116,7 @@ def _load_private_patterns(path: Path | None) -> list[tuple[str, re.Pattern[str]
         raise ValueError("private pattern file exceeds the size limit")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise ValueError("private pattern file must be owned by the current user")
-    if info.st_mode & 0o077:
+    if os.name != "nt" and info.st_mode & 0o077:
         raise ValueError("private pattern file permissions must be 0600 or stricter")
     resolved = candidate.resolve()
     if _inside(resolved, ROOT.resolve()):
@@ -129,11 +156,16 @@ def _read_release_text(path: Path, errors: list[str]) -> str | None:
         if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
             return data.decode("utf-16")
         if b"\x00" in data:
+            errors.append(f"binary release file is not allowed: {relative}")
             return None
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
-        if path.suffix.lower() in TEXT_LIKE_SUFFIXES:
-            errors.append(f"text-like file is not valid UTF-8/UTF-16: {relative}")
+        kind = (
+            "text-like file is not valid UTF-8/UTF-16"
+            if path.suffix.lower() in TEXT_LIKE_SUFFIXES
+            else "binary release file is not allowed"
+        )
+        errors.append(f"{kind}: {relative}")
         return None
 
 
@@ -192,6 +224,12 @@ def _validate_metadata(errors: list[str]) -> None:
 
     if manifest.get("name") != "codex-control-plane-hooks":
         errors.append("plugin manifest name mismatch")
+    version = manifest.get("version")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        errors.append("plugin manifest version is not semantic")
+    elif f"## [{version}]" not in changelog:
+        errors.append("plugin manifest version is missing from CHANGELOG.md")
     if "hooks" in manifest:
         errors.append("plugin manifest must rely on default hooks/hooks.json discovery")
     entries = marketplace.get("plugins") if isinstance(marketplace, dict) else None
@@ -203,6 +241,24 @@ def _validate_metadata(errors: list[str]) -> None:
     matcher = pretool[0].get("matcher", "") if pretool else ""
     if "exec_command" not in matcher:
         errors.append("PreToolUse matcher does not include exec_command")
+    hook_events = hooks.get("hooks", {}) if isinstance(hooks, dict) else {}
+    if isinstance(hook_events, dict):
+        for event_name, groups in hook_events.items():
+            event_groups = groups if isinstance(groups, list) else []
+            for group in event_groups:
+                handlers = group.get("hooks", []) if isinstance(group, dict) else []
+                for handler in handlers:
+                    if not isinstance(handler, dict) or handler.get("type") != "command":
+                        continue
+                    posix_command = handler.get("command")
+                    if not isinstance(posix_command, str) or "$PLUGIN_ROOT" not in posix_command:
+                        errors.append(f"{event_name} command hook lacks a PLUGIN_ROOT-based POSIX command")
+                    windows_command = handler.get("commandWindows")
+                    if not isinstance(windows_command, str) or "$env:PLUGIN_ROOT" not in windows_command:
+                        errors.append(f"{event_name} command hook lacks a PLUGIN_ROOT-based commandWindows")
+                    timeout = handler.get("timeout")
+                    if not isinstance(timeout, int) or timeout <= 5 or timeout > 10:
+                        errors.append(f"{event_name} command hook timeout must be between 6 and 10 seconds")
 
     rules = (ROOT / "examples" / "rules" / "default.rules").read_text(encoding="utf-8")
     if any(line.lstrip().startswith("prefix_rule(") for line in rules.splitlines()):
@@ -222,7 +278,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--private-patterns-file",
         type=Path,
-        help="Repository-external 0600 UTF-8 file with one literal private marker per line.",
+        help="Repository-external private UTF-8 file with one literal private marker per line.",
     )
     return parser.parse_args(argv)
 

@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-24.04, macos-14, windows-2022]
         python: ["3.9", "3.12"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -25,9 +25,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Protocol and release tests
-        run: python3 -B -m unittest discover -s tests -v
+        run: python -B -m unittest discover -s tests -v
+      - name: Packaged Hook command smoke
+        run: python scripts/smoke_hook_manifest.py
       - name: Public release boundary
-        run: python3 scripts/check_release.py
+        run: python scripts/check_release.py
 
   secret-scan:
     runs-on: ubuntu-latest
