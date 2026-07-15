@@ -9,8 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -124,12 +126,19 @@ class HookProtocolTests(unittest.TestCase):
         commands = [
             r"Remove-Item -Recurse -Force C:\work\cache",
             r"Remove-Item -Recurse C:\work\cache",
+            r"Remove-Item -Rec C:\work\cache",
             r"ri -r C:\work\cache",
+            r"ri -Rec C:\work\cache",
+            r"del -Rec C:\work\cache\*",
+            r"erase -Rec C:\work\cache\*",
+            r"rd -Rec C:\work\cache",
             r"cmd.exe /c rmdir /s /q C:\work\cache",
             r"cmd.exe /d /s /c echo hello",
             r"del /s C:\work\cache\*",
             r"powershell.exe -NoProfile -Command Get-ChildItem",
             r"powershell.exe -NoProfile -enc QQBBAEEA",
+            r"iex 'Get-ChildItem'",
+            r"Invoke-Expression 'Get-ChildItem'",
             r"Start-Process powershell.exe -Verb RunAs",
             r"Set-ExecutionPolicy Bypass -Scope CurrentUser",
             r"winget install Example.Package",
@@ -142,6 +151,15 @@ class HookProtocolTests(unittest.TestCase):
             with self.subTest(command=command):
                 result = self.bash(command)
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_windows_command_words_in_read_only_searches_are_allowed(self) -> None:
+        for command in [
+            "rg powershell README.md",
+            "grep cmd file.txt",
+            "rg 'Remove-Item -Recurse' docs",
+        ]:
+            with self.subTest(command=command):
+                self.assertEqual({}, self.bash(command))
 
     def test_windows_paths_are_recognized_as_durable_and_external(self) -> None:
         module = __import__("control_plane_hook")
@@ -163,6 +181,16 @@ class HookProtocolTests(unittest.TestCase):
             "dnf upgrade example-package",
             "apk add example-package",
             "pacman -S example-package",
+            "nala install example-package",
+            "microdnf upgrade example-package",
+            "brew install example-package",
+            "aptitude install example-package",
+            "nix profile install example-package",
+            "nix-env -i example-package",
+            "pkexec sh -c 'rm -rf /tmp/cache'",
+            "doas apt install example-package",
+            "runuser -u root -- rm -rf /tmp/cache",
+            "su -c 'rm -rf /tmp/cache'",
         ]
         for command in commands:
             with self.subTest(command=command):
@@ -175,6 +203,15 @@ class HookProtocolTests(unittest.TestCase):
             "rclone copy file remote:bucket",
             "aws s3 cp file s3://example-bucket/",
             "gcloud storage cp file gs://example-bucket/",
+            "gsutil cp file gs://example-bucket/",
+            "azcopy copy file https://example.invalid/container/",
+            "nc example.invalid 443",
+            "netcat example.invalid 443",
+            "ncat example.invalid 443",
+            "socat - TCP:example.invalid:443",
+            "lftp example.invalid",
+            "ftp example.invalid",
+            "aria2c https://example.invalid/file",
         ]:
             with self.subTest(command=command):
                 self.assertTrue(module._is_external_tool("Bash", command))
@@ -200,6 +237,73 @@ class HookProtocolTests(unittest.TestCase):
         digest = hashlib.sha256(session.encode("utf-8")).hexdigest()[:24]
         state = json.loads((Path(self.data_dir) / f"session-{digest}.json").read_text(encoding="utf-8"))
         self.assertEqual({f"agent-{index}" for index in range(8)}, set(state["active_agents"]))
+
+    def test_concurrent_stop_and_agent_start_preserve_the_agent_ledger(self) -> None:
+        session = "concurrent-stop-start-session"
+        barrier = threading.Barrier(2)
+
+        def invoke(event: dict) -> dict:
+            barrier.wait()
+            payload = {
+                "session_id": session,
+                "turn_id": "race-turn",
+                "cwd": DEFAULT_CWD,
+                **event,
+            }
+            return self.run_raw(json.dumps(payload))[1]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    invoke,
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "agent_id": "race-agent",
+                        "agent_type": "test",
+                    },
+                ),
+                executor.submit(
+                    invoke,
+                    {
+                        "hook_event_name": "Stop",
+                        "stop_hook_active": False,
+                        "last_assistant_message": "Done.",
+                    },
+                ),
+            ]
+            results = [future.result() for future in futures]
+
+        self.assertEqual(2, len(results))
+        digest = hashlib.sha256(session.encode("utf-8")).hexdigest()[:24]
+        state = json.loads((Path(self.data_dir) / f"session-{digest}.json").read_text(encoding="utf-8"))
+        self.assertIn("race-agent", state["active_agents"])
+
+    def test_state_lock_timeout_fails_closed(self) -> None:
+        module = __import__("control_plane_hook")
+        fake_fcntl = mock.Mock()
+        fake_fcntl.LOCK_EX = 1
+        fake_fcntl.LOCK_NB = 2
+        fake_fcntl.flock.side_effect = BlockingIOError
+        stream = mock.Mock()
+        stream.fileno.return_value = 9
+        with mock.patch.object(module, "fcntl", fake_fcntl), mock.patch.object(
+            module.time, "monotonic", side_effect=[0.0, 6.0]
+        ):
+            with self.assertRaises(TimeoutError):
+                module._lock_state(stream)
+
+    def test_failed_atomic_state_replace_preserves_existing_state(self) -> None:
+        module = __import__("control_plane_hook")
+        self.prompt("Inspect the project.")
+        state_path = module._state_path(self.session)
+        original = state_path.read_bytes()
+
+        with mock.patch.object(module.os, "replace", side_effect=OSError("simulated replace failure")):
+            with self.assertRaises(OSError):
+                module._mutate_state(self.session, lambda state: state.__setitem__("explicit_expand", True))
+
+        self.assertEqual(original, state_path.read_bytes())
+        self.assertEqual([], list(Path(self.data_dir).glob(".*.tmp")))
 
     def test_legacy_state_is_migrated_to_current_schema(self) -> None:
         digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
@@ -234,6 +338,32 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("block", stop_result["decision"])
         self.assertEqual(malformed, state_path.read_text(encoding="utf-8"))
+
+    def test_wrongly_typed_state_fails_closed_without_replacement(self) -> None:
+        digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
+        state_path = Path(self.data_dir) / f"session-{digest}.json"
+        invalid_state = json.dumps(
+            {
+                "schema_version": 2,
+                "active_agents": [],
+                "updated_at": int(time.time()),
+            }
+        )
+        state_path.write_text(invalid_state, encoding="utf-8")
+
+        result = self.bash("pwd")
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual(invalid_state, state_path.read_text(encoding="utf-8"))
+
+        stop_result = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+                "last_assistant_message": "Done.",
+            }
+        )
+        self.assertEqual("block", stop_result["decision"])
+        self.assertEqual(invalid_state, state_path.read_text(encoding="utf-8"))
 
     def test_expired_state_is_reinitialized(self) -> None:
         digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]

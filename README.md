@@ -101,7 +101,7 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 108 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-15 |
+| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 113 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-15 |
 | GitHub Actions runtime | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Linux Codex host | 2026-07-15 |
 | GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Windows Codex host | 2026-07-15 |
 

@@ -43,15 +43,22 @@ TEXT_LIKE_SUFFIXES = {
     ".yml",
 }
 FORBIDDEN_RELEASE_SUFFIXES = {".key", ".p12", ".pem", ".pfx"}
+_WINDOWS_SEPARATOR_PATTERN = r"(?:/|\\{1,4})"
+_WINDOWS_LEADING_BACKSLASH_PATTERN = r"\\{2,8}"
 GENERIC_PRIVATE_PATTERNS = (
     ("absolute-macos-home", re.compile(re.escape("/") + "Users/" + r"[^/\s\"']+", re.IGNORECASE)),
     ("absolute-linux-home", re.compile(re.escape("/") + "home/" + r"[^/\s\"']+", re.IGNORECASE)),
     (
         "absolute-windows-home",
         re.compile(
-            r"(?i)(?:\b[A-Z]:[\\/]|/mnt/[a-z]/|"
-            r"\\\\(?:\?\\UNC\\)?[^\\/\s]+[\\/][^\\/\s]+[\\/])"
-            r"Users[\\/][^\\/\s\"']+"
+            rf"(?i)(?:\b[A-Z]:{_WINDOWS_SEPARATOR_PATTERN}|/mnt/[a-z]/|"
+            rf"{_WINDOWS_LEADING_BACKSLASH_PATTERN}\?{_WINDOWS_SEPARATOR_PATTERN}"
+            rf"[A-Z]:{_WINDOWS_SEPARATOR_PATTERN}|"
+            rf"{_WINDOWS_LEADING_BACKSLASH_PATTERN}"
+            rf"(?:\?{_WINDOWS_SEPARATOR_PATTERN}UNC{_WINDOWS_SEPARATOR_PATTERN})?"
+            rf"[^\\/\s\"']+{_WINDOWS_SEPARATOR_PATTERN}"
+            rf"[^\\/\s\"']+{_WINDOWS_SEPARATOR_PATTERN})"
+            rf"Users{_WINDOWS_SEPARATOR_PATTERN}[^\\/\s\"']+"
         ),
     ),
 )

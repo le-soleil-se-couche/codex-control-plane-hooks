@@ -95,12 +95,25 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_release_checker_rejects_windows_homes_and_binary_files(self) -> None:
         private_path = "C:\\" + "Users" + r"\example\project"
         private_unc_path = "\\\\" + "server" + r"\share" + "\\" + "Users" + r"\example\project"
-        self.assertTrue(
-            any(pattern.search(private_path) for _, pattern in CHECKER.GENERIC_PRIVATE_PATTERNS)
+        private_extended_path = "\\\\?\\" + "C:\\" + "Users" + r"\example\project"
+        private_extended_unc_path = (
+            "\\\\?\\UNC\\" + "server" + r"\share" + "\\" + "Users" + r"\example\project"
         )
-        self.assertTrue(
-            any(pattern.search(private_unc_path) for _, pattern in CHECKER.GENERIC_PRIVATE_PATTERNS)
-        )
+        candidates = [
+            private_path,
+            private_unc_path,
+            private_extended_path,
+            private_extended_unc_path,
+            json.dumps({"path": private_path}),
+            json.dumps({"path": private_unc_path}),
+            json.dumps({"path": private_extended_path}),
+            json.dumps({"path": private_extended_unc_path}),
+        ]
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                self.assertTrue(
+                    any(pattern.search(candidate) for _, pattern in CHECKER.GENERIC_PRIVATE_PATTERNS)
+                )
 
         errors: list[str] = []
         with tempfile.NamedTemporaryFile(dir=ROOT, suffix=".db", delete=False) as stream:

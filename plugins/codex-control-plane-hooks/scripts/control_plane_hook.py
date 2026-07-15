@@ -70,8 +70,9 @@ _EXTERNAL_TOOL_RE = re.compile(
     r"(?i)(gmail|google|drive|notion|slack|teams|outlook|canva|github|browser|chrome|web|upload|send|post|publish|share)"
 )
 _EXTERNAL_COMMAND_RE = re.compile(
-    r"(?i)\b(curl|wget|scp|sftp|ssh|rsync|rclone|aws|gcloud|az|gh|open|osascript|"
-    r"invoke-webrequest|invoke-restmethod|start-bitstransfer|bitsadmin)\b|"
+    r"(?i)\b(curl|wget|scp|sftp|ssh|rsync|rclone|aws|gcloud|gsutil|az|azcopy|gh|"
+    r"nc|netcat|ncat|socat|lftp|ftp|aria2c|open|osascript|invoke-webrequest|"
+    r"invoke-restmethod|start-bitstransfer|bitsadmin)\b|"
     r"\bcertutil\b[^\r\n]*\s-urlcache\b|\bgit\s+push\b"
 )
 _DURABLE_DESTINATION_RE = re.compile(
@@ -167,6 +168,7 @@ _READ_ONLY_COMMANDS = {
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "branch", "rev-parse", "ls-files", "grep", "remote", "blame", "ls-tree"}
 _CONTROL_TOKENS = {";", "&&", "||", "|", "&"}
 _SHELL_EVAL = {"ash", "bash", "dash", "fish", "ksh", "sh", "zsh"}
+_PRIVILEGE_WRAPPERS = {"doas", "pkexec", "runuser", "su", "sudo"}
 _INTERPRETER_EVAL_FLAGS = {
     "py": {"-c"},
     "python": {"-c"},
@@ -207,9 +209,15 @@ _SYSTEM_PACKAGE_ACTIONS = {
     "apk": {"add", "del", "fix", "upgrade"},
     "apt": {"full-upgrade", "install", "remove", "update", "upgrade"},
     "apt-get": {"dist-upgrade", "install", "remove", "update", "upgrade"},
+    "aptitude": {"full-upgrade", "install", "remove", "update", "upgrade"},
+    "brew": {"install", "reinstall", "uninstall", "update", "upgrade"},
     "dnf": {"install", "remove", "update", "upgrade"},
     "emerge": {"--sync"},
     "flatpak": {"install", "uninstall", "update"},
+    "microdnf": {"install", "remove", "update", "upgrade"},
+    "nala": {"fetch", "install", "remove", "update", "upgrade"},
+    "nix": {"build", "develop", "profile", "run", "shell"},
+    "nix-env": {"--install", "--upgrade", "-i", "-u"},
     "pacman": {"-S", "-R", "-U", "-Syu"},
     "snap": {"install", "refresh", "remove"},
     "yum": {"install", "remove", "update", "upgrade"},
@@ -217,12 +225,16 @@ _SYSTEM_PACKAGE_ACTIONS = {
 }
 _COMMAND_EXECUTABLES = {
     "apk",
+    "aria2c",
     "apt",
     "apt-get",
+    "aptitude",
     "ash",
     "aws",
+    "azcopy",
     "bash",
     "bitsadmin",
+    "brew",
     "busybox",
     "bunx",
     "certutil",
@@ -233,6 +245,7 @@ _COMMAND_EXECUTABLES = {
     "dash",
     "del",
     "dnf",
+    "doas",
     "emerge",
     "eval",
     "erase",
@@ -240,12 +253,24 @@ _COMMAND_EXECUTABLES = {
     "find",
     "fish",
     "flatpak",
+    "ftp",
     "gcloud",
+    "gsutil",
     "git",
     "icacls",
     "invoke-restmethod",
     "invoke-webrequest",
+    "invoke-expression",
+    "iex",
     "ksh",
+    "lftp",
+    "microdnf",
+    "nala",
+    "nc",
+    "ncat",
+    "netcat",
+    "nix",
+    "nix-env",
     "node",
     "npm",
     "npx",
@@ -263,6 +288,7 @@ _COMMAND_EXECUTABLES = {
     "pythonw",
     "powershell",
     "pwsh",
+    "pkexec",
     "rclone",
     "rg",
     "rm",
@@ -270,10 +296,13 @@ _COMMAND_EXECUTABLES = {
     "remove-item",
     "rmdir",
     "runas",
+    "runuser",
     "ruby",
     "sh",
     "snap",
+    "socat",
     "ssh",
+    "su",
     "sudo",
     "scoop",
     "set-executionpolicy",
@@ -301,47 +330,44 @@ _COMMAND_START_RE = re.compile(
     + r")(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?\b)"
 )
 
-_WINDOWS_COMMAND_FINDINGS = (
-    (
-        "windows_recursive_delete",
-        "high",
-        re.compile(
-            r"(?i)\b(?:remove-item|ri)\b(?=[^\r\n]*\s-(?:recurse|r)\b)"
-        ),
-    ),
-    (
-        "windows_recursive_delete",
-        "high",
-        re.compile(r"(?i)\b(?:rmdir|rd|del|erase)(?:\.exe)?\b(?=[^\r\n]*\s/s\b)"),
-    ),
-    (
-        "dynamic_eval",
-        "medium",
-        re.compile(r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b"),
-    ),
-    ("dynamic_eval", "medium", re.compile(r"(?i)\bcmd(?:\.exe)?\b")),
-    (
-        "privilege_escalation",
-        "medium",
-        re.compile(r"(?i)\b(?:runas(?:\.exe)?\b|start-process\b[^\r\n]*\s-verb\s+runas\b)"),
-    ),
-    ("profile_persistence", "medium", re.compile(r"(?i)\bset-executionpolicy\b|\$PROFILE\b")),
-    (
-        "recursive_world_writable",
-        "medium",
-        re.compile(r"(?i)\bicacls\b[^\r\n]*\s/grant\b[^\r\n]*\beveryone\s*:\s*\(?f\)?[^\r\n]*\s/t\b"),
-    ),
-    ("background_process", "medium", re.compile(r"(?i)\b(?:start-job|start-process)\b")),
-    (
-        "package_install",
-        "medium",
-        re.compile(r"(?i)\b(?:winget|choco|scoop)(?:\.exe)?\b[^\r\n]*\s(?:install|upgrade|update)\b"),
-    ),
-)
-
-
 def _finding(code: str, severity: str = "high") -> dict[str, str]:
     return {"severity": severity, "category": "dangerous_command", "code": code}
+
+
+def _windows_segment_findings(executable: str, args: list[str]) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    lowered = [token.casefold() for token in args]
+    powershell_delete = executable in {"del", "erase", "rd", "remove-item", "ri", "rm", "rmdir"}
+    recursive_parameter = any(token == "-r" or token.startswith("-rec") for token in lowered)
+    cmd_recursive = executable in {"del", "erase", "rd", "rmdir"} and "/s" in lowered
+    if (powershell_delete and recursive_parameter) or cmd_recursive:
+        findings.append(_finding("windows_recursive_delete"))
+
+    if executable in {"cmd", "iex", "invoke-expression", "powershell", "pwsh"}:
+        findings.append(_finding("dynamic_eval", "medium"))
+    if executable == "." and args:
+        findings.append(_finding("dynamic_eval", "medium"))
+    if executable == "runas" or (
+        executable == "start-process"
+        and any(
+            token == "-verb" and index + 1 < len(lowered) and lowered[index + 1] == "runas"
+            for index, token in enumerate(lowered)
+        )
+    ):
+        findings.append(_finding("privilege_escalation", "medium"))
+    if executable == "set-executionpolicy":
+        findings.append(_finding("profile_persistence", "medium"))
+    if executable == "icacls":
+        joined = " ".join(lowered)
+        if "/grant" in lowered and "everyone" in joined and "/t" in lowered:
+            findings.append(_finding("recursive_world_writable", "medium"))
+    if executable in {"start-job", "start-process"}:
+        findings.append(_finding("background_process", "medium"))
+    if executable in {"choco", "scoop", "winget"} and any(
+        token in {"install", "update", "upgrade"} for token in lowered
+    ):
+        findings.append(_finding("package_install", "medium"))
+    return findings
 
 
 def _looks_like_windows_command(command: str) -> bool:
@@ -349,7 +375,8 @@ def _looks_like_windows_command(command: str) -> bool:
         os.name == "nt"
         or re.search(r"(?i)(?:\b[A-Z]:\\|\\\\[^\\\s]+\\|\.(?:exe|cmd|bat|com|ps1)\b)", command)
         or re.search(
-            r"(?i)\b(?:powershell|pwsh|remove-item|start-process|invoke-webrequest|invoke-restmethod)\b",
+            r"(?i)\b(?:powershell|pwsh|remove-item|start-process|invoke-expression|iex|"
+            r"invoke-webrequest|invoke-restmethod)\b",
             command,
         )
     )
@@ -507,6 +534,24 @@ def _unwrap_command(tokens: list[str]) -> tuple[str, list[str], set[str]]:
             wrappers.add(executable)
             remaining = _skip_options(remaining[1:], {"-u", "-g", "-h", "-p", "-C", "-T", "-R"})
             continue
+        if executable == "doas":
+            wrappers.add(executable)
+            remaining = _skip_options(remaining[1:], {"-a", "-C", "-u"})
+            continue
+        if executable == "pkexec":
+            wrappers.add(executable)
+            remaining = _skip_options(remaining[1:], {"--user"})
+            continue
+        if executable == "runuser":
+            wrappers.add(executable)
+            remaining = _skip_options(
+                remaining[1:],
+                {"-u", "--user", "-g", "--group", "-G", "--supp-group", "-s", "--shell"},
+            )
+            continue
+        if executable == "su":
+            wrappers.add(executable)
+            return "", [], wrappers
         if executable in {"time", "nice"}:
             wrappers.add(executable)
             remaining = _skip_options(remaining[1:], {"-n"})
@@ -620,7 +665,7 @@ def _is_shell_eval_flag(token: str) -> bool:
 def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]:
     executable, args, wrappers = _unwrap_command(tokens)
     findings: list[dict[str, str]] = []
-    if "sudo" in wrappers:
+    if wrappers & _PRIVILEGE_WRAPPERS:
         findings.append(_finding("privilege_escalation", "medium"))
     if wrappers & {"nohup", "setsid"}:
         findings.append(_finding("background_process", "medium"))
@@ -630,6 +675,7 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
         findings.append(_finding("execution_environment_override", "medium"))
     if not executable:
         return findings
+    findings.extend(_windows_segment_findings(executable, args))
 
     if executable == "rg" and any(token == "--pre" or token.startswith("--pre=") for token in args):
         findings.append(_finding("rg_preprocessor"))
@@ -766,11 +812,7 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
 
 
 def _structured_command_findings(command: str, depth: int = 0) -> list[dict[str, str]]:
-    findings = [
-        _finding(code, severity)
-        for code, severity, pattern in _WINDOWS_COMMAND_FINDINGS
-        if pattern.search(command)
-    ]
+    findings: list[dict[str, str]] = []
     if _has_shell_indirection(command):
         findings.append(_finding("shell_indirection", "medium"))
     tokens = _shell_tokens(command)
@@ -1018,17 +1060,22 @@ def _load_state_file(path: Path, session_id: str) -> dict[str, Any]:
         raise RuntimeError("state file contains invalid JSON") from exc
     if not isinstance(state, dict):
         raise RuntimeError("state file must contain a JSON object")
-    try:
-        schema_version = int(state.get("schema_version"))
-        updated_at = int(state.get("updated_at"))
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("state file metadata is invalid") from exc
+    schema_version = state.get("schema_version")
+    updated_at = state.get("updated_at")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or not isinstance(updated_at, int)
+        or isinstance(updated_at, bool)
+    ):
+        raise RuntimeError("state file metadata is invalid")
     if schema_version not in {1, STATE_SCHEMA_VERSION}:
         raise RuntimeError("state file schema is unsupported")
     if updated_at <= 0:
         raise RuntimeError("state file timestamp is invalid")
     if int(time.time()) - updated_at > STATE_TTL_SECONDS:
         return _default_state(session_id)
+    _validate_state_fields(state)
     normalized = _default_state(session_id)
     for key in normalized:
         if key in state:
@@ -1036,6 +1083,56 @@ def _load_state_file(path: Path, session_id: str) -> dict[str, Any]:
     normalized["schema_version"] = STATE_SCHEMA_VERSION
     normalized["session_hash"] = _default_state(session_id)["session_hash"]
     return normalized
+
+
+def _validate_state_fields(state: dict[str, Any]) -> None:
+    scalar_types = {
+        "session_hash": str,
+        "current_turn_id": str,
+        "explicit_expand": bool,
+        "nested_allowed": bool,
+        "sensitive_context": bool,
+    }
+    for key, expected_type in scalar_types.items():
+        if key in state and type(state[key]) is not expected_type:
+            raise RuntimeError(f"state field has invalid type: {key}")
+
+    active_agents = state.get("active_agents", {})
+    if not isinstance(active_agents, dict) or not all(
+        isinstance(agent_id, str) and isinstance(metadata, dict)
+        for agent_id, metadata in active_agents.items()
+    ):
+        raise RuntimeError("state field has invalid type: active_agents")
+
+    dangerous_authorizations = state.get("dangerous_authorizations", [])
+    if not isinstance(dangerous_authorizations, list) or not all(
+        isinstance(item, str) for item in dangerous_authorizations
+    ):
+        raise RuntimeError("state field has invalid type: dangerous_authorizations")
+
+    dangerous_hashes = state.get("dangerous_authorization_hashes", {})
+    if not isinstance(dangerous_hashes, dict) or not all(
+        isinstance(code, str)
+        and isinstance(digests, list)
+        and all(isinstance(digest, str) for digest in digests)
+        for code, digests in dangerous_hashes.items()
+    ):
+        raise RuntimeError("state field has invalid type: dangerous_authorization_hashes")
+
+    pending_permissions = state.get("pending_permission_authorizations", {})
+    if not isinstance(pending_permissions, dict) or not all(
+        isinstance(tool_id, str) and isinstance(metadata, dict)
+        for tool_id, metadata in pending_permissions.items()
+    ):
+        raise RuntimeError("state field has invalid type: pending_permission_authorizations")
+
+    for key in ("sensitive_disclosure_grant", "local_git_grant", "pending_local_git"):
+        if key in state and state[key] is not None and not isinstance(state[key], dict):
+            raise RuntimeError(f"state field has invalid type: {key}")
+
+    compaction_count = state.get("compaction_count", 0)
+    if not isinstance(compaction_count, int) or isinstance(compaction_count, bool) or compaction_count < 0:
+        raise RuntimeError("state field has invalid type: compaction_count")
 
 
 def _default_state(session_id: str) -> dict[str, Any]:
