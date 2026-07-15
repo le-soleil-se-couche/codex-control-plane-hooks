@@ -1002,8 +1002,8 @@ def _open_private(path: Path, flags: int, mode: int = 0o600):
         raise PermissionError(f"state file is owned by another user: {path}")
     if os.name != "nt":
         os.fchmod(descriptor, mode)
-    access_mode = flags & os.O_ACCMODE
-    stream_mode = "r" if access_mode == os.O_RDONLY else "r+"
+    writable = bool(flags & (os.O_WRONLY | os.O_RDWR))
+    stream_mode = "r+" if writable else "r"
     return os.fdopen(descriptor, stream_mode, encoding="utf-8")
 
 
