@@ -1408,6 +1408,12 @@ def _authorization_command_candidates(segment: str) -> list[str]:
     if not match:
         return []
     candidate = segment[match.start(1) :].strip(" `")
+    prefix = segment[: match.start(1)].rstrip()
+    opening_quote = prefix[-1:] if prefix[-1:] in {"'", '"'} else ""
+    if opening_quote and candidate.endswith(opening_quote):
+        unwrapped = candidate[:-1].rstrip()
+        if _shell_tokens(unwrapped):
+            return [unwrapped]
     if _shell_tokens(candidate):
         return [candidate]
     if candidate.endswith(("'", '"')):

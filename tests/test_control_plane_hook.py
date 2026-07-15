@@ -761,6 +761,9 @@ class HookProtocolTests(unittest.TestCase):
 
     def test_outer_quote_around_natural_language_command_is_removed_only_when_needed(self) -> None:
         command = "sudo -n true"
+        module = __import__("control_plane_hook")
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
+            self.assertEqual([command], module._authorization_command_candidates(f'允许执行 "{command}"'))
         self.prompt(f'允许执行 "{command}"。')
         result = self.bash(command)
         self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
