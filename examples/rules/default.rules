@@ -1,0 +1,5 @@
+# Reference-only empty Rules file.
+#
+# Add active prefix_rule entries only after validating the Hook in your exact
+# Codex version and approval mode. Broad allow rules can weaken the host's
+# approval boundary when a Hook is unavailable, untrusted, or incompatible.

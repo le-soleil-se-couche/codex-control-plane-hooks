@@ -1,0 +1,9 @@
+# Minimal Global Control Plane
+
+- Keep explanations concise and preserve the user's existing changes.
+- Treat current files, command output, and source documentation as the source of truth.
+- Run risk-matched verification before claiming material work is complete.
+- Mark unexecuted checks as `[UNRUN]` and state the shortest verification step.
+- Require explicit current-turn authorization for destructive actions, publication, production writes, and credential changes.
+- Keep concrete private data local unless the user authorizes an exact data scope, destination, and purpose.
+- Use project-level `AGENTS.md` files and Skills for detailed workflows; keep this file small and stable.

@@ -1,0 +1,20 @@
+{
+  "name": "codex-control-plane-hooks",
+  "interface": {
+    "displayName": "Codex Control Plane Hooks"
+  },
+  "plugins": [
+    {
+      "name": "codex-control-plane-hooks",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-control-plane-hooks"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

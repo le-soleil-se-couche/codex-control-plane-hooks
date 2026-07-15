@@ -1,0 +1,43 @@
+# Threat Model
+
+## Assets
+
+- Repository and workstation integrity.
+- Credentials visible to prompts and tools.
+- Configured private business data.
+- Approval and Agent lifecycle state.
+- Accuracy of completion claims.
+
+## Trust boundaries
+
+- Codex host and Hook event protocol.
+- Python interpreter executing the Hook.
+- Plugin source and installed cache.
+- Private policy and plugin-data directory.
+- User prompts, copied text, tool input, and tool output.
+- External tools and durable destinations.
+- Release packaging, Git history, and CI scanners.
+
+## In scope
+
+- Accidental execution of selected high-risk command patterns.
+- Replay and scope drift for experimental one-shot approvals.
+- Selected credential-like strings crossing observed Hook boundaries.
+- Configured sensitive values being written to recognized external or durable destinations.
+- Completion while observed Agents remain active.
+- Symlink and ownership hazards around local state.
+- Private markers or selected credential formats entering the release tree or reachable Git history.
+
+## Out of scope
+
+- A compromised OS account, Codex binary, Python runtime, plugin source, plugin cache, or policy file.
+- Complete secret detection, data-loss prevention, malware detection, prompt-injection prevention, or sandbox escape prevention.
+- Tools and effects for which the host emits no matched Hook event.
+- Network activity performed by the host before or outside a Hook boundary.
+- Semantic correctness of arbitrary commands, code, research, or generated artifacts.
+
+## Security posture
+
+The plugin returns deny responses for recognized conditions when the host invokes the event and accepts the response. It should be deployed as defense in depth with `on-request` approvals, a restrictive sandbox, repository permissions, backups, and review of Hook trust changes.
+
+The release checker scans the current tree, including its own source, with generic rules and optional repository-external private literals. CI adds Gitleaks over reachable Git history. These checks reduce accidental disclosure and remain bounded pattern scanners rather than complete data-loss prevention.

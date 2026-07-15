@@ -1,0 +1,6 @@
+# Reference only. Merge settings deliberately; do not replace a live config.toml.
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = false

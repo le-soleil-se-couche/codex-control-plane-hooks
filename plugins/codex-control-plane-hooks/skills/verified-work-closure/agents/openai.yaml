@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verified Work Closure"
+  short_description: "Evidence-backed completion and adversarial checks"
+  default_prompt: "Verify the claimed outcome with real evidence and report any UNRUN boundary."

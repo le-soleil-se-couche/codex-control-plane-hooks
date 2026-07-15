@@ -1,0 +1,13 @@
+{
+  "sensitive_markers": [
+    "Example Organization"
+  ],
+  "sensitive_terms": [
+    "account",
+    "client",
+    "position"
+  ],
+  "durable_destination_markers": [],
+  "enable_natural_language_approvals": false,
+  "enable_sensitive_disclosure_approvals": false
+}

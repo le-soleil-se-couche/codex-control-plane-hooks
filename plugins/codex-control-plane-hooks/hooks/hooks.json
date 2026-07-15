@@ -1,0 +1,104 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking prompt safety"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|exec_command|apply_patch|Edit|Write|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking command and data safety"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "Bash|exec_command|apply_patch|Edit|Write|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Reviewing approval boundary"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|exec_command|apply_patch|Edit|Write|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking tool output"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Recording Agent lifecycle"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Closing Agent lifecycle"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Saving control-plane handoff"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "timeout": 10,
+            "statusMessage": "Reconciling active Agents"
+          }
+        ]
+      }
+    ]
+  }
+}

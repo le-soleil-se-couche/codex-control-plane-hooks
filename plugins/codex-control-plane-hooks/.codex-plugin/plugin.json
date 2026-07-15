@@ -1,0 +1,36 @@
+{
+  "name": "codex-control-plane-hooks",
+  "version": "0.1.0",
+  "description": "Best-effort local Hook checks for risky commands, selected credential patterns, sensitive-data handling, and Agent lifecycle state.",
+  "author": {
+    "name": "le-soleil-se-couche",
+    "url": "https://github.com/le-soleil-se-couche"
+  },
+  "homepage": "https://github.com/le-soleil-se-couche/codex-control-plane-hooks",
+  "repository": "https://github.com/le-soleil-se-couche/codex-control-plane-hooks",
+  "license": "Apache-2.0",
+  "keywords": [
+    "codex",
+    "hooks",
+    "safety",
+    "approval",
+    "privacy"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Control Plane Hooks",
+    "shortDescription": "Local policy checks for selected Codex Hook events",
+    "longDescription": "A version-scoped reference plugin that applies best-effort checks to observed Codex Hook events, tracks one-shot approvals, and records Agent lifecycle state.",
+    "developerName": "le-soleil-se-couche",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive"
+    ],
+    "websiteURL": "https://github.com/le-soleil-se-couche/codex-control-plane-hooks",
+    "privacyPolicyURL": "https://github.com/le-soleil-se-couche/codex-control-plane-hooks/blob/main/PRIVACY.md",
+    "defaultPrompt": [
+      "Review the active Hook policy and explain what it will block.",
+      "Run the plugin's protocol tests and report the evidence boundary."
+    ]
+  }
+}

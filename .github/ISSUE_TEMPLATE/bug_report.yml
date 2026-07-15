@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible non-security problem
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private prompts, or live business data. Use private vulnerability reporting for security issues.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Plugin, Codex, OS, architecture, and Python versions
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Redacted reproduction
+      description: Hook event, tool name, minimal input, observed output, and expected output
+    validations:
+      required: true
