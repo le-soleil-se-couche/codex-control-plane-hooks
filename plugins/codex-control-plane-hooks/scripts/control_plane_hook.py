@@ -364,7 +364,7 @@ def _windows_segment_findings(executable: str, args: list[str]) -> list[dict[str
     if executable in {"start-job", "start-process"}:
         findings.append(_finding("background_process", "medium"))
     if executable in {"choco", "scoop", "winget"} and any(
-        token in {"install", "update", "upgrade"} for token in lowered
+        token in {"install", "remove", "uninstall", "update", "upgrade"} for token in lowered
     ):
         findings.append(_finding("package_install", "medium"))
     return findings
@@ -774,7 +774,17 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
             findings.append(_finding("package_install", "medium"))
     if executable in _SYSTEM_PACKAGE_ACTIONS:
         actions = _SYSTEM_PACKAGE_ACTIONS[executable]
-        if any(token in actions or token.casefold() in actions for token in _tokens_before_separator(args)):
+        package_tokens = _tokens_before_separator(args)
+        pacman_mutation = executable == "pacman" and any(
+            token in {"--remove", "--sync", "--upgrade"}
+            or (
+                token.startswith("-")
+                and not token.startswith("--")
+                and any(operation in token[1:] for operation in "SRU")
+            )
+            for token in package_tokens
+        )
+        if pacman_mutation or any(token in actions or token.casefold() in actions for token in package_tokens):
             findings.append(_finding("package_install", "medium"))
 
     if executable in {"py", "python", "python3", "pythonw"}:

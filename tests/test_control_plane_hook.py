@@ -142,6 +142,10 @@ class HookProtocolTests(unittest.TestCase):
             r"Start-Process powershell.exe -Verb RunAs",
             r"Set-ExecutionPolicy Bypass -Scope CurrentUser",
             r"winget install Example.Package",
+            r"winget uninstall Example.Package",
+            r"winget remove Example.Package",
+            r"choco uninstall example-package",
+            r"scoop uninstall example-package",
             r"py.exe -c print(1)",
             r"py -3.12 -m pip install example-package",
             r"python3.12.exe -c print(1)",
@@ -181,6 +185,9 @@ class HookProtocolTests(unittest.TestCase):
             "dnf upgrade example-package",
             "apk add example-package",
             "pacman -S example-package",
+            "pacman -Sy example-package",
+            "pacman --sync example-package",
+            "pacman -Rns example-package",
             "nala install example-package",
             "microdnf upgrade example-package",
             "brew install example-package",
@@ -196,6 +203,8 @@ class HookProtocolTests(unittest.TestCase):
             with self.subTest(command=command):
                 result = self.bash(command)
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+        self.assertEqual({}, self.bash("pacman -Q example-package"))
 
         module = __import__("control_plane_hook")
         for command in [
