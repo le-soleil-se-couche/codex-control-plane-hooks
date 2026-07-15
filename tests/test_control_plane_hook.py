@@ -9,13 +9,16 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "codex-control-plane-hooks" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 SCRIPT = SCRIPTS / "control_plane_hook.py"
+DEFAULT_CWD = tempfile.gettempdir()
 
 
 class HookProtocolTests(unittest.TestCase):
@@ -50,7 +53,7 @@ class HookProtocolTests(unittest.TestCase):
         env = os.environ.copy()
         env["PLUGIN_DATA"] = data_dir or self.data_dir
         completed = subprocess.run(
-            ["python3", str(SCRIPT)],
+            [sys.executable, str(SCRIPT)],
             input=payload,
             text=True,
             capture_output=True,
@@ -60,11 +63,26 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual("", completed.stderr)
         return completed, json.loads(completed.stdout)
 
+    def run_bytes(
+        self, payload: bytes, *, data_dir: str | None = None
+    ) -> tuple[subprocess.CompletedProcess[bytes], dict]:
+        env = os.environ.copy()
+        env["PLUGIN_DATA"] = data_dir or self.data_dir
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPT)],
+            input=payload,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        self.assertEqual(b"", completed.stderr)
+        return completed, json.loads(completed.stdout.decode("ascii"))
+
     def run_hook(self, event: dict, *, data_dir: str | None = None) -> dict:
         payload = {
             "session_id": self.session,
             "turn_id": self.turn,
-            "cwd": "/tmp",
+            "cwd": DEFAULT_CWD,
             "permission_mode": "default",
             **event,
         }
@@ -73,10 +91,10 @@ class HookProtocolTests(unittest.TestCase):
             payload["tool_use_id"] = f"tool-{self.tool_sequence}"
         return self.run_raw(json.dumps(payload), data_dir=data_dir)[1]
 
-    def prompt(self, text: str, *, cwd: str = "/tmp") -> dict:
+    def prompt(self, text: str, *, cwd: str = DEFAULT_CWD) -> dict:
         return self.run_hook({"hook_event_name": "UserPromptSubmit", "prompt": text, "cwd": cwd})
 
-    def bash(self, command: str, *, cwd: str = "/tmp") -> dict:
+    def bash(self, command: str, *, cwd: str = DEFAULT_CWD) -> dict:
         return self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -96,11 +114,98 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual({}, result)
 
+    def test_windows_executable_suffix_preserves_git_classification(self) -> None:
+        self.assertEqual({}, self.bash("git.exe status --short"))
+        result = self.bash("git.exe commit -m checkpoint")
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+        self.assertIn("git_non_read_only", result["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_windows_native_dangerous_commands_are_denied(self) -> None:
+        commands = [
+            r"Remove-Item -Recurse -Force C:\work\cache",
+            r"Remove-Item -Recurse C:\work\cache",
+            r"ri -r C:\work\cache",
+            r"cmd.exe /c rmdir /s /q C:\work\cache",
+            r"cmd.exe /d /s /c echo hello",
+            r"del /s C:\work\cache\*",
+            r"powershell.exe -NoProfile -Command Get-ChildItem",
+            r"powershell.exe -NoProfile -enc QQBBAEEA",
+            r"Start-Process powershell.exe -Verb RunAs",
+            r"Set-ExecutionPolicy Bypass -Scope CurrentUser",
+            r"winget install Example.Package",
+            r"py.exe -c print(1)",
+            r"py -3.12 -m pip install example-package",
+            r"python3.12.exe -c print(1)",
+            r"pip3.12.exe install example-package",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_windows_paths_are_recognized_as_durable_and_external(self) -> None:
+        module = __import__("control_plane_hook")
+        windows_home = "C:\\" + "Users" + r"\example\.codex\memories\note.md"
+        self.assertTrue(module._is_durable_destination(windows_home))
+        self.assertTrue(module._is_external_tool("Bash", "Invoke-WebRequest https://example.invalid"))
+
+    def test_quoted_windows_scope_preserves_spaces(self) -> None:
+        module = __import__("control_plane_hook")
+        scope = r"C:\Work Trees\example-repo"
+        prompt = f'批准在 "{scope}" 执行 git.exe add 和 git.exe commit。'
+        self.assertEqual(module._scope_hash(scope), module._prompt_scope_hash(prompt, DEFAULT_CWD, None))
+
+    def test_linux_shells_package_managers_and_transfers_are_classified(self) -> None:
+        commands = [
+            "dash -c 'rm -rf /tmp/cache'",
+            "ash -c 'rm -rf /tmp/cache'",
+            "apt-get install example-package",
+            "dnf upgrade example-package",
+            "apk add example-package",
+            "pacman -S example-package",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+        module = __import__("control_plane_hook")
+        for command in [
+            "ssh example.invalid",
+            "rclone copy file remote:bucket",
+            "aws s3 cp file s3://example-bucket/",
+            "gcloud storage cp file gs://example-bucket/",
+        ]:
+            with self.subTest(command=command):
+                self.assertTrue(module._is_external_tool("Bash", command))
+
+    def test_concurrent_agent_state_updates_do_not_lose_entries(self) -> None:
+        session = "concurrent-agent-session"
+
+        def start_agent(index: int) -> dict:
+            payload = {
+                "session_id": session,
+                "turn_id": f"turn-{index}",
+                "cwd": DEFAULT_CWD,
+                "hook_event_name": "SubagentStart",
+                "agent_id": f"agent-{index}",
+                "agent_type": "test",
+            }
+            return self.run_raw(json.dumps(payload))[1]
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(start_agent, range(8)))
+
+        self.assertEqual(8, len(results))
+        digest = hashlib.sha256(session.encode("utf-8")).hexdigest()[:24]
+        state = json.loads((Path(self.data_dir) / f"session-{digest}.json").read_text(encoding="utf-8"))
+        self.assertEqual({f"agent-{index}" for index in range(8)}, set(state["active_agents"]))
+
     def test_legacy_state_is_migrated_to_current_schema(self) -> None:
         digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
         state_path = Path(self.data_dir) / f"session-{digest}.json"
         state_path.write_text(
-            json.dumps({"schema_version": 2, "active_agents": {}, "updated_at": 0}),
+            json.dumps({"schema_version": 1, "active_agents": {}, "updated_at": int(time.time())}),
             encoding="utf-8",
         )
 
@@ -108,6 +213,57 @@ class HookProtocolTests(unittest.TestCase):
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(2, state["schema_version"])
+        self.assertIn("pending_permission_authorizations", state)
+
+    def test_malformed_state_fails_closed_without_replacement(self) -> None:
+        digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
+        state_path = Path(self.data_dir) / f"session-{digest}.json"
+        malformed = "{"
+        state_path.write_text(malformed, encoding="utf-8")
+
+        result = self.bash("pwd")
+
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual(malformed, state_path.read_text(encoding="utf-8"))
+        stop_result = self.run_hook(
+            {
+                "hook_event_name": "Stop",
+                "stop_hook_active": False,
+                "last_assistant_message": "Done.",
+            }
+        )
+        self.assertEqual("block", stop_result["decision"])
+        self.assertEqual(malformed, state_path.read_text(encoding="utf-8"))
+
+    def test_expired_state_is_reinitialized(self) -> None:
+        digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
+        state_path = Path(self.data_dir) / f"session-{digest}.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "active_agents": {"stale-agent": {"agent_type": "test"}},
+                    "updated_at": int(time.time()) - 8 * 24 * 60 * 60,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual({}, self.bash("pwd"))
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual({}, state["active_agents"])
+
+    def test_relative_plugin_data_fails_closed(self) -> None:
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pwd"},
+            },
+            data_dir="relative-plugin-data",
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     def test_natural_language_approvals_are_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
@@ -208,15 +364,29 @@ class HookProtocolTests(unittest.TestCase):
             real = Path(parent) / "real"
             link = Path(parent) / "state-link"
             real.mkdir()
-            link.symlink_to(real, target_is_directory=True)
-            result = self.run_hook(
-                {
-                    "hook_event_name": "PreToolUse",
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "pwd"},
-                },
-                data_dir=str(link),
-            )
+            if os.name == "nt":
+                created = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(real)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                if created.returncode != 0:
+                    self.skipTest("Windows junction creation is unavailable")
+            else:
+                link.symlink_to(real, target_is_directory=True)
+            try:
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "pwd"},
+                    },
+                    data_dir=str(link),
+                )
+            finally:
+                if os.name == "nt" and link.exists():
+                    os.rmdir(link)
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     def test_successful_stop_removes_session_state(self) -> None:
@@ -230,7 +400,8 @@ class HookProtocolTests(unittest.TestCase):
             }
         )
         self.assertEqual({}, result)
-        self.assertFalse(list(Path(self.data_dir).glob("session-*")))
+        self.assertFalse(list(Path(self.data_dir).glob("session-*.json")))
+        self.assertEqual(1, len(list(Path(self.data_dir).glob("session-*.lock"))))
 
     def test_apply_patch_content_is_not_scanned_as_a_shell_command(self) -> None:
         result = self.run_hook(
@@ -1227,6 +1398,7 @@ class HookProtocolTests(unittest.TestCase):
         self.assertNotEqual("deny", allowed["hookSpecificOutput"].get("permissionDecision"))
         self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX symlink retarget semantics")
     def test_repo_scope_resolves_symlinks_before_authorization(self) -> None:
         root = Path(self.data_dir)
         repo_a = root / "repo-a"
@@ -1360,6 +1532,36 @@ class HookProtocolTests(unittest.TestCase):
 
     def test_invalid_json_fails_closed(self) -> None:
         result = self.run_raw("{")[1]
+        self.assertEqual("block", result["decision"])
+
+    def test_utf8_stdio_preserves_non_ascii_policy_matching(self) -> None:
+        Path(self.data_dir, "policy.json").write_text(
+            json.dumps(
+                {
+                    "sensitive_markers": ["测试公司"],
+                    "sensitive_terms": ["持仓"],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        payload = json.dumps(
+            {
+                "session_id": self.session,
+                "turn_id": self.turn,
+                "cwd": DEFAULT_CWD,
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "请处理测试公司的真实持仓。",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        result = self.run_bytes(payload)[1]
+
+        self.assertIn("additionalContext", result["hookSpecificOutput"])
+
+    def test_invalid_utf8_fails_closed(self) -> None:
+        result = self.run_bytes(b"\xff")[1]
         self.assertEqual("block", result["decision"])
 
     def test_sed_and_nl_are_read_only_without_write_flags(self) -> None:

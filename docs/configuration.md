@@ -2,12 +2,12 @@
 
 ## Policy location
 
-The Hook resolves policy in this order:
+On macOS and Linux, the Hook resolves policy in this order:
 
-1. `CONTROL_PLANE_POLICY`, when explicitly set.
+1. An absolute `CONTROL_PLANE_POLICY` path, when explicitly set.
 2. `policy.json` inside the host-provided `PLUGIN_DATA` directory.
 
-If neither exists, organization-specific detection and all natural-language approvals remain disabled.
+On Windows, `PLUGIN_DATA` is required and policy must remain at `PLUGIN_DATA/policy.json`. External policy paths fail closed because this dependency-free Hook cannot independently validate arbitrary NTFS DACLs. If the default policy does not exist, organization-specific detection and all natural-language approvals remain disabled.
 
 ## Policy fields
 
@@ -19,13 +19,13 @@ If neither exists, organization-specific detection and all natural-language appr
 | `enable_natural_language_approvals` | boolean | `false` | Enables experimental one-shot command and local Git approval parsing. |
 | `enable_sensitive_disclosure_approvals` | boolean | `false` | Enables experimental one-shot disclosure grants. |
 
-The policy file is capped at 64 KiB. Each string list is capped at 100 entries. A present policy that is malformed, oversized, symlinked, non-regular, or owned by another user causes the current Hook event to fail closed. A missing default policy keeps private detection and natural-language approvals disabled; a missing explicitly configured policy fails closed. Boolean options activate only for the JSON value `true`.
+The policy file is capped at 64 KiB. Each string list is capped at 100 entries. A present policy that is malformed, oversized, symlinked, reparse-point, non-regular, or POSIX-owned by another user causes the current Hook event to fail closed. A missing default policy keeps private detection and natural-language approvals disabled; a missing explicitly configured POSIX policy fails closed. Boolean options activate only for the JSON value `true`.
 
 Structured `Write`, `Edit`, and `apply_patch` calls count as durable local persistence when configured concrete sensitive data would remain. A redaction edit is allowed only when its newly persisted text is clean. All `mcp__*` tools default to external for this check. Add installation-specific durable path markers to the private policy instead of hard-coding them in public source.
 
 ## Private release-boundary markers
 
-`scripts/check_release.py` always applies generic path and credential checks. To add installation-specific literal checks, pass a repository-external UTF-8 file with one marker per line:
+`scripts/check_release.py` always applies generic path and credential checks. On macOS or Linux, add installation-specific literal checks with a repository-external UTF-8 file containing one marker per line:
 
 ```bash
 chmod 600 /absolute/path/outside/repository/private-patterns
@@ -33,20 +33,22 @@ python3 scripts/check_release.py \
   --private-patterns-file /absolute/path/outside/repository/private-patterns
 ```
 
-Blank lines and lines beginning with `#` are ignored. The file must be a current-user-owned regular file, no larger than 64 KiB, with no group or other permissions. `RELEASE_PRIVATE_PATTERNS_FILE` is also supported for controlled CI environments. Findings identify the private rule by number and never print its value.
+Blank lines and lines beginning with `#` are ignored. The file must be a current-user-owned regular file, no larger than 64 KiB, with no group or other permissions. `RELEASE_PRIVATE_PATTERNS_FILE` is also supported for controlled POSIX CI environments. Findings identify the private rule by number and never print its value. Windows rejects this optional input because owner and DACL validation would otherwise be incomplete.
 
 ## State
 
-The host-provided plugin-data directory is preferred. When unavailable, the fallback is:
+The host-provided plugin-data directory is preferred. On macOS and Linux, the fallback is:
 
 - `$XDG_STATE_HOME/codex-control-plane-hooks`, or
 - `~/.local/state/codex-control-plane-hooks`.
 
-The Hook rejects a symlinked state directory, checks file ownership where POSIX ownership is available, uses mode `0700` for the directory and `0600` for files, and rejects symlinked state files. Session identifiers are hashed before they become filenames.
+Windows requires an absolute host-provided `PLUGIN_DATA` path. The Hook rejects observed symlinks and Windows reparse points. On POSIX it checks ownership and enforces mode `0700` for the directory and `0600` for files. Windows relies on the host directory's inherited DACL and does not independently audit every ACE. Session identifiers are hashed before they become filenames.
+
+State mutations use bounded cross-process locks: `flock` on macOS/Linux and `msvcrt.locking` on Windows. Stop checks and session-state removal share the same lock. A stable lock sentinel remains after Stop so a concurrent lifecycle event cannot switch to a different lock inode.
 
 State includes hashes and workflow metadata: current turn, one-shot command grants, pending permission requests, sensitive-context flags, configured disclosure-grant hashes, Agent identifiers, and timestamps. It does not intentionally persist prompt text, command text, policy values, tool payloads, or tool output.
 
-State expires after seven days and is deleted after a successful Stop event.
+State older than seven days is logically reinitialized on its next access. A successful Stop removes the session JSON when no observed Agent remains active; the lock sentinel is retained. Corrupt, unreadable, unsupported-schema, foreign-owner, symlinked, or reparse-point state fails closed and is left in place for diagnosis.
 
 ## Config and Rules examples
 

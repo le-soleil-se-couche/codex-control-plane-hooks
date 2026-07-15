@@ -34,6 +34,7 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("scripts/check_release.py", scanned)
         self.assertIn("examples/AGENTS.md.example", scanned)
 
+    @unittest.skipIf(os.name == "nt", "private marker ACL verification requires POSIX")
     def test_external_private_markers_are_detected_without_value_echo(self) -> None:
         marker = "Version-scoped reference Hooks"
         with tempfile.TemporaryDirectory() as directory:
@@ -68,6 +69,52 @@ class ReleaseLayoutTests(unittest.TestCase):
         )
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(manifest["name"], marketplace["plugins"][0]["name"])
+
+    def test_every_command_hook_has_a_windows_override(self) -> None:
+        hooks = json.loads(
+            (
+                ROOT
+                / "plugins"
+                / "codex-control-plane-hooks"
+                / "hooks"
+                / "hooks.json"
+            ).read_text(encoding="utf-8")
+        )
+        commands = [
+            handler
+            for groups in hooks["hooks"].values()
+            for group in groups
+            for handler in group.get("hooks", [])
+            if handler.get("type") == "command"
+        ]
+        self.assertTrue(commands)
+        for handler in commands:
+            self.assertIn("$PLUGIN_ROOT", handler["command"])
+            self.assertIn("$env:PLUGIN_ROOT", handler["commandWindows"])
+
+    def test_release_checker_rejects_windows_homes_and_binary_files(self) -> None:
+        private_path = "C:\\" + "Users" + r"\example\project"
+        private_unc_path = "\\\\" + "server" + r"\share" + "\\" + "Users" + r"\example\project"
+        self.assertTrue(
+            any(pattern.search(private_path) for _, pattern in CHECKER.GENERIC_PRIVATE_PATTERNS)
+        )
+        self.assertTrue(
+            any(pattern.search(private_unc_path) for _, pattern in CHECKER.GENERIC_PRIVATE_PATTERNS)
+        )
+
+        errors: list[str] = []
+        with tempfile.NamedTemporaryFile(dir=ROOT, suffix=".db", delete=False) as stream:
+            binary_path = Path(stream.name)
+            stream.write(b"SQLite\x00payload")
+        self.addCleanup(binary_path.unlink, missing_ok=True)
+        self.assertIsNone(CHECKER._read_release_text(binary_path, errors))
+        self.assertTrue(any("binary release file is not allowed" in error for error in errors))
+
+    def test_release_checker_covers_generic_credential_classes(self) -> None:
+        bearer = "Authorization: Bearer " + "A" * 24
+        assignment = "password=" + "B" * 24
+        self.assertTrue(any(pattern.search(bearer) for _, pattern in CHECKER.SECRET_PATTERNS))
+        self.assertTrue(any(pattern.search(assignment) for _, pattern in CHECKER.SECRET_PATTERNS))
 
     def test_examples_are_reference_only_and_inert(self) -> None:
         rules = (ROOT / "examples" / "rules" / "default.rules").read_text(encoding="utf-8")

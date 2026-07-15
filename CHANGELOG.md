@@ -4,6 +4,14 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-15
+
+- Added native Windows command overrides, strict UTF-8 stdio, Windows executable normalization, reparse-point checks, and bounded state locking.
+- Added Linux shell, system package-manager, and transfer-client classification.
+- Made corrupt, unreadable, or unsupported state fail closed; added schema migration, bounded POSIX locking, atomic Stop cleanup, and concurrent-writer regression coverage.
+- Added Ubuntu, macOS, and Windows CI lanes plus a packaged manifest-command smoke in paths containing spaces.
+- Expanded the public release checker to reject binary files, Windows/WSL/UNC user paths, bearer tokens, JWTs, and generic credential assignments.
+- Required host-provided plugin data on Windows and kept external private-marker checks on POSIX hosts where owner and mode checks are available.
 - Moved installation-specific release markers to a repository-external private input file.
 - Expanded the release checker to scan itself, filenames, compound suffixes, and bounded text files without echoing private marker values.
 - Removed installation-specific durable-path logic from public source and added private policy-driven durable markers.

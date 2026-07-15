@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -16,8 +17,13 @@ from typing import Any, Callable
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Codex currently runs this on macOS/Linux.
+except ImportError:  # pragma: no cover - unavailable on native Windows.
     fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - unavailable on macOS/Linux.
+    msvcrt = None
 
 
 MAX_SCAN_CHARS = 500_000
@@ -42,45 +48,6 @@ _SECRET_PATTERNS = (
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
 )
-_DANGEROUS_PATTERNS = (
-    (
-        "rm_rf",
-        re.compile(
-            r"(?i)(^|[;&|]\s*)rm\s+(?:(?:-[A-Za-z]*r[A-Za-z]*f|-[A-Za-z]*f[A-Za-z]*r)\b"
-            r"|(?:-r\s+-f|-f\s+-r)\b|(?:--recursive\s+--force|--force\s+--recursive)\b)"
-        ),
-    ),
-    ("git_reset_hard", re.compile(r"(?i)\bgit\s+reset\s+--hard\b")),
-    ("git_clean_force", re.compile(r"(?i)\bgit\s+clean\s+-[A-Za-z]*f[A-Za-z]*[dx]")),
-    ("force_push", re.compile(r"(?i)\bgit\s+push\b[^\n]*\s--force(?:-with-lease)?\b")),
-    ("curl_pipe_shell", re.compile(r"(?is)\b(curl|wget)\b[^\n|]*\|\s*(bash|sh|zsh|python|python3)\b")),
-    ("profile_persistence", re.compile(r"(?i)(>>|>)\s*(~?/\.zshrc|~?/\.bashrc|~?/\.profile|/etc/)")),
-    ("recursive_world_writable", re.compile(r"(?i)\bchmod\s+-R\s+777\b")),
-)
-_AUTH_DANGEROUS_PATTERNS = (
-    (
-        "rm_rf",
-        re.compile(
-            r"(?i)\brm\s+(?:(?:-[A-Za-z]*r[A-Za-z]*f|-[A-Za-z]*f[A-Za-z]*r)\b"
-            r"|(?:-r\s+-f|-f\s+-r)\b|(?:--recursive\s+--force|--force\s+--recursive)\b)"
-        ),
-    ),
-    ("git_reset_hard", re.compile(r"(?i)\bgit\s+reset\s+--hard\b")),
-    ("git_clean_force", re.compile(r"(?i)\bgit\s+clean\s+-[A-Za-z]*f[A-Za-z]*[dx]")),
-    ("force_push", re.compile(r"(?i)\bgit\s+push\b[^\n]*\s--force(?:-with-lease)?\b")),
-    ("curl_pipe_shell", re.compile(r"(?is)\b(curl|wget)\b[^\n|]*\|\s*(bash|sh|zsh|python|python3)\b")),
-    ("profile_persistence", re.compile(r"(?i)(>>|>)\s*(~?/\.zshrc|~?/\.bashrc|~?/\.profile|/etc/)")),
-    ("recursive_world_writable", re.compile(r"(?i)\bchmod\s+-R\s+777\b")),
-    ("rg_preprocessor", re.compile(r"(?i)\brg\b[^\n]*\s--pre(?:=|\s)")),
-    ("git_push", re.compile(r"(?i)\bgit\b[^\n]*\spush\b")),
-    ("git_dynamic_config", re.compile(r"(?i)\bgit\b[^\n]*\s-c(?:\s|[^A-Z])")),
-    ("git_external_helper", re.compile(r"(?i)--(?:ext-diff|textconv)\b")),
-    ("dynamic_eval", re.compile(r"(?i)\b(?:python3?|node|ruby|perl|bash|sh|zsh)\b[^\n]*\s(?:-c|-e|--eval|-p|--print)\b")),
-    ("package_install", re.compile(r"(?i)\b(?:npm|pnpm|yarn|pip3?)\b[^\n]*\s(?:install|add|ci)\b")),
-    ("package_runner", re.compile(r"(?i)\b(?:npx|bunx)\b")),
-    ("privilege_escalation", re.compile(r"(?i)\bsudo\b")),
-    ("background_process", re.compile(r"(?i)\b(?:nohup|setsid)\b|(?:^|\s)&(?:\s|$)")),
-)
 _SENSITIVE_EXTERNAL_VERB_RE = re.compile(r"外发|披露|上传|发送|共享|external|upload|share|send", re.IGNORECASE)
 _SENSITIVE_NEGATION_RE = re.compile(r"不要|别|禁止|不许|不得|不允许|拒绝|do\s+not|don't|never", re.IGNORECASE)
 _SENSITIVE_EXPLICIT_AUTH_RE = re.compile(
@@ -103,10 +70,13 @@ _EXTERNAL_TOOL_RE = re.compile(
     r"(?i)(gmail|google|drive|notion|slack|teams|outlook|canva|github|browser|chrome|web|upload|send|post|publish|share)"
 )
 _EXTERNAL_COMMAND_RE = re.compile(
-    r"(?i)\b(curl|wget|scp|sftp|rsync|gh|open|osascript)\b|\bgit\s+push\b"
+    r"(?i)\b(curl|wget|scp|sftp|ssh|rsync|rclone|aws|gcloud|az|gh|open|osascript|"
+    r"invoke-webrequest|invoke-restmethod|start-bitstransfer|bitsadmin)\b|"
+    r"\bcertutil\b[^\r\n]*\s-urlcache\b|\bgit\s+push\b"
 )
 _DURABLE_DESTINATION_RE = re.compile(
-    r"(?i)(/\.codex/(?:memories|skills)|/\.claude/.*/memory|marketplace|public|publish)"
+    r"(?i)([\\/]\.codex[\\/](?:memories|skills)|[\\/]\.claude[\\/].*[\\/]memory|"
+    r"marketplace|public|publish)"
 )
 _AUTH_NEGATED_RE = re.compile(
     r"(?i)(不|未|没有|拒绝|禁止).{0,4}(?:明确授权|授权|确认执行|批准执行|执行|同意执行|允许)"
@@ -124,9 +94,14 @@ _DANGEROUS_APPROVAL_RE = re.compile(
 _LOCAL_GIT_APPROVAL_RE = re.compile(
     r"(?i)^\s*(?:我\s*)?(?:(?:本轮|这次|现在)\s*)?(?:明确\s*)?(?:批准|同意|确认|授权|允许)"
 )
-_LOCAL_GIT_OPERATION_RE = re.compile(r"(?i)\bgit\s+(add|commit)\b")
+_LOCAL_GIT_OPERATION_RE = re.compile(r"(?i)\bgit(?:\.exe)?\s+(add|commit)\b")
 _PENDING_COMMAND_REFERENCE_RE = re.compile(r"上述|上面|刚才|前述|该命令|这个命令|previous\s+command", re.IGNORECASE)
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(/[^\s，。；;`\"']+)")
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])("
+    r"\"(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^\"\r\n]+\""
+    r"|(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^\s，。；;`\"']+)"
+)
 _CURRENT_REPO_RE = re.compile(r"当前(?:仓库|repo)|这个(?:仓库|repo)|current\s+(?:repository|repo)", re.IGNORECASE)
 _CURRENT_EXPANSION_RE = re.compile(
     r"(?i)(?:开|开启|启动|使用|派|创建)\s*(?:到|共|最多)?\s*(?:[4-9]|[1-9]\d+)\s*个?\s*(?:子\s*)?agent"
@@ -142,6 +117,7 @@ _EXPANSION_NEGATED_RE = re.compile(
 )
 _CONTINUATION_RE = re.compile(r"(?i)^\s*(?:继续|接着|沿用|按刚才|按上面|然后呢|go\s+on|continue|proceed)\b")
 _SHELL_CONTROL_RE = re.compile(r"[;&|<>]|\$\(|\x60")
+_WINDOWS_ENV_EXPANSION_RE = re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%|![A-Za-z_][A-Za-z0-9_]*!")
 _AUTH_SEGMENT_SPLIT_RE = re.compile(r"[，。；！？\n\r]+")
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SENSITIVE_ENV_NAMES = {
@@ -157,13 +133,45 @@ _SENSITIVE_ENV_NAMES = {
     "PYTHONSTARTUP",
     "RUBYOPT",
 }
-_READ_ONLY_COMMANDS = {"pwd", "ls", "cat", "grep", "nl", "wc", "head", "tail", "stat", "file", "du", "echo", "printf", "date", "which", "ps", "jq", "shasum", "cmp", "true", "false"}
+_READ_ONLY_COMMANDS = {
+    "pwd",
+    "ls",
+    "cat",
+    "grep",
+    "nl",
+    "wc",
+    "head",
+    "tail",
+    "stat",
+    "file",
+    "du",
+    "echo",
+    "printf",
+    "date",
+    "which",
+    "ps",
+    "jq",
+    "shasum",
+    "cmp",
+    "true",
+    "false",
+    "dir",
+    "type",
+    "where",
+    "get-childitem",
+    "get-content",
+    "get-location",
+    "get-process",
+    "select-string",
+}
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "branch", "rev-parse", "ls-files", "grep", "remote", "blame", "ls-tree"}
 _CONTROL_TOKENS = {";", "&&", "||", "|", "&"}
-_SHELL_EVAL = {"bash", "sh", "zsh"}
+_SHELL_EVAL = {"ash", "bash", "dash", "fish", "ksh", "sh", "zsh"}
 _INTERPRETER_EVAL_FLAGS = {
+    "py": {"-c"},
     "python": {"-c"},
     "python3": {"-c"},
+    "pythonw": {"-c"},
     "node": {"-e", "--eval", "-p", "--print"},
     "ruby": {"-e"},
     "perl": {"-e"},
@@ -195,48 +203,140 @@ _PACKAGE_VALUE_OPTIONS = {
 }
 _PACKAGE_INSTALL_SUBCOMMANDS = {"install", "add", "ci", "i", "update", "up", "link", "rebuild"}
 _PACKAGE_RUNNER_SUBCOMMANDS = {"exec", "x", "dlx"}
+_SYSTEM_PACKAGE_ACTIONS = {
+    "apk": {"add", "del", "fix", "upgrade"},
+    "apt": {"full-upgrade", "install", "remove", "update", "upgrade"},
+    "apt-get": {"dist-upgrade", "install", "remove", "update", "upgrade"},
+    "dnf": {"install", "remove", "update", "upgrade"},
+    "emerge": {"--sync"},
+    "flatpak": {"install", "uninstall", "update"},
+    "pacman": {"-S", "-R", "-U", "-Syu"},
+    "snap": {"install", "refresh", "remove"},
+    "yum": {"install", "remove", "update", "upgrade"},
+    "zypper": {"install", "remove", "update"},
+}
 _COMMAND_EXECUTABLES = {
+    "apk",
+    "apt",
+    "apt-get",
+    "ash",
+    "aws",
     "bash",
+    "bitsadmin",
     "busybox",
     "bunx",
+    "certutil",
     "chmod",
+    "choco",
+    "cmd",
     "curl",
+    "dash",
+    "del",
+    "dnf",
+    "emerge",
     "eval",
+    "erase",
     "exec",
     "find",
+    "fish",
+    "flatpak",
+    "gcloud",
     "git",
+    "icacls",
+    "invoke-restmethod",
+    "invoke-webrequest",
+    "ksh",
     "node",
     "npm",
     "npx",
     "osascript",
     "parallel",
+    "pacman",
     "perl",
     "pip",
     "pip3",
     "pipx",
     "pnpm",
+    "py",
     "python",
     "python3",
+    "pythonw",
+    "powershell",
+    "pwsh",
+    "rclone",
     "rg",
     "rm",
+    "rd",
+    "remove-item",
+    "rmdir",
+    "runas",
     "ruby",
     "sh",
+    "snap",
+    "ssh",
     "sudo",
+    "scoop",
+    "set-executionpolicy",
+    "start-bitstransfer",
+    "start-job",
+    "start-process",
     "timeout",
     "toybox",
     "uv",
     "uvx",
     "wget",
     "watch",
+    "winget",
     "xargs",
     "yarn",
+    "yum",
     "zsh",
+    "zypper",
     "gtimeout",
 }
 _COMMAND_START_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_./-])((?:/[A-Za-z0-9_./-]+/)?(?:"
+    r"(?i)(?<![A-Za-z0-9_./-])((?:(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/]|/)"
+    r"[A-Za-z0-9_.\\/ -]*[\\/])?(?:"
     + "|".join(sorted(re.escape(item) for item in _COMMAND_EXECUTABLES))
-    + r")\b)"
+    + r")(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?\b)"
+)
+
+_WINDOWS_COMMAND_FINDINGS = (
+    (
+        "windows_recursive_delete",
+        "high",
+        re.compile(
+            r"(?i)\b(?:remove-item|ri)\b(?=[^\r\n]*\s-(?:recurse|r)\b)"
+        ),
+    ),
+    (
+        "windows_recursive_delete",
+        "high",
+        re.compile(r"(?i)\b(?:rmdir|rd|del|erase)(?:\.exe)?\b(?=[^\r\n]*\s/s\b)"),
+    ),
+    (
+        "dynamic_eval",
+        "medium",
+        re.compile(r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b"),
+    ),
+    ("dynamic_eval", "medium", re.compile(r"(?i)\bcmd(?:\.exe)?\b")),
+    (
+        "privilege_escalation",
+        "medium",
+        re.compile(r"(?i)\b(?:runas(?:\.exe)?\b|start-process\b[^\r\n]*\s-verb\s+runas\b)"),
+    ),
+    ("profile_persistence", "medium", re.compile(r"(?i)\bset-executionpolicy\b|\$PROFILE\b")),
+    (
+        "recursive_world_writable",
+        "medium",
+        re.compile(r"(?i)\bicacls\b[^\r\n]*\s/grant\b[^\r\n]*\beveryone\s*:\s*\(?f\)?[^\r\n]*\s/t\b"),
+    ),
+    ("background_process", "medium", re.compile(r"(?i)\b(?:start-job|start-process)\b")),
+    (
+        "package_install",
+        "medium",
+        re.compile(r"(?i)\b(?:winget|choco|scoop)(?:\.exe)?\b[^\r\n]*\s(?:install|upgrade|update)\b"),
+    ),
 )
 
 
@@ -244,24 +344,48 @@ def _finding(code: str, severity: str = "high") -> dict[str, str]:
     return {"severity": severity, "category": "dangerous_command", "code": code}
 
 
+def _looks_like_windows_command(command: str) -> bool:
+    return bool(
+        os.name == "nt"
+        or re.search(r"(?i)(?:\b[A-Z]:\\|\\\\[^\\\s]+\\|\.(?:exe|cmd|bat|com|ps1)\b)", command)
+        or re.search(
+            r"(?i)\b(?:powershell|pwsh|remove-item|start-process|invoke-webrequest|invoke-restmethod)\b",
+            command,
+        )
+    )
+
+
+def _strip_token_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+        return token[1:-1]
+    return token
+
+
 def _shell_tokens(command: str) -> list[str]:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        windows_style = _looks_like_windows_command(command)
+        lexer = shlex.shlex(command, posix=not windows_style, punctuation_chars=";&|<>")
         lexer.whitespace_split = True
         lexer.commenters = ""
-        return list(lexer)
+        tokens = list(lexer)
+        return [_strip_token_quotes(token) for token in tokens] if windows_style else tokens
     except ValueError:
         return []
 
 
 def _has_shell_indirection(command: str) -> bool:
+    if _WINDOWS_ENV_EXPANSION_RE.search(command):
+        return True
+    windows_style = _looks_like_windows_command(command)
     quote = ""
     escaped = False
     for index, char in enumerate(command):
         if escaped:
             escaped = False
             continue
-        if char == "\\" and quote != "'":
+        if char == "^" and windows_style:
+            return True
+        if char == "\\" and quote != "'" and not windows_style:
             escaped = True
             continue
         if quote == "'":
@@ -326,7 +450,17 @@ def _unwrap_command(tokens: list[str]) -> tuple[str, list[str], set[str]]:
                 wrappers.add("sensitive_environment")
             remaining = remaining[1:]
             continue
-        executable = Path(remaining[0]).name
+        executable = ntpath.basename(remaining[0].replace("/", "\\")).casefold()
+        for suffix in (".exe", ".cmd", ".bat", ".com", ".ps1"):
+            if executable.endswith(suffix):
+                executable = executable[: -len(suffix)]
+                break
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+            executable = "python"
+        elif re.fullmatch(r"pythonw(?:\d+(?:\.\d+)*)?", executable):
+            executable = "pythonw"
+        elif re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", executable):
+            executable = "pip"
         if executable == "env":
             wrappers.add(executable)
             remaining = remaining[1:]
@@ -592,8 +726,12 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
             and any(token in {"pip", "tool"} for token in package_tokens)
         ) or (package_command in {"pip", "tool"} and nested_command == "install"):
             findings.append(_finding("package_install", "medium"))
+    if executable in _SYSTEM_PACKAGE_ACTIONS:
+        actions = _SYSTEM_PACKAGE_ACTIONS[executable]
+        if any(token in actions or token.casefold() in actions for token in _tokens_before_separator(args)):
+            findings.append(_finding("package_install", "medium"))
 
-    if executable in {"python", "python3"}:
+    if executable in {"py", "python", "python3", "pythonw"}:
         for index, token in enumerate(args[:-1]):
             if token != "-m" or args[index + 1].split(".", 1)[0] not in {"pip", "pip3"}:
                 continue
@@ -628,7 +766,11 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
 
 
 def _structured_command_findings(command: str, depth: int = 0) -> list[dict[str, str]]:
-    findings: list[dict[str, str]] = []
+    findings = [
+        _finding(code, severity)
+        for code, severity, pattern in _WINDOWS_COMMAND_FINDINGS
+        if pattern.search(command)
+    ]
     if _has_shell_indirection(command):
         findings.append(_finding("shell_indirection", "medium"))
     tokens = _shell_tokens(command)
@@ -686,33 +828,56 @@ def _scan_command(command: str, *, source: str) -> list[dict[str, str]]:
     return _fallback_scan_command(command)
 
 
+def _is_reparse_info(info: os.stat_result) -> bool:
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return bool(marker and attributes & marker)
+
+
 def _private_directory(path: Path) -> Path:
     path = path.expanduser()
     if path.exists() and path.is_symlink():
         raise RuntimeError(f"refusing symlinked state directory: {path}")
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
     info = os.stat(path, follow_symlinks=False)
+    if _is_reparse_info(info):
+        raise RuntimeError(f"refusing reparse-point state directory: {path}")
     if not stat.S_ISDIR(info.st_mode):
         raise RuntimeError(f"state path is not a directory: {path}")
-    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+    if os.name != "nt" and hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise PermissionError(f"state directory is owned by another user: {path}")
-    if info.st_mode & 0o077:
+    if os.name != "nt" and info.st_mode & 0o077:
         path.chmod(0o700)
+    return path
+
+
+def _absolute_configured_path(value: str, name: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"{name} must be an absolute path")
     return path
 
 
 def _data_dir() -> Path:
     configured = os.environ.get("PLUGIN_DATA")
     if configured:
-        return _private_directory(Path(configured))
+        return _private_directory(_absolute_configured_path(configured, "PLUGIN_DATA"))
+    if os.name == "nt":
+        raise RuntimeError("PLUGIN_DATA is required on Windows")
     state_home = os.environ.get("XDG_STATE_HOME")
-    base = Path(state_home) if state_home else Path.home() / ".local" / "state"
+    base = (
+        _absolute_configured_path(state_home, "XDG_STATE_HOME")
+        if state_home
+        else Path.home() / ".local" / "state"
+    )
     return _private_directory(base / "codex-control-plane-hooks")
 
 
 def _policy_path() -> Path:
     configured = os.environ.get("CONTROL_PLANE_POLICY")
-    return Path(configured).expanduser() if configured else _data_dir() / "policy.json"
+    if configured and os.name == "nt":
+        raise RuntimeError("Windows policy must use PLUGIN_DATA/policy.json")
+    return _absolute_configured_path(configured, "CONTROL_PLANE_POLICY") if configured else _data_dir() / "policy.json"
 
 
 def _policy_values(raw: Any, key: str) -> list[str]:
@@ -741,11 +906,11 @@ def _policy() -> dict[str, Any]:
         if explicitly_configured:
             raise RuntimeError("configured policy file is unavailable")
         return _empty_policy()
-    if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+    if path.is_symlink() or _is_reparse_info(info) or not stat.S_ISREG(info.st_mode):
         raise RuntimeError("policy path must be a regular non-symlink file")
     if info.st_size > MAX_POLICY_BYTES:
         raise RuntimeError("policy file exceeds the size limit")
-    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+    if os.name != "nt" and hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise PermissionError("policy file is owned by another user")
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -781,37 +946,96 @@ def _session_id(event: dict[str, Any]) -> str:
 
 
 def _open_private(path: Path, flags: int, mode: int = 0o600):
+    if path.exists() and path.is_symlink():
+        raise RuntimeError(f"refusing symlinked state file: {path}")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(path, flags | nofollow | cloexec, mode)
     info = os.fstat(descriptor)
-    if not stat.S_ISREG(info.st_mode):
+    if _is_reparse_info(info) or not stat.S_ISREG(info.st_mode):
         os.close(descriptor)
-        raise RuntimeError(f"state file is not regular: {path}")
-    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise RuntimeError(f"state file is not a regular non-reparse file: {path}")
+    if os.name != "nt" and hasattr(os, "getuid") and info.st_uid != os.getuid():
         os.close(descriptor)
         raise PermissionError(f"state file is owned by another user: {path}")
-    os.fchmod(descriptor, mode)
+    if os.name != "nt":
+        os.fchmod(descriptor, mode)
     access_mode = flags & os.O_ACCMODE
     stream_mode = "r" if access_mode == os.O_RDONLY else "r+"
     return os.fdopen(descriptor, stream_mode, encoding="utf-8")
+
+
+def _lock_state(stream) -> str:
+    deadline = time.monotonic() + 5.0
+    if fcntl is not None:
+        while True:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return "fcntl"
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out acquiring the POSIX state lock")
+                time.sleep(0.05)
+    if msvcrt is None:
+        raise RuntimeError("no supported state-lock backend is available")
+    stream.seek(0, os.SEEK_END)
+    if stream.tell() == 0:
+        stream.write("0")
+        stream.flush()
+        os.fsync(stream.fileno())
+    while True:
+        stream.seek(0)
+        try:
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            return "msvcrt"
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out acquiring the Windows state lock")
+            time.sleep(0.05)
+
+
+def _unlock_state(stream, backend: str) -> None:
+    if backend == "fcntl":
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return
+    if backend == "msvcrt":
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    raise RuntimeError(f"unknown state-lock backend: {backend}")
 
 
 def _load_state_file(path: Path, session_id: str) -> dict[str, Any]:
     try:
         with _open_private(path, os.O_RDONLY) as stream:
             raw = stream.read()
-        state = json.loads(raw)
-        if not isinstance(state, dict):
-            raise ValueError("state must be an object")
-        updated_at = int(state.get("updated_at") or 0)
-        if updated_at <= 0 or int(time.time()) - updated_at > STATE_TTL_SECONDS:
-            return _default_state(session_id)
-        return state
     except FileNotFoundError:
         return _default_state(session_id)
-    except (OSError, ValueError, TypeError):
+
+    try:
+        state = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("state file contains invalid JSON") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("state file must contain a JSON object")
+    try:
+        schema_version = int(state.get("schema_version"))
+        updated_at = int(state.get("updated_at"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("state file metadata is invalid") from exc
+    if schema_version not in {1, STATE_SCHEMA_VERSION}:
+        raise RuntimeError("state file schema is unsupported")
+    if updated_at <= 0:
+        raise RuntimeError("state file timestamp is invalid")
+    if int(time.time()) - updated_at > STATE_TTL_SECONDS:
         return _default_state(session_id)
+    normalized = _default_state(session_id)
+    for key in normalized:
+        if key in state:
+            normalized[key] = state[key]
+    normalized["schema_version"] = STATE_SCHEMA_VERSION
+    normalized["session_hash"] = _default_state(session_id)["session_hash"]
+    return normalized
 
 
 def _default_state(session_id: str) -> dict[str, Any]:
@@ -838,38 +1062,53 @@ def _mutate_state(session_id: str, mutate: Callable[[dict[str, Any]], None]) -> 
     path = _state_path(session_id)
     lock_path = path.with_suffix(".lock")
     with _open_private(lock_path, os.O_RDWR | os.O_CREAT) as lock:
-        if fcntl is not None:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        lock_backend = _lock_state(lock)
         try:
             state = _load_state_file(path, session_id)
             mutate(state)
             state["schema_version"] = STATE_SCHEMA_VERSION
             state["updated_at"] = int(time.time())
             temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-            with _open_private(temp, os.O_RDWR | os.O_CREAT | os.O_EXCL) as stream:
-                stream.write(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp, path)
+            try:
+                with _open_private(temp, os.O_RDWR | os.O_CREAT | os.O_EXCL) as stream:
+                    stream.write(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp, path)
+            finally:
+                _unlink_owned_regular(temp)
             return state
         finally:
-            if fcntl is not None:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            _unlock_state(lock, lock_backend)
 
 
 def _read_state(session_id: str) -> dict[str, Any]:
     return _mutate_state(session_id, lambda state: None)
 
 
-def _cleanup_state(session_id: str) -> None:
+def _unlink_owned_regular(candidate: Path) -> None:
+    try:
+        info = os.stat(candidate, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    owned = os.name == "nt" or not hasattr(os, "getuid") or info.st_uid == os.getuid()
+    if stat.S_ISREG(info.st_mode) and not _is_reparse_info(info) and owned:
+        candidate.unlink()
+
+
+def _stop_state(session_id: str) -> int:
     path = _state_path(session_id)
-    for candidate in (path, path.with_suffix(".lock")):
+    lock_path = path.with_suffix(".lock")
+    with _open_private(lock_path, os.O_RDWR | os.O_CREAT) as lock:
+        lock_backend = _lock_state(lock)
         try:
-            info = os.stat(candidate, follow_symlinks=False)
-            if stat.S_ISREG(info.st_mode) and (not hasattr(os, "getuid") or info.st_uid == os.getuid()):
-                candidate.unlink()
-        except FileNotFoundError:
-            continue
+            state = _load_state_file(path, session_id)
+            active_count = len(state.get("active_agents") or {})
+            if not active_count:
+                _unlink_owned_regular(path)
+            return active_count
+        finally:
+            _unlock_state(lock, lock_backend)
 
 
 def _flatten_text(value: Any, *, limit: int = MAX_SCAN_CHARS) -> str:
@@ -945,7 +1184,8 @@ def _command_hash(command: str, cwd: str) -> str:
 
 
 def _normalized_cwd(cwd: str) -> str:
-    return os.path.realpath(os.path.abspath(os.path.expanduser(cwd or ".")))
+    resolved = os.path.realpath(os.path.abspath(os.path.expanduser(cwd or ".")))
+    return os.path.normcase(resolved)
 
 
 def _scope_hash(cwd: str) -> str:
@@ -1026,9 +1266,14 @@ def _ordinary_local_git_candidate(command: str, cwd: str, dangerous: set[str]) -
 
 
 def _prompt_scope_hash(prompt: str, cwd: str, pending: dict[str, Any] | None) -> str:
-    match = _ABSOLUTE_PATH_RE.search(prompt)
+    matches = [
+        match
+        for pattern in (_ABSOLUTE_PATH_RE, _WINDOWS_ABSOLUTE_PATH_RE)
+        if (match := pattern.search(prompt))
+    ]
+    match = min(matches, key=lambda item: item.start()) if matches else None
     if match:
-        path = match.group(1).rstrip(")]}>、")
+        path = match.group(1).strip("\"'").rstrip(")]}>、")
         return _scope_hash(path)
     if pending and _PENDING_COMMAND_REFERENCE_RE.search(prompt):
         return str(pending.get("scope_hash") or "")
@@ -1604,15 +1849,12 @@ def _handle_stop(event: dict[str, Any]) -> dict[str, Any]:
     if bool(event.get("stop_hook_active")):
         return {}
     session_id = _session_id(event)
-    state = _read_state(session_id)
-    active_count = len(state.get("active_agents") or {})
+    active_count = _stop_state(session_id)
     if active_count:
         return {
             "decision": "block",
             "reason": f"{active_count} Agent(s) are still active. Wait for or close them, then reconcile their results.",
         }
-
-    _cleanup_state(session_id)
     return {}
 
 
@@ -1652,7 +1894,7 @@ def _internal_error_response(event: dict[str, Any], *, parse_error: bool = False
 def main() -> int:
     event: dict[str, Any] = {}
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="strict"))
         if not isinstance(payload, dict):
             response = _internal_error_response({}, parse_error=True)
         else:
@@ -1660,7 +1902,9 @@ def main() -> int:
             response = dispatch(event)
     except Exception:
         response = _internal_error_response(event, parse_error=not event)
-    sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+    encoded = (json.dumps(response, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    sys.stdout.buffer.write(encoded)
+    sys.stdout.buffer.flush()
     return 0
 
 

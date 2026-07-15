@@ -6,8 +6,11 @@ Contributions are welcome under Apache-2.0.
 
 ```bash
 python3 -B -m unittest discover -s tests -v
+python3 scripts/smoke_hook_manifest.py
 python3 scripts/check_release.py
 ```
+
+Use `python` instead of `python3` on Windows PowerShell. Pull requests must pass the Ubuntu, macOS, Windows, and full-history secret-scan jobs.
 
 Run the Codex-bundled plugin validator when available:
 

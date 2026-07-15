@@ -1,6 +1,6 @@
 {
   "name": "codex-control-plane-hooks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Best-effort local Hook checks for risky commands, selected credential patterns, sensitive-data handling, and Agent lifecycle state.",
   "author": {
     "name": "le-soleil-se-couche",
