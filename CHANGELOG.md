@@ -9,7 +9,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 - Added `apt` and `apt-get` `purge` and `autoremove` coverage to the system-package mutation gate.
 - Limited `%VAR%` and `!VAR!` expansion checks to Windows-style command contexts so POSIX documentation searches remain read-only.
 - Preserved quoted Windows executable paths in exact one-shot authorization parsing while keeping malformed quotes fail closed.
-- Treated a leading PowerShell `&` as a call operator only for literal native executable targets; script files, variables, script blocks, and trailing background operators remain denied.
+- Treated a leading PowerShell `&` as a call operator only for literal native executable targets or selected read-only cmdlets; script files, variables, script blocks, and trailing background operators remain denied.
 - Added focused regressions and adversarial counterexamples for all four PR #2 review findings.
 
 ## [0.2.0] - 2026-07-15
