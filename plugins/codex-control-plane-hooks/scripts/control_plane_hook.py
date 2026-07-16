@@ -144,9 +144,7 @@ _PROMPT_EXTERNAL_TARGET_PATTERNS = (
         ),
     ),
 )
-_MCP_TARGET_CANDIDATE_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])mcp__[^\s,，;；]+"
-)
+_MCP_TARGET_CANDIDATE_RE = re.compile(r"(?i)mcp__\S+")
 _MCP_TARGET_TOKEN_RE = re.compile(r"(?i)^mcp__[A-Za-z0-9_]+(?:__[A-Za-z0-9_]+)?$")
 _MCP_TARGET_TRAILING_PUNCTUATION = ".,!?;:，。！？；：`'\")]}"
 _PROMPT_TARGET_TERMINAL_PUNCTUATION = ".,!?;:，。！？；：`'\")]}"
@@ -1797,7 +1795,7 @@ def _bounded_term_source(term: str) -> str:
     return rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])"
 
 
-def _configured_assignment_pattern(terms: list[str]) -> re.Pattern[str] | None:
+def _configured_term_pattern(terms: list[str]) -> re.Pattern[str] | None:
     alternatives = "|".join(
         re.escape(term)
         for term in sorted(set(terms), key=lambda item: (-len(item), item.casefold()))
@@ -1805,30 +1803,35 @@ def _configured_assignment_pattern(terms: list[str]) -> re.Pattern[str] | None:
     if not alternatives:
         return None
     return re.compile(
-        rf"(?<![A-Za-z0-9_])(?P<term>{alternatives})(?![A-Za-z0-9_])"
-        r"[^\S\r\n]*[:：=]",
+        rf"(?<![A-Za-z0-9_])(?P<term>{alternatives})(?![A-Za-z0-9_])",
         re.IGNORECASE,
     )
 
 
 def _matching_concrete_term_hashes(text: str) -> set[str]:
-    pattern = _configured_assignment_pattern(_policy()["terms"])
+    pattern = _configured_term_pattern(_policy()["terms"])
     if pattern is None:
         return set()
     concrete: set[str] = set()
 
-    def record(match: re.Match[str], value_end: int) -> None:
-        value = _REDACTION_PLACEHOLDER_RE.sub("", text[match.end() : value_end])
+    def record(term: str, value_start: int, value_end: int) -> None:
+        value = _REDACTION_PLACEHOLDER_RE.sub("", text[value_start:value_end])
         if value.strip(" \t\r\n,，;；|"):
-            concrete.add(_policy_value_hash(match.group("term")))
+            concrete.add(_policy_value_hash(term))
 
-    previous: re.Match[str] | None = None
-    for current in pattern.finditer(text):
+    previous: tuple[str, int] | None = None
+    for mention in pattern.finditer(text):
+        cursor = mention.end()
+        while cursor < len(text) and text[cursor] in " \t\r\n":
+            cursor += 1
+        if cursor == len(text) or text[cursor] not in ":：=":
+            continue
+        current = (mention.group("term"), cursor + 1)
         if previous is not None:
-            record(previous, current.start())
+            record(previous[0], previous[1], mention.start())
         previous = current
     if previous is not None:
-        record(previous, len(text))
+        record(previous[0], previous[1], len(text))
     return concrete
 
 
@@ -1844,6 +1847,8 @@ def _external_target_scope_from_prompt(text: str) -> tuple[set[str], str | None]
     mcp_targets: set[str] = set()
     exact_tool_hashes: set[str] = set()
     for match in _MCP_TARGET_CANDIDATE_RE.finditer(text):
+        if not _prompt_mcp_target_start_is_delimited(text, match.start()):
+            return set(), None
         token = match.group(0).rstrip(_MCP_TARGET_TRAILING_PUNCTUATION)
         if not _MCP_TARGET_TOKEN_RE.fullmatch(token):
             return set(), None
@@ -1869,6 +1874,14 @@ def _external_target_scope_from_prompt(text: str) -> tuple[set[str], str | None]
     return mcp_targets | natural_targets, exact_tool_hash
 
 
+def _prompt_mcp_target_start_is_delimited(text: str, start: int) -> bool:
+    return bool(
+        start == 0
+        or text[start - 1].isspace()
+        or text[start - 1] in "([{\"'`（【「『"
+    )
+
+
 def _prompt_target_match_is_delimited(text: str, start: int, end: int) -> bool:
     if start and text[start - 1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./-":
         return False
@@ -1877,13 +1890,9 @@ def _prompt_target_match_is_delimited(text: str, start: int, end: int) -> bool:
     cursor = end
     if text[cursor] not in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
         return False
-    has_non_ascii_terminal = False
     while cursor < len(text) and text[cursor] in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
-        has_non_ascii_terminal = has_non_ascii_terminal or ord(text[cursor]) > 127
         cursor += 1
-    if cursor == len(text) or text[cursor].isspace():
-        return True
-    return has_non_ascii_terminal and ord(text[cursor]) > 127
+    return cursor == len(text) or text[cursor].isspace()
 
 
 def _external_targets_from_tool_name(tool_name: str) -> set[str]:
@@ -1934,7 +1943,11 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
         or not turn_id
     ):
         return None
-    sentences = [item.strip() for item in re.split(r"[。！？!?；;\n]+", prompt) if item.strip()]
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?:[。！？!?；;]+(?=\s|$)|\n+)", prompt)
+        if item.strip()
+    ]
     if any(_SENSITIVE_NEGATION_RE.search(item) and _SENSITIVE_EXTERNAL_VERB_RE.search(item) for item in sentences):
         return None
     for item in sentences:

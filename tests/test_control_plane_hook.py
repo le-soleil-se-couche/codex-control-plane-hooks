@@ -1295,11 +1295,27 @@ class HookProtocolTests(unittest.TestCase):
                 "mcp__github-malicious",
                 "mcp__github.malicious",
                 "mcp__github/malicious",
+                "not-mcp__github__create_file",
+                "not/mcp__github__create_file",
+                "not\\mcp__github__create_file",
+                "not:mcp__github__create_file",
+                "not@mcp__github__create_file",
+                "mcp__github__create_file,evil",
+                "mcp__github__create_file，恶意",
+                "mcp__github__create_file;evil",
+                "mcp__github__create_file；恶意",
+                "mcp__github__create_file?evil",
+                "mcp__github__create_file!evil",
+                "mcp__github__create_file。恶意",
+                "mcp__github__create_file.恶意",
+                "mcp__github__create_file.，恶意",
                 "notgithub",
                 "github-malicious",
                 "not-github",
                 "github.malicious",
                 "github.恶意",
+                "github.，恶意",
+                "github，恶意",
                 "github..malicious",
                 "github.-malicious",
                 "github/malicious",
@@ -1461,6 +1477,25 @@ class HookProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
+    def test_line_wrapped_assignment_separator_remains_concrete(self) -> None:
+        for index, separator in enumerate(("\n: ", "\r\n= ", "\n："), start=1):
+            with self.subTest(separator=repr(separator)):
+                self.turn = f"wrapped-separator-{index}"
+                self.prompt("Process Example Capital position data locally.")
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "mcp__google_drive__upload",
+                        "tool_input": {
+                            "text": (
+                                f"Example Capital position{separator}"
+                                f"TEST_POSITION_031_{index}"
+                            )
+                        },
+                    }
+                )
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
     def test_structured_sensitive_fields_follow_the_same_subset_rule(self) -> None:
         self.prompt(
             "For this turn, I explicitly authorize sending Example Capital position details "
@@ -1567,10 +1602,18 @@ class HookProtocolTests(unittest.TestCase):
         module = __import__("control_plane_hook")
         prefix = "Example Capital position: {{redacted}}\n"
         payload = prefix + ("\n" * (module.MAX_SCAN_CHARS - len(prefix)))
+        separator_prefix = "Example Capital position"
+        separator_payload = (
+            separator_prefix
+            + ("\n" * (module.MAX_SCAN_CHARS - len(separator_prefix) - 20))
+            + ": TEST_POSITION_032"
+        )
         started = time.monotonic()
         result = module._matching_concrete_term_hashes(payload)
+        separator_result = module._matching_concrete_term_hashes(separator_payload)
         elapsed = time.monotonic() - started
         self.assertEqual(set(), result)
+        self.assertIn(module._policy_value_hash("position"), separator_result)
         self.assertLess(elapsed, 3.0)
 
     def test_affirmative_post_term_wording_remains_authorized(self) -> None:
