@@ -56,6 +56,14 @@ _TERM_NEGATION_SUFFIX_RE = re.compile(
     r"do\s+not\s+(?:include|send)|不要|不包括|不含|排除|除外"
     r")\s*[,，:]?\s*$"
 )
+_TERM_NEGATION_POSTFIX_RE = re.compile(
+    r"(?ix)^[ \t]*(?:"
+    r"(?:is[ \t]+)?not[ \t]+(?:included|authorized|allowed|sent|shared)|"
+    r"(?:is[ \t]+)?excluded|"
+    r"(?:must|should)[ \t]+not[ \t]+be[ \t]+(?:included|sent|shared)|"
+    r"不包括|不包含|不含|排除|除外|不发送|不得发送"
+    r")(?=$|[\s,，;；:.])"
+)
 _SENSITIVE_EXPLICIT_AUTH_RE = re.compile(
     r"本轮明确授权|这次明确授权|现在明确授权|本轮明确允许|这次明确允许|I\s+explicitly\s+authorize",
     re.IGNORECASE,
@@ -71,6 +79,29 @@ _EXTERNAL_TARGET_PATTERNS = (
     ("github", re.compile(r"(?i)github|mcp__github|\bgh\b")),
     ("browser", re.compile(r"(?i)browser|chrome|computer[ _-]*use")),
     ("web", re.compile(r"(?i)(?:^|[^a-z])web(?:[^a-z]|$)|https?://")),
+)
+_PROMPT_EXTERNAL_TARGET_PATTERNS = (
+    ("google_drive", re.compile(r"(?i)(?<![A-Za-z0-9_])google[ _-]*drive(?![A-Za-z0-9_])")),
+    ("gmail", re.compile(r"(?i)(?<![A-Za-z0-9_])gmail(?![A-Za-z0-9_])")),
+    ("notion", re.compile(r"(?i)(?<![A-Za-z0-9_])notion(?![A-Za-z0-9_])")),
+    ("slack", re.compile(r"(?i)(?<![A-Za-z0-9_])slack(?![A-Za-z0-9_])")),
+    ("teams", re.compile(r"(?i)(?<![A-Za-z0-9_])(?:microsoft[ _-]*)?teams(?![A-Za-z0-9_])")),
+    ("sharepoint", re.compile(r"(?i)(?<![A-Za-z0-9_])sharepoint(?![A-Za-z0-9_])")),
+    ("box", re.compile(r"(?i)(?<![A-Za-z0-9_])box(?![A-Za-z0-9_])")),
+    (
+        "github",
+        re.compile(r"(?i)(?<![A-Za-z0-9_])(?:github|gh)(?![A-Za-z0-9_])"),
+    ),
+    (
+        "browser",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_])(?:browser|chrome|computer[ _-]*use)(?![A-Za-z0-9_])"
+        ),
+    ),
+    ("web", re.compile(r"(?i)(?<![A-Za-z0-9_])web(?![A-Za-z0-9_])|https?://")),
+)
+_MCP_TARGET_TOKEN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])mcp__[A-Za-z0-9_]+(?:__[A-Za-z0-9_]+)?(?![A-Za-z0-9_])"
 )
 _TRUSTED_MCP_SERVER_TARGETS = {
     "box": "box",
@@ -1721,7 +1752,7 @@ def _matching_concrete_term_hashes(text: str) -> set[str]:
     for term in _policy()["terms"]:
         pattern = re.compile(
             _bounded_term_source(term)
-            + r"\s*[:：=]\s*(?!\{\{)[^\n,，;；|]{2,}",
+            + r"[^\S\r\n]*[:：=](?![^\S\r\n]*\{\{)[^\S\r\n]*[^\r\n,，;；|]{2,}",
             re.IGNORECASE,
         )
         if pattern.search(text):
@@ -1738,7 +1769,17 @@ def _sensitive_concrete(text: str) -> bool:
 
 
 def _external_targets_from_prompt(text: str) -> set[str]:
-    return {name for name, pattern in _EXTERNAL_TARGET_PATTERNS if pattern.search(text)}
+    mcp_targets: set[str] = set()
+    for match in _MCP_TARGET_TOKEN_RE.finditer(text):
+        targets = _external_targets_from_tool_name(match.group(0))
+        if not targets:
+            return set()
+        mcp_targets.update(targets)
+    natural_text = _MCP_TARGET_TOKEN_RE.sub(" ", text)
+    natural_targets = {
+        name for name, pattern in _PROMPT_EXTERNAL_TARGET_PATTERNS if pattern.search(natural_text)
+    }
+    return mcp_targets | natural_targets
 
 
 def _external_targets_from_tool_name(tool_name: str) -> set[str]:
@@ -1770,7 +1811,11 @@ def _matching_grant_term_hashes(text: str) -> set[str]:
         mentions = list(re.finditer(_bounded_term_source(term), text, re.IGNORECASE))
         if not mentions:
             continue
-        if any(_TERM_NEGATION_SUFFIX_RE.search(text[max(0, item.start() - 48) : item.start()]) for item in mentions):
+        if any(
+            _TERM_NEGATION_SUFFIX_RE.search(text[max(0, item.start() - 48) : item.start()])
+            or _TERM_NEGATION_POSTFIX_RE.search(text[item.end() : item.end() + 48])
+            for item in mentions
+        ):
             continue
         matched.add(_policy_value_hash(term))
     return matched
