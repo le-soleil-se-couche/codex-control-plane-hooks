@@ -412,12 +412,14 @@ def _strip_token_quotes(token: str) -> str:
 
 def _is_literal_powershell_call_target(token: str) -> bool:
     target = _strip_token_quotes(token)
-    if not target or any(char in target for char in "$`(){};&|<>"):
+    if not target or any(char in target for char in "$`{};&|<>"):
         return False
     if re.search(r"(?i)\.(?:ps1|cmd|bat)$", target):
         return False
     if re.search(r"(?i)\.(?:exe|com)$", target):
         return True
+    if any(char in target for char in "()"):
+        return False
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", target))
 
 
@@ -436,6 +438,8 @@ def _shell_tokens(command: str) -> list[str]:
 def _has_shell_indirection(command: str) -> bool:
     windows_style = _looks_like_windows_command(command)
     if windows_style and _WINDOWS_ENV_EXPANSION_RE.search(command):
+        if os.name == "nt":
+            return True
         tokens = _shell_tokens(command)
         executable, _, wrappers = _unwrap_command(tokens)
         read_only_literal_context = not wrappers and (
@@ -1475,6 +1479,12 @@ def _authorization_command_candidates(segment: str) -> list[str]:
         return code_spans
 
     quoted_windows = _QUOTED_WINDOWS_EXECUTABLE_RE.search(segment)
+    approval = _DANGEROUS_APPROVAL_RE.match(segment)
+    if quoted_windows:
+        prefix_start = approval.end() if approval else 0
+        prefix = segment[prefix_start : quoted_windows.start()].strip()
+        if prefix not in {"", "&"}:
+            return []
     if quoted_windows:
         prefix = segment[: quoted_windows.start()].rstrip()
         call_operator = "& " if re.search(r"(?:^|\s)&\s*$", prefix) else ""

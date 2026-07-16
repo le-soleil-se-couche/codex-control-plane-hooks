@@ -181,6 +181,16 @@ class HookProtocolTests(unittest.TestCase):
         with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
             self.assertTrue(module._has_shell_indirection("Write-Output %APPDATA%"))
 
+        with mock.patch.object(module.os, "name", "nt"):
+            for command in [
+                "rg %APPDATA% docs",
+                "echo %TOKEN%",
+                r"type %USERPROFILE%\notes.txt",
+                "grep !PATH! README.md",
+            ]:
+                with self.subTest(native_windows_command=command):
+                    self.assertTrue(module._has_shell_indirection(command))
+
         for command in commands:
             with self.subTest(protocol_command=command):
                 self.assertEqual({}, self.bash(command))
@@ -188,6 +198,9 @@ class HookProtocolTests(unittest.TestCase):
     def test_powershell_call_operator_preserves_safe_windows_invocation(self) -> None:
         command = r'& "C:\Program Files\Git\bin\git.exe" status --short'
         self.assertEqual({}, self.bash(command))
+        self.assertEqual(
+            {}, self.bash(r'& "C:\Program Files (x86)\Git\bin\git.exe" status --short')
+        )
         self.assertEqual({}, self.bash("& Get-ChildItem"))
 
         module = __import__("control_plane_hook")
@@ -258,6 +271,10 @@ class HookProtocolTests(unittest.TestCase):
 
         malformed = r'允许执行 "C:\Program Files\Git\bin\git.exe push origin main'
         self.assertEqual([], module._authorization_command_candidates(malformed))
+
+        embedded = f"允许执行 echo {command}"
+        self.assertNotIn(command, module._authorization_command_candidates(embedded))
+        self.assertNotIn("git_push", module._dangerous_authorization_hashes(embedded, DEFAULT_CWD))
 
     def test_linux_shells_package_managers_and_transfers_are_classified(self) -> None:
         commands = [
