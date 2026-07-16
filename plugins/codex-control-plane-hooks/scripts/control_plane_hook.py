@@ -50,6 +50,12 @@ _SECRET_PATTERNS = (
 )
 _SENSITIVE_EXTERNAL_VERB_RE = re.compile(r"外发|披露|上传|发送|共享|external|upload|share|send", re.IGNORECASE)
 _SENSITIVE_NEGATION_RE = re.compile(r"不要|别|禁止|不许|不得|不允许|拒绝|do\s+not|don't|never", re.IGNORECASE)
+_TERM_NEGATION_SUFFIX_RE = re.compile(
+    r"(?ix)(?:"
+    r"(?:but\s+)?not|except(?:\s+for)?|excluding|exclude|without|"
+    r"do\s+not\s+(?:include|send)|不要|不包括|不含|排除|除外"
+    r")\s*[,，:]?\s*$"
+)
 _SENSITIVE_EXPLICIT_AUTH_RE = re.compile(
     r"本轮明确授权|这次明确授权|现在明确授权|本轮明确允许|这次明确允许|I\s+explicitly\s+authorize",
     re.IGNORECASE,
@@ -66,7 +72,37 @@ _EXTERNAL_TARGET_PATTERNS = (
     ("browser", re.compile(r"(?i)browser|chrome|computer[ _-]*use")),
     ("web", re.compile(r"(?i)(?:^|[^a-z])web(?:[^a-z]|$)|https?://")),
 )
-_TRUSTED_MCP_MULTIPLEXERS = {"codex_apps"}
+_TRUSTED_MCP_SERVER_TARGETS = {
+    "box": "box",
+    "browser": "browser",
+    "chrome": "browser",
+    "computer_use": "browser",
+    "github": "github",
+    "gmail": "gmail",
+    "google_drive": "google_drive",
+    "microsoft_teams": "teams",
+    "notion": "notion",
+    "sharepoint": "sharepoint",
+    "slack": "slack",
+    "teams": "teams",
+    "web": "web",
+}
+_TRUSTED_MCP_MULTIPLEXER_TARGET_PREFIXES = {
+    "codex_apps": (
+        ("box_", "box"),
+        ("browser_", "browser"),
+        ("chrome_", "browser"),
+        ("computer_use_", "browser"),
+        ("github_", "github"),
+        ("gmail_", "gmail"),
+        ("google_drive_", "google_drive"),
+        ("notion_", "notion"),
+        ("sharepoint_", "sharepoint"),
+        ("slack_", "slack"),
+        ("teams_", "teams"),
+        ("web_", "web"),
+    )
+}
 _EXTERNAL_TOOL_RE = re.compile(
     r"(?i)(gmail|google|drive|notion|slack|teams|outlook|canva|github|browser|chrome|web|upload|send|post|publish|share)"
 )
@@ -173,7 +209,19 @@ _POWERSHELL_READ_ONLY_COMMANDS = {
     "get-process",
     "select-string",
 }
-_READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "branch", "rev-parse", "ls-files", "grep", "remote", "blame", "ls-tree"}
+_READ_ONLY_GIT_SUBCOMMANDS = {
+    "blame",
+    "branch",
+    "diff",
+    "grep",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "remote",
+    "rev-parse",
+    "show",
+    "status",
+}
 _CONTROL_TOKENS = {";", "&&", "||", "|", "&"}
 _SHELL_EVAL = {"ash", "bash", "dash", "fish", "ksh", "sh", "zsh"}
 _PRIVILEGE_WRAPPERS = {"doas", "pkexec", "runuser", "su", "sudo"}
@@ -663,7 +711,7 @@ def _git_is_read_only(subcommand: str, args: list[str], dynamic_config: bool) ->
     if any(token == "--output" or token.startswith("--output=") for token in args):
         return False
     if subcommand == "branch":
-        mutation_flags = {
+        mutation_options = {
             "-d",
             "-D",
             "-m",
@@ -678,11 +726,10 @@ def _git_is_read_only(subcommand: str, args: list[str], dynamic_config: bool) ->
             "--unset-upstream",
             "--edit-description",
         }
+        option_args = _before_option_terminator(args)
         if any(
-            token in mutation_flags
-            or token.startswith("--set-upstream-to=")
-            or (token.startswith("-u") and token != "--")
-            for token in args
+            token.split("=", 1)[0] in mutation_options or _branch_short_options_mutate(token)
+            for token in option_args
         ):
             return False
         positional = [token for token in args if not token.startswith("-")]
@@ -694,9 +741,26 @@ def _git_is_read_only(subcommand: str, args: list[str], dynamic_config: bool) ->
         if action == "get-url":
             return True
         if action == "show":
-            return any(token in {"-n", "--no-query"} for token in remote_args)
+            return _has_option_before_terminator(remote_args, {"-n", "--no-query"})
         return False
     return True
+
+
+def _before_option_terminator(args: list[str]) -> list[str]:
+    try:
+        return args[: args.index("--")]
+    except ValueError:
+        return args
+
+
+def _has_option_before_terminator(args: list[str], options: set[str]) -> bool:
+    return any(token in options for token in _before_option_terminator(args))
+
+
+def _branch_short_options_mutate(token: str) -> bool:
+    if not token.startswith("-") or token.startswith("--"):
+        return False
+    return any(letter in "dDmMcCu" for letter in token[1:])
 
 
 def _git_remote_command(args: list[str]) -> tuple[str, list[str]]:
@@ -715,11 +779,11 @@ def _git_uses_network(subcommand: str, args: list[str]) -> bool:
         return False
     action, remote_args = _git_remote_command(args)
     if action == "show":
-        return not any(token in {"-n", "--no-query"} for token in remote_args)
+        return not _has_option_before_terminator(remote_args, {"-n", "--no-query"})
     if action == "add":
-        return any(token in {"-f", "--fetch"} for token in remote_args)
+        return _has_option_before_terminator(remote_args, {"-f", "--fetch"})
     if action == "set-head":
-        return any(token in {"-a", "--auto"} for token in remote_args)
+        return _has_option_before_terminator(remote_args, {"-a", "--auto"})
     return action in {"prune", "update"}
 
 
@@ -1363,6 +1427,13 @@ def _flatten_sensitive_fields(value: Any, *, limit: int = MAX_SCAN_CHARS) -> str
     parts: list[str] = []
     size = 0
 
+    def has_content(item: Any) -> bool:
+        if isinstance(item, dict):
+            return any(has_content(child) for child in item.values())
+        if isinstance(item, (list, tuple)):
+            return any(has_content(child) for child in item)
+        return item is not None and bool(str(item).strip())
+
     def append(item: Any) -> None:
         nonlocal size
         if item is None or size >= limit:
@@ -1378,9 +1449,11 @@ def _flatten_sensitive_fields(value: Any, *, limit: int = MAX_SCAN_CHARS) -> str
             for key, child in item.items():
                 if isinstance(child, (str, int, float, bool)):
                     append(f"{key}: {child}")
+                elif has_content(child):
+                    append(f"{key}: [structured]")
+                    visit(child)
                 else:
                     append(key)
-                    visit(child)
         elif isinstance(item, (list, tuple)):
             for child in item:
                 visit(child)
@@ -1639,12 +1712,16 @@ def _sensitive_context(text: str) -> bool:
     )
 
 
+def _bounded_term_source(term: str) -> str:
+    return rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])"
+
+
 def _matching_concrete_term_hashes(text: str) -> set[str]:
     concrete: set[str] = set()
     for term in _policy()["terms"]:
         pattern = re.compile(
-            rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])"
-            rf"\s*[:：=]\s*(?!\{{\{{)[^\n,，;；|]{{2,}}",
+            _bounded_term_source(term)
+            + rf"\s*[:：=]\s*(?!\{{\{{)[^\n,，;；|]{{2,}}",
             re.IGNORECASE,
         )
         if pattern.search(text):
@@ -1664,31 +1741,39 @@ def _external_targets_from_prompt(text: str) -> set[str]:
     return {name for name, pattern in _EXTERNAL_TARGET_PATTERNS if pattern.search(text)}
 
 
-def _trusted_tool_identity(tool_name: str) -> str:
+def _external_targets_from_tool_name(tool_name: str) -> set[str]:
     if not tool_name.startswith("mcp__"):
-        return tool_name
+        return {name for name, pattern in _EXTERNAL_TARGET_PATTERNS if pattern.search(tool_name)}
     parts = tool_name.split("__", 2)
     if len(parts) < 2:
-        return tool_name
+        return set()
     server = parts[1].casefold()
-    return tool_name if server in _TRUSTED_MCP_MULTIPLEXERS else server
-
-
-def _external_targets_from_tool_name(tool_name: str) -> set[str]:
-    identity = _trusted_tool_identity(tool_name)
-    return {name for name, pattern in _EXTERNAL_TARGET_PATTERNS if pattern.search(identity)}
+    direct_target = _TRUSTED_MCP_SERVER_TARGETS.get(server)
+    if direct_target:
+        return {direct_target}
+    if len(parts) < 3:
+        return set()
+    operation = parts[2].casefold()
+    for prefix, target in _TRUSTED_MCP_MULTIPLEXER_TARGET_PREFIXES.get(server, ()):
+        if operation == prefix.removesuffix("_") or operation.startswith(prefix):
+            return {target}
+    return set()
 
 
 def _policy_value_hash(value: str) -> str:
     return hashlib.sha256(value.casefold().encode("utf-8", errors="replace")).hexdigest()
 
 
-def _matching_term_hashes(text: str) -> set[str]:
-    return {
-        _policy_value_hash(term)
-        for term in _policy()["terms"]
-        if re.search(re.escape(term), text, re.IGNORECASE)
-    }
+def _matching_grant_term_hashes(text: str) -> set[str]:
+    matched: set[str] = set()
+    for term in _policy()["terms"]:
+        mentions = list(re.finditer(_bounded_term_source(term), text, re.IGNORECASE))
+        if not mentions:
+            continue
+        if any(_TERM_NEGATION_SUFFIX_RE.search(text[max(0, item.start() - 48) : item.start()]) for item in mentions):
+            continue
+        matched.add(_policy_value_hash(term))
+    return matched
 
 
 def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | None:
@@ -1705,7 +1790,7 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
         return None
     for item in sentences:
         targets = _external_targets_from_prompt(item)
-        term_hashes = _matching_term_hashes(item)
+        term_hashes = _matching_grant_term_hashes(item)
         if all(
             (
                 _SENSITIVE_EXPLICIT_AUTH_RE.search(item),
@@ -1848,7 +1933,8 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
     if sensitive:
         return _context(
             "UserPromptSubmit",
-            "Configured sensitive-business context is present. Keep concrete values local; aggregate or redact before durable or external use.",
+            "Configured sensitive-business context is present. Keep concrete values local; "
+            "aggregate or redact before durable or external use.",
         )
     return {}
 
@@ -2064,11 +2150,20 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
     ):
         notes: list[str] = []
         if dangerous:
-            notes.append("The scoped authorization was accepted for this turn; do not request the same authorization again.")
+            notes.append(
+                "The scoped authorization was accepted for this turn; "
+                "do not request the same authorization again."
+            )
         if secret_redaction or sensitive_redaction:
-            notes.append("Local redaction accepted because newly persisted content no longer contains the detected sensitive value.")
+            notes.append(
+                "Local redaction accepted because newly persisted content no longer contains "
+                "the detected sensitive value."
+            )
         if sensitive or (state.get("sensitive_context") and external):
-            notes.append("Keep configured sensitive-business data aggregated or redacted; do not disclose concrete values.")
+            notes.append(
+                "Keep configured sensitive-business data aggregated or redacted; "
+                "do not disclose concrete values."
+            )
         return _context("PreToolUse", " ".join(notes))
     return {}
 
@@ -2093,7 +2188,10 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
             "reason": "Potential credential detected in tool output. Do not repeat, persist, or externalize it.",
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": "Treat the original tool output as sensitive and continue only with a redacted summary.",
+                "additionalContext": (
+                    "Treat the original tool output as sensitive and continue only with "
+                    "a redacted summary."
+                ),
             },
         }
     concrete_sensitive = _sensitive_concrete(response_text) or bool(
@@ -2102,7 +2200,8 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
     if concrete_sensitive:
         return _context(
             "PostToolUse",
-            "The tool returned configured sensitive-business data. Use it only for the authorized local task and redact or aggregate it before durable notes, logs, public docs, or external services.",
+            "The tool returned configured sensitive-business data. Use it only for the authorized local task "
+            "and redact or aggregate it before durable notes, logs, public docs, or external services.",
         )
     return {}
 
@@ -2162,7 +2261,10 @@ def _handle_stop(event: dict[str, Any]) -> dict[str, Any]:
     if active_count:
         return {
             "decision": "block",
-            "reason": f"{active_count} Agent(s) are still active. Wait for or close them, then reconcile their results.",
+            "reason": (
+                f"{active_count} Agent(s) are still active. Wait for or close them, "
+                "then reconcile their results."
+            ),
         }
     return {}
 

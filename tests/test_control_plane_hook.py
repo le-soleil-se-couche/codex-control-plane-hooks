@@ -88,7 +88,8 @@ class HookProtocolTests(unittest.TestCase):
             "permission_mode": "default",
             **event,
         }
-        if payload.get("hook_event_name") in {"PreToolUse", "PermissionRequest", "PostToolUse"} and "tool_use_id" not in payload:
+        tool_events = {"PreToolUse", "PermissionRequest", "PostToolUse"}
+        if payload.get("hook_event_name") in tool_events and "tool_use_id" not in payload:
             self.tool_sequence += 1
             payload["tool_use_id"] = f"tool-{self.tool_sequence}"
         return self.run_raw(json.dumps(payload), data_dir=data_dir)[1]
@@ -1274,6 +1275,20 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
+    def test_unknown_mcp_server_name_cannot_spoof_authorized_target(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to GitHub."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__custom_github_store__write",
+                "tool_input": {"text": "Example Capital position: TEST_POSITION_017"},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
     def test_sensitive_disclosure_requires_every_concrete_term(self) -> None:
         self.prompt(
             "For this turn, I explicitly authorize sending Example Capital position details "
@@ -1334,6 +1349,57 @@ class HookProtocolTests(unittest.TestCase):
                     "position": "TEST_POSITION_016",
                     "client": "TEST_CLIENT_016",
                 },
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_nested_sensitive_structures_are_concrete(self) -> None:
+        self.prompt("Process Example Capital position data locally.")
+        payloads = [
+            {
+                "organization": "Example Capital",
+                "position": {"ticker": "TEST_TICKER_017", "shares": 100},
+            },
+            {
+                "organization": "Example Capital",
+                "position": [{"ticker": "TEST_TICKER_018", "shares": 200}],
+            },
+        ]
+        for tool_input in payloads:
+            with self.subTest(tool_input=tool_input):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "mcp__google_drive__upload",
+                        "tool_input": tool_input,
+                    }
+                )
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_grant_terms_require_boundaries(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending the Example Capital navigation report "
+            "to Google Drive."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {"text": "Example Capital NAV: TEST_NAV_017"},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_term_specific_negation_is_excluded_from_grant(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position, but not client, "
+            "to Google Drive."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {"text": "Example Capital client: TEST_CLIENT_017"},
             }
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
@@ -1700,6 +1766,7 @@ class HookProtocolTests(unittest.TestCase):
             "git remote prune origin",
             "git remote add -f example https://example.invalid/repo.git",
             "git remote set-head example -a",
+            "git remote show origin -- -n",
         ]:
             with self.subTest(network_command=command):
                 result = self.bash(command)
@@ -1722,6 +1789,7 @@ class HookProtocolTests(unittest.TestCase):
     def test_git_branch_metadata_mutations_are_denied(self) -> None:
         for command in [
             "git branch -u origin/main",
+            "git branch -quorigin/main",
             "git branch --set-upstream-to=origin/main",
             "git branch --unset-upstream",
             "git branch --edit-description",

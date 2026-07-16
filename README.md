@@ -12,7 +12,7 @@ Version-scoped reference Hooks for local Codex workflows. The plugin applies bes
 - Exact turn, tool, working-directory, command-hash, and one-shot approval state.
 - Optional organization-specific markers and data terms from a private `policy.json`.
 - Optional private durable-destination markers from the same local policy.
-- One-shot sensitive-disclosure grants bound to every concrete configured data term in the payload and one recognized tool destination.
+- One-shot sensitive-disclosure grants bound to every concrete configured data term in the payload and one canonical trusted tool destination.
 - Local redaction patches: `apply_patch` and structured `Edit` can remove detected values when newly persisted content is clean.
 - Observed Agent lifecycle state, advisory nesting context, a pre-compaction state checkpoint, and Stop blocking while Agents remain active.
 - A small `verified-work-closure` Skill for evidence-backed completion receipts.
@@ -101,7 +101,7 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 127 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
+| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 131 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
 | GitHub Actions runtime | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Linux Codex host | 2026-07-15 |
 | GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Windows Codex host | 2026-07-15 |
 
@@ -111,7 +111,7 @@ Runtime support and Codex-host compatibility are separate claims. Hook event nam
 
 - Checks only run for events matched by `hooks/hooks.json` and emitted by the host.
 - Secret detection covers selected patterns and scans a bounded amount of text.
-- Unknown `mcp__*` tools are treated as external destinations when sensitive context is active and cannot consume a grant for a named connector.
+- Unknown `mcp__*` tools are treated as external destinations when sensitive context is active. Payload text and lookalike server namespaces cannot consume a grant for a named connector.
 - Post-tool checks occur after a tool has produced output.
 - Natural-language approval parsing remains experimental even when explicitly enabled.
 - Browser, Computer Use, and connector behavior depends on the tool name and Hook events exposed by the host.
