@@ -60,9 +60,10 @@ _TERM_NEGATION_POSTFIX_RE = re.compile(
     r"(?ix)^[ \t]*[,，:]?[ \t]*(?:"
     r"(?:is[ \t]+)?not[ \t]+(?:included|authorized|allowed|sent|shared|uploaded|disclosed)|"
     r"(?:is[ \t]+)?excluded|"
-    r"(?:must|should)[ \t]+not[ \t]+be[ \t]+"
+    r"(?:(?:must|should|will|shall)[ \t]+not(?:[ \t]+be)?|won['’]t(?:[ \t]+be)?)[ \t]+"
     r"(?:included|sent|shared|uploaded|disclosed)|"
-    r"不包括|不包含|不含|排除|除外|不发送|不得发送|不上传|不得上传|不披露|不得披露"
+    r"不包括|不包含|不含|排除|除外|不发送|不得发送|不上传|不得上传|不披露|不得披露|"
+    r"不会上传|不会披露"
     r")(?=$|[\s,，;；:.])"
 )
 _SENSITIVE_EXPLICIT_AUTH_RE = re.compile(
@@ -82,28 +83,75 @@ _EXTERNAL_TARGET_PATTERNS = (
     ("web", re.compile(r"(?i)(?:^|[^a-z])web(?:[^a-z]|$)|https?://")),
 )
 _PROMPT_EXTERNAL_TARGET_PATTERNS = (
-    ("google_drive", re.compile(r"(?i)(?<![A-Za-z0-9_])google[ _-]*drive(?![A-Za-z0-9_])")),
-    ("gmail", re.compile(r"(?i)(?<![A-Za-z0-9_])gmail(?![A-Za-z0-9_])")),
-    ("notion", re.compile(r"(?i)(?<![A-Za-z0-9_])notion(?![A-Za-z0-9_])")),
-    ("slack", re.compile(r"(?i)(?<![A-Za-z0-9_])slack(?![A-Za-z0-9_])")),
-    ("teams", re.compile(r"(?i)(?<![A-Za-z0-9_])(?:microsoft[ _-]*)?teams(?![A-Za-z0-9_])")),
-    ("sharepoint", re.compile(r"(?i)(?<![A-Za-z0-9_])sharepoint(?![A-Za-z0-9_])")),
-    ("box", re.compile(r"(?i)(?<![A-Za-z0-9_])box(?![A-Za-z0-9_])")),
+    (
+        "google_drive",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])google[ _-]*drive"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "gmail",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])gmail(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
+    (
+        "notion",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])notion(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
+    (
+        "slack",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])slack(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
+    (
+        "teams",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])(?:microsoft[ _-]*)?teams"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "sharepoint",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])sharepoint"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "box",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])box(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
     (
         "github",
-        re.compile(r"(?i)(?<![A-Za-z0-9_])(?:github|gh)(?![A-Za-z0-9_])"),
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])(?:github|gh)"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
     ),
     (
         "browser",
         re.compile(
-            r"(?i)(?<![A-Za-z0-9_])(?:browser|chrome|computer[ _-]*use)(?![A-Za-z0-9_])"
+            r"(?i)(?<![A-Za-z0-9_./-])"
+            r"(?:browser|chrome|computer[ _-]*use)"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
         ),
     ),
-    ("web", re.compile(r"(?i)(?<![A-Za-z0-9_])web(?![A-Za-z0-9_])|https?://")),
+    (
+        "web",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])web(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])|https?://"
+        ),
+    ),
 )
-_MCP_TARGET_TOKEN_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_-])mcp__[A-Za-z0-9_-]+(?![A-Za-z0-9_-])"
+_MCP_TARGET_CANDIDATE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])mcp__[^\s,，;；]+"
 )
+_MCP_TARGET_TOKEN_RE = re.compile(r"(?i)^mcp__[A-Za-z0-9_]+(?:__[A-Za-z0-9_]+)?$")
+_MCP_TARGET_TRAILING_PUNCTUATION = ".,!?;:，。！？；：`'\")]}"
+_PROMPT_TARGET_TERMINAL_PUNCTUATION = ".,!?;:，。！？；：`'\")]}"
+_REDACTION_PLACEHOLDER_RE = re.compile(
+    r"(?i)\{\{[ \t]*(?:redacted|removed|masked|omitted)[ \t]*\}\}"
+)
+_FIELD_VALUE_SEPARATOR_RE = re.compile(r"[,，;；|]")
 _TRUSTED_MCP_SERVER_TARGETS = {
     "box": "box",
     "browser": "browser",
@@ -1748,15 +1796,37 @@ def _bounded_term_source(term: str) -> str:
     return rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])"
 
 
+def _line_contains_configured_assignment(line: str) -> bool:
+    return any(
+        re.search(
+            _bounded_term_source(term) + r"[^\S\r\n]*[:：=]",
+            line,
+            re.IGNORECASE,
+        )
+        for term in _policy()["terms"]
+    )
+
+
+def _has_concrete_field_value(text: str, value_start: int) -> bool:
+    lines = text[value_start:].splitlines()
+    for index, line in enumerate(lines[:4]):
+        if index and _line_contains_configured_assignment(line):
+            return False
+        fragment = _FIELD_VALUE_SEPARATOR_RE.split(line, maxsplit=1)[0]
+        remainder = _REDACTION_PLACEHOLDER_RE.sub("", fragment)
+        if remainder.strip():
+            return True
+    return False
+
+
 def _matching_concrete_term_hashes(text: str) -> set[str]:
     concrete: set[str] = set()
     for term in _policy()["terms"]:
         pattern = re.compile(
-            _bounded_term_source(term)
-            + r"[^\S\r\n]*[:：=](?![^\S\r\n]*\{\{)[^\S\r\n]*[^\r\n,，;；|]{2,}",
+            _bounded_term_source(term) + r"[^\S\r\n]*[:：=]",
             re.IGNORECASE,
         )
-        if pattern.search(text):
+        if any(_has_concrete_field_value(text, match.end()) for match in pattern.finditer(text)):
             concrete.add(_policy_value_hash(term))
     return concrete
 
@@ -1769,18 +1839,46 @@ def _sensitive_concrete(text: str) -> bool:
     return bool(_sensitive_context(text) and _contains_concrete_sensitive_term(text))
 
 
-def _external_targets_from_prompt(text: str) -> set[str]:
+def _external_target_scope_from_prompt(text: str) -> tuple[set[str], str | None]:
     mcp_targets: set[str] = set()
-    for match in _MCP_TARGET_TOKEN_RE.finditer(text):
-        targets = _external_targets_from_tool_name(match.group(0))
+    exact_tool_hashes: set[str] = set()
+    for match in _MCP_TARGET_CANDIDATE_RE.finditer(text):
+        token = match.group(0).rstrip(_MCP_TARGET_TRAILING_PUNCTUATION)
+        if not _MCP_TARGET_TOKEN_RE.fullmatch(token):
+            return set(), None
+        targets = _external_targets_from_tool_name(token)
         if not targets:
-            return set()
+            return set(), None
         mcp_targets.update(targets)
-    natural_text = _MCP_TARGET_TOKEN_RE.sub(" ", text)
+        if len(token.split("__", 2)) == 3:
+            exact_tool_hashes.add(_policy_value_hash(token))
+    if len(exact_tool_hashes) > 1:
+        return set(), None
+    natural_text = _MCP_TARGET_CANDIDATE_RE.sub(" ", text)
     natural_targets = {
-        name for name, pattern in _PROMPT_EXTERNAL_TARGET_PATTERNS if pattern.search(natural_text)
+        name
+        for name, pattern in _PROMPT_EXTERNAL_TARGET_PATTERNS
+        if any(
+            (name == "web" and match.group(0).casefold().startswith(("http://", "https://")))
+            or _prompt_target_match_is_delimited(natural_text, match.start(), match.end())
+            for match in pattern.finditer(natural_text)
+        )
     }
-    return mcp_targets | natural_targets
+    exact_tool_hash = next(iter(exact_tool_hashes)) if exact_tool_hashes else None
+    return mcp_targets | natural_targets, exact_tool_hash
+
+
+def _prompt_target_match_is_delimited(text: str, start: int, end: int) -> bool:
+    if start and text[start - 1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./-":
+        return False
+    if end == len(text) or text[end].isspace():
+        return True
+    cursor = end
+    if text[cursor] not in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
+        return False
+    while cursor < len(text) and text[cursor] in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
+        cursor += 1
+    return cursor == len(text) or text[cursor].isspace() or ord(text[cursor]) > 127
 
 
 def _external_targets_from_tool_name(tool_name: str) -> set[str]:
@@ -1835,7 +1933,7 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
     if any(_SENSITIVE_NEGATION_RE.search(item) and _SENSITIVE_EXTERNAL_VERB_RE.search(item) for item in sentences):
         return None
     for item in sentences:
-        targets = _external_targets_from_prompt(item)
+        targets, exact_tool_hash = _external_target_scope_from_prompt(item)
         term_hashes = _matching_grant_term_hashes(item)
         if all(
             (
@@ -1846,11 +1944,14 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
                 len(targets) == 1,
             )
         ):
-            return {
+            grant = {
                 "turn_id": turn_id,
                 "target": next(iter(targets)),
                 "term_hashes": sorted(term_hashes),
             }
+            if exact_tool_hash:
+                grant["tool_name_hash"] = exact_tool_hash
+            return grant
     return None
 
 
@@ -2162,11 +2263,13 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
     grant = state.get("sensitive_disclosure_grant")
     concrete_terms = _matching_concrete_term_hashes(sensitive_text)
     grant_terms = set(grant.get("term_hashes") or []) if isinstance(grant, dict) else set()
+    grant_tool_hash = str(grant.get("tool_name_hash") or "") if isinstance(grant, dict) else ""
     disclosure = bool(
         isinstance(grant, dict)
         and str(grant.get("turn_id") or "") == event_turn
         and len(targets) == 1
         and str(grant.get("target") or "") == next(iter(targets))
+        and (not grant_tool_hash or grant_tool_hash == _policy_value_hash(tool_name))
         and concrete_terms
         and concrete_terms.issubset(grant_terms)
     )

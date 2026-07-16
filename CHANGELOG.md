@@ -6,10 +6,11 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [0.2.3] - 2026-07-16
 
-- Kept redaction templates such as `{{redacted}}` from counting as concrete sensitive values, including when horizontal whitespace precedes the placeholder.
-- Required exact prompt-side connector phrases or trusted MCP identities so underscore, hyphen, and identifier lookalikes cannot create a canonical disclosure grant.
-- Honored common post-term exclusions, including punctuation-adjacent and upload or disclosure wording.
-- Added positive and adversarial regressions for exact MCP targets, lookalikes, placeholders, and post-term exclusions.
+- Parsed assigned field values before removing recognized redaction placeholders, preserving line-wrapped and post-placeholder concrete values.
+- Required exact prompt-side connector phrases or complete trusted MCP identities so punctuation and identifier lookalikes cannot create a canonical disclosure grant.
+- Bound grants that name a complete MCP tool to that exact tool identity while retaining destination-level grants for natural connector names.
+- Honored common post-term exclusions, including punctuation-adjacent, future-tense, upload, and disclosure wording.
+- Added positive and adversarial regressions for exact MCP tools, lookalikes, placeholders, line-wrapped values, and post-term exclusions.
 
 ## [0.2.2] - 2026-07-16
 

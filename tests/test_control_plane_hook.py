@@ -1290,7 +1290,20 @@ class HookProtocolTests(unittest.TestCase):
 
     def test_grant_prompt_lookalike_target_is_not_canonicalized(self) -> None:
         for index, target in enumerate(
-            ("mcp__github_malicious", "mcp__github-malicious", "notgithub"), start=1
+            (
+                "mcp__github_malicious",
+                "mcp__github-malicious",
+                "mcp__github.malicious",
+                "mcp__github/malicious",
+                "notgithub",
+                "github-malicious",
+                "not-github",
+                "github.malicious",
+                "github..malicious",
+                "github.-malicious",
+                "github/malicious",
+            ),
+            start=1,
         ):
             with self.subTest(target=target):
                 self.turn = f"lookalike-target-{index}"
@@ -1320,6 +1333,20 @@ class HookProtocolTests(unittest.TestCase):
             }
         )
         self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
+    def test_exact_mcp_target_grant_does_not_cover_other_operations(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to mcp__github__create_file."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__github__delete_repo",
+                "tool_input": {"text": "Example Capital position: TEST_POSITION_024"},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     def test_sensitive_disclosure_requires_every_concrete_term(self) -> None:
         self.prompt(
@@ -1390,6 +1417,23 @@ class HookProtocolTests(unittest.TestCase):
                 self.assertNotEqual(
                     "deny", result["hookSpecificOutput"].get("permissionDecision")
                 )
+
+    def test_line_wrapped_or_post_placeholder_values_remain_concrete(self) -> None:
+        for index, value in enumerate(
+            ("\nTEST_POSITION_025", "\r\nTEST_POSITION_026", " {{redacted}} TEST_POSITION_027"),
+            start=1,
+        ):
+            with self.subTest(value=repr(value)):
+                self.turn = f"concrete-value-{index}"
+                self.prompt("Process Example Capital position data locally.")
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "mcp__google_drive__upload",
+                        "tool_input": {"text": f"Example Capital position:{value}"},
+                    }
+                )
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     def test_structured_sensitive_fields_follow_the_same_subset_rule(self) -> None:
         self.prompt(
@@ -1469,6 +1513,8 @@ class HookProtocolTests(unittest.TestCase):
                 "client is excluded",
                 "client not uploaded",
                 "client not disclosed",
+                "client will not be uploaded",
+                "client will not be disclosed",
                 "client 不包括",
             ),
             start=1,
