@@ -165,6 +165,13 @@ _READ_ONLY_COMMANDS = {
     "get-process",
     "select-string",
 }
+_POWERSHELL_READ_ONLY_COMMANDS = {
+    "get-childitem",
+    "get-content",
+    "get-location",
+    "get-process",
+    "select-string",
+}
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "branch", "rev-parse", "ls-files", "grep", "remote", "blame", "ls-tree"}
 _CONTROL_TOKENS = {";", "&&", "||", "|", "&"}
 _SHELL_EVAL = {"ash", "bash", "dash", "fish", "ksh", "sh", "zsh"}
@@ -205,11 +212,22 @@ _PACKAGE_VALUE_OPTIONS = {
 }
 _PACKAGE_INSTALL_SUBCOMMANDS = {"install", "add", "ci", "i", "update", "up", "link", "rebuild"}
 _PACKAGE_RUNNER_SUBCOMMANDS = {"exec", "x", "dlx"}
+_SYSTEM_PACKAGE_VALUE_OPTIONS = {"-c", "--config-file", "-o", "--option", "-t", "--target-release"}
 _SYSTEM_PACKAGE_ACTIONS = {
     "apk": {"add", "del", "fix", "upgrade"},
-    "apt": {"full-upgrade", "install", "remove", "update", "upgrade"},
-    "apt-get": {"dist-upgrade", "install", "remove", "update", "upgrade"},
-    "aptitude": {"full-upgrade", "install", "remove", "update", "upgrade"},
+    "apt": {"autoremove", "autopurge", "full-upgrade", "install", "purge", "remove", "update", "upgrade"},
+    "apt-get": {
+        "auto-remove",
+        "autoremove",
+        "autopurge",
+        "dist-upgrade",
+        "install",
+        "purge",
+        "remove",
+        "update",
+        "upgrade",
+    },
+    "aptitude": {"full-upgrade", "install", "purge", "remove", "update", "upgrade"},
     "brew": {"install", "reinstall", "uninstall", "update", "upgrade"},
     "dnf": {"install", "remove", "update", "upgrade"},
     "emerge": {"--sync"},
@@ -329,6 +347,10 @@ _COMMAND_START_RE = re.compile(
     + "|".join(sorted(re.escape(item) for item in _COMMAND_EXECUTABLES))
     + r")(?:\.exe|\.cmd|\.bat|\.com|\.ps1)?\b)"
 )
+_QUOTED_WINDOWS_EXECUTABLE_RE = re.compile(
+    r"(?i)(?P<quote>[\"'])(?P<path>(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])"
+    r"[^\"'\r\n]+\.(?:exe|cmd|bat|com|ps1))(?P=quote)"
+)
 
 def _finding(code: str, severity: str = "high") -> dict[str, str]:
     return {"severity": severity, "category": "dangerous_command", "code": code}
@@ -388,6 +410,17 @@ def _strip_token_quotes(token: str) -> str:
     return token
 
 
+def _is_literal_powershell_call_target(token: str) -> bool:
+    target = _strip_token_quotes(token)
+    if not target or any(char in target for char in "$`(){};&|<>"):
+        return False
+    if re.search(r"(?i)\.(?:ps1|cmd|bat)$", target):
+        return False
+    if re.search(r"(?i)\.(?:exe|com)$", target):
+        return True
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", target))
+
+
 def _shell_tokens(command: str) -> list[str]:
     try:
         windows_style = _looks_like_windows_command(command)
@@ -401,9 +434,15 @@ def _shell_tokens(command: str) -> list[str]:
 
 
 def _has_shell_indirection(command: str) -> bool:
-    if _WINDOWS_ENV_EXPANSION_RE.search(command):
-        return True
     windows_style = _looks_like_windows_command(command)
+    if windows_style and _WINDOWS_ENV_EXPANSION_RE.search(command):
+        tokens = _shell_tokens(command)
+        executable, _, wrappers = _unwrap_command(tokens)
+        read_only_literal_context = not wrappers and (
+            executable in _READ_ONLY_COMMANDS or executable in {"rg", "sed"}
+        )
+        if not read_only_literal_context:
+            return True
     quote = ""
     escaped = False
     for index, char in enumerate(command):
@@ -436,11 +475,25 @@ def _has_shell_indirection(command: str) -> bool:
     return False
 
 
-def _split_shell_commands(tokens: list[str]) -> tuple[list[list[str]], list[str]]:
+def _split_shell_commands(
+    tokens: list[str], *, windows_style: bool = False
+) -> tuple[list[list[str]], list[str]]:
     commands: list[list[str]] = []
     operators: list[str] = []
     current: list[str] = []
-    for token in tokens:
+    for index, token in enumerate(tokens):
+        if (
+            token == "&"
+            and not current
+            and index + 1 < len(tokens)
+            and _is_literal_powershell_call_target(tokens[index + 1])
+            and (
+                windows_style
+                or _strip_token_quotes(tokens[index + 1]).casefold()
+                in _POWERSHELL_READ_ONLY_COMMANDS
+            )
+        ):
+            continue
         if token in _CONTROL_TOKENS:
             if current:
                 commands.append(current)
@@ -775,6 +828,7 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
     if executable in _SYSTEM_PACKAGE_ACTIONS:
         actions = _SYSTEM_PACKAGE_ACTIONS[executable]
         package_tokens = _tokens_before_separator(args)
+        package_command, _ = _subcommand_after_options(args, _SYSTEM_PACKAGE_VALUE_OPTIONS)
         pacman_mutation = executable == "pacman" and any(
             token in {"--remove", "--sync", "--upgrade"}
             or (
@@ -784,7 +838,11 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
             )
             for token in package_tokens
         )
-        if pacman_mutation or any(token in actions or token.casefold() in actions for token in package_tokens):
+        apt_mutation = executable in {"apt", "apt-get", "aptitude"} and package_command.casefold() in actions
+        other_mutation = executable not in {"apt", "apt-get", "aptitude"} and any(
+            token in actions or token.casefold() in actions for token in package_tokens
+        )
+        if pacman_mutation or apt_mutation or other_mutation:
             findings.append(_finding("package_install", "medium"))
 
     if executable in {"py", "python", "python3", "pythonw"}:
@@ -830,7 +888,9 @@ def _structured_command_findings(command: str, depth: int = 0) -> list[dict[str,
         if command.strip():
             findings.append(_finding("command_parse_error"))
         return _dedupe_findings(findings)
-    commands, operators = _split_shell_commands(tokens)
+    commands, operators = _split_shell_commands(
+        tokens, windows_style=_looks_like_windows_command(command)
+    )
     findings.extend(finding for segment in commands for finding in _segment_findings(segment, depth=depth))
     if "&" in operators:
         findings.append(_finding("background_process", "medium"))
@@ -1414,16 +1474,31 @@ def _authorization_command_candidates(segment: str) -> list[str]:
     if code_spans:
         return code_spans
 
+    quoted_windows = _QUOTED_WINDOWS_EXECUTABLE_RE.search(segment)
+    if quoted_windows:
+        prefix = segment[: quoted_windows.start()].rstrip()
+        call_operator = "& " if re.search(r"(?:^|\s)&\s*$", prefix) else ""
+        remainder = segment[quoted_windows.end() :].strip(" `")
+        candidate = call_operator + quoted_windows.group(0)
+        if remainder:
+            candidate += " " + remainder
+        return [candidate] if _shell_tokens(candidate) else []
+
     match = _COMMAND_START_RE.search(segment)
     if not match:
         return []
     candidate = segment[match.start(1) :].strip(" `")
     prefix = segment[: match.start(1)].rstrip()
     opening_quote = prefix[-1:] if prefix[-1:] in {"'", '"'} else ""
-    if opening_quote and candidate.endswith(opening_quote):
-        unwrapped = candidate[:-1].rstrip()
-        if _shell_tokens(unwrapped):
-            return [unwrapped]
+    if opening_quote:
+        if candidate.endswith(opening_quote):
+            unwrapped = candidate[:-1].rstrip()
+            if _shell_tokens(unwrapped):
+                return [unwrapped]
+        reconstructed = opening_quote + candidate
+        if _shell_tokens(reconstructed):
+            return [reconstructed]
+        return []
     if _shell_tokens(candidate):
         return [candidate]
     if candidate.endswith(("'", '"')):
