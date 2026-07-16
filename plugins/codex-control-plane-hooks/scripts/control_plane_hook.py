@@ -418,9 +418,7 @@ def _is_literal_powershell_call_target(token: str) -> bool:
         return False
     if re.search(r"(?i)\.(?:exe|com)$", target):
         return True
-    if any(char in target for char in "()"):
-        return False
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", target))
+    return target.casefold() in _POWERSHELL_READ_ONLY_COMMANDS
 
 
 def _shell_tokens(command: str) -> list[str]:

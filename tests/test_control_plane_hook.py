@@ -208,6 +208,15 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual({}, self.bash("& Get-ChildItem"))
 
         module = __import__("control_plane_hook")
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
+            for bare_target in ["& Invoke-Build", "& SomeFunction"]:
+                with self.subTest(windows_bare_target=bare_target):
+                    codes = {
+                        item["code"]
+                        for item in module._structured_command_findings(bare_target)
+                    }
+                    self.assertIn("background_process", codes)
+
         for composed in [
             r'Get-Location; & "C:\Program Files\Git\bin\git.exe" status --short',
             r'Get-Content README.md | & "C:\Program Files\Git\bin\git.exe" status --short',
@@ -219,6 +228,8 @@ class HookProtocolTests(unittest.TestCase):
         for unsafe in [
             r"& $command",
             r"& { Get-ChildItem }",
+            r"& Invoke-Build",
+            r"& SomeFunction",
             r'& "C:\work\script.ps1"',
             r'& "C:\work\script.cmd"',
             r'& "C:\Program Files\Git\bin\git.exe" status --short &',
