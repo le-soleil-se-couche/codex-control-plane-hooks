@@ -28,4 +28,12 @@ python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py \
 - Keep examples minimal and inert; never submit a redacted full personal configuration.
 - Report security issues privately under `SECURITY.md`.
 
+## Pull request lifecycle
+
+- Create a fresh branch from the latest `main`; do not reuse a branch that has already been squash merged.
+- Open at most one pull request for a head branch and verify that the head tree differs from the base tree.
+- Wait for every required check on the current head SHA, including all six OS/Python jobs and `secret-scan`.
+- Wait for asynchronous Codex Review to finish and resolve every actionable thread before merging.
+- Retire the head branch after a squash merge so it cannot produce a duplicate no-op pull request.
+
 Pull requests are accepted under the repository license unless explicitly stated otherwise.

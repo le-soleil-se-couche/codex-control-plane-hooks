@@ -165,6 +165,91 @@ class HookProtocolTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual({}, self.bash(command))
 
+    def test_windows_env_syntax_in_posix_documentation_searches_is_allowed(self) -> None:
+        module = __import__("control_plane_hook")
+        commands = [
+            "rg '%APPDATA%' docs",
+            "grep '!PATH!' README.md",
+            "rg 'powershell.exe %APPDATA%' docs",
+            r"grep 'C:\tools\helper.exe !PATH!' README.md",
+        ]
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=False):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertFalse(module._has_shell_indirection(command))
+
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
+            self.assertTrue(module._has_shell_indirection("Write-Output %APPDATA%"))
+
+        with mock.patch.object(module.os, "name", "nt"):
+            for command in [
+                "rg %APPDATA% docs",
+                "echo %TOKEN%",
+                r"type %USERPROFILE%\notes.txt",
+                "grep !PATH! README.md",
+            ]:
+                with self.subTest(native_windows_command=command):
+                    self.assertTrue(module._has_shell_indirection(command))
+
+        for command in commands:
+            with self.subTest(protocol_command=command):
+                result = self.bash(command)
+                if os.name == "nt":
+                    self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                else:
+                    self.assertEqual({}, result)
+
+    def test_powershell_call_operator_preserves_safe_windows_invocation(self) -> None:
+        command = r'& "C:\Program Files\Git\bin\git.exe" status --short'
+        self.assertEqual({}, self.bash(command))
+        self.assertEqual(
+            {}, self.bash(r'& "C:\Program Files (x86)\Git\bin\git.exe" status --short')
+        )
+        self.assertEqual({}, self.bash("& Get-ChildItem"))
+
+        module = __import__("control_plane_hook")
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
+            for bare_target in ["& Invoke-Build", "& SomeFunction"]:
+                with self.subTest(windows_bare_target=bare_target):
+                    codes = {
+                        item["code"]
+                        for item in module._structured_command_findings(bare_target)
+                    }
+                    self.assertIn("background_process", codes)
+
+        for composed in [
+            r'Get-Location; & "C:\Program Files\Git\bin\git.exe" status --short',
+            r'Get-Content README.md | & "C:\Program Files\Git\bin\git.exe" status --short',
+        ]:
+            with self.subTest(command=composed):
+                codes = {item["code"] for item in module._structured_command_findings(composed)}
+                self.assertNotIn("background_process", codes)
+
+        for unsafe in [
+            r"& $command",
+            r"& { Get-ChildItem }",
+            r"& Invoke-Build",
+            r"& SomeFunction",
+            r'& "C:\work\script.ps1"',
+            r'& "C:\work\script.cmd"',
+            r'& "C:\Program Files\Git\bin\git.exe" status --short &',
+        ]:
+            with self.subTest(command=unsafe):
+                result = self.bash(unsafe)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+        push = r'& "C:\Program Files\Git\bin\git.exe" push origin main'
+        push_codes = {item["code"] for item in module._structured_command_findings(push)}
+        self.assertIn("git_push", push_codes)
+        direct = r'"C:\Program Files\Git\bin\git.exe" push origin main'
+        self.assertNotEqual(module._command_hash(push, DEFAULT_CWD), module._command_hash(direct, DEFAULT_CWD))
+
+        self.prompt(f"允许执行 {push}。")
+        first = self.bash(push)
+        replay = self.bash(push)
+        self.assertNotEqual("deny", first["hookSpecificOutput"].get("permissionDecision"))
+        self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
     def test_windows_paths_are_recognized_as_durable_and_external(self) -> None:
         module = __import__("control_plane_hook")
         windows_home = "C:\\" + "Users" + r"\example\.codex\memories\note.md"
@@ -177,11 +262,49 @@ class HookProtocolTests(unittest.TestCase):
         prompt = f'批准在 "{scope}" 执行 git.exe add 和 git.exe commit。'
         self.assertEqual(module._scope_hash(scope), module._prompt_scope_hash(prompt, DEFAULT_CWD, None))
 
+    def test_quoted_windows_executable_authorization_preserves_spaces(self) -> None:
+        command = r'"C:\Program Files\Git\bin\git.exe" push origin main'
+        module = __import__("control_plane_hook")
+        self.assertEqual([command], module._authorization_command_candidates(f"允许执行 {command}"))
+
+        variants = [
+            r'"C:\Program Files\PowerShell\7\pwsh.exe"',
+            r"'C:\Program Files (x86)\Git\bin\git.exe' status --short",
+            r'"C:\工具\Git\bin\git.exe" status --short',
+        ]
+        for variant in variants:
+            with self.subTest(command=variant):
+                self.assertEqual(
+                    [variant], module._authorization_command_candidates(f"允许执行 {variant}")
+                )
+
+        self.prompt(f"允许执行 {command}。")
+        first = self.bash(command)
+        replay = self.bash(command)
+        self.assertNotEqual("deny", first["hookSpecificOutput"].get("permissionDecision"))
+        self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+        malformed = r'允许执行 "C:\Program Files\Git\bin\git.exe push origin main'
+        self.assertEqual([], module._authorization_command_candidates(malformed))
+
+        embedded = f"允许执行 echo {command}"
+        self.assertNotIn(command, module._authorization_command_candidates(embedded))
+        self.assertNotIn("git_push", module._dangerous_authorization_hashes(embedded, DEFAULT_CWD))
+
     def test_linux_shells_package_managers_and_transfers_are_classified(self) -> None:
         commands = [
             "dash -c 'rm -rf /tmp/cache'",
             "ash -c 'rm -rf /tmp/cache'",
             "apt-get install example-package",
+            "apt purge example-package",
+            "apt autoremove example-package",
+            "apt-get purge example-package",
+            "apt-get autoremove example-package",
+            "apt autopurge example-package",
+            "apt-get auto-remove example-package",
+            "apt-get autopurge example-package",
+            "apt-get -o Debug::NoLocking=1 purge example-package",
+            "aptitude purge example-package",
             "dnf upgrade example-package",
             "apk add example-package",
             "pacman -S example-package",
@@ -205,6 +328,10 @@ class HookProtocolTests(unittest.TestCase):
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
         self.assertEqual({}, self.bash("pacman -Q example-package"))
+        self.assertEqual({}, self.bash("apt list example-package"))
+        self.assertEqual({}, self.bash("apt list --upgradable"))
+        self.assertEqual({}, self.bash("apt show purge"))
+        self.assertEqual({}, self.bash("apt-get check"))
 
         module = __import__("control_plane_hook")
         for command in [

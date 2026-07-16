@@ -4,6 +4,14 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-16
+
+- Added `apt` and `apt-get` `purge` and `autoremove` coverage to the system-package mutation gate.
+- Limited `%VAR%` and `!VAR!` documentation-search exceptions to non-Windows hosts while retaining the expansion guard for native Windows commands.
+- Preserved quoted Windows executable paths in exact one-shot authorization parsing only when anchored directly after the approval phrase or an explicit call operator; malformed and embedded argument forms fail closed.
+- Treated a leading PowerShell `&` as a call operator only for literal `.exe` or `.com` targets, including quoted paths with parentheses, or selected read-only cmdlets; script files, variables, script blocks, and trailing background operators remain denied.
+- Added focused regressions and adversarial counterexamples for all four PR #2 review findings.
+
 ## [0.2.0] - 2026-07-15
 
 - Added native Windows command overrides, strict UTF-8 stdio, Windows executable normalization, reparse-point checks, bounded state locking, strict state-schema validation, and structured PowerShell command classification.
