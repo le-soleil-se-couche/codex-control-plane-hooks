@@ -4,6 +4,16 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-16
+
+- Bound disclosure destinations to trusted tool or MCP server identity so payload text cannot impersonate an authorized connector.
+- Required every concrete configured sensitive term in an outbound payload to be covered by the one-shot disclosure grant.
+- Classified querying `git remote show`, nested `git remote` mutations, and branch tracking or description updates conservatively.
+- Required explicitly configured POSIX policy files to have no group or other permissions.
+- Reworded PreCompact output as a state checkpoint and active-Agent reminder without claiming to save a semantic handoff.
+- Pinned public installation guidance to `v0.2.2` and added a version-pinned Ruff CI gate.
+- Added focused regressions for disclosure target spoofing, mixed-field disclosure, Git nested actions, and policy permissions.
+
 ## [0.2.1] - 2026-07-16
 
 - Added `apt` and `apt-get` `purge` and `autoremove` coverage to the system-package mutation gate.

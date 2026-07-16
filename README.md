@@ -12,9 +12,9 @@ Version-scoped reference Hooks for local Codex workflows. The plugin applies bes
 - Exact turn, tool, working-directory, command-hash, and one-shot approval state.
 - Optional organization-specific markers and data terms from a private `policy.json`.
 - Optional private durable-destination markers from the same local policy.
-- One-shot sensitive-disclosure grants bound to a configured data term and one recognized destination.
+- One-shot sensitive-disclosure grants bound to every concrete configured data term in the payload and one recognized tool destination.
 - Local redaction patches: `apply_patch` and structured `Edit` can remove detected values when newly persisted content is clean.
-- Observed Agent lifecycle state, advisory nesting context, pre-compaction handoff, and Stop blocking while Agents remain active.
+- Observed Agent lifecycle state, advisory nesting context, a pre-compaction state checkpoint, and Stop blocking while Agents remain active.
 - A small `verified-work-closure` Skill for evidence-backed completion receipts.
 
 The plugin does not impose an Agent-count ceiling. Runtime capacity remains owned by Codex and the active tool contract.
@@ -33,14 +33,14 @@ The plugin does not impose an Agent-count ceiling. Runtime capacity remains owne
 Review the repository and its current compatibility table before installation.
 
 ```bash
-codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref main
+codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.2
 codex plugin add codex-control-plane-hooks@codex-control-plane-hooks
 codex plugin list --marketplace codex-control-plane-hooks
 ```
 
 Codex may require explicit Hook trust after installation. Review `plugins/codex-control-plane-hooks/hooks/hooks.json` and the invoked Python script before accepting trust in the Codex app.
 
-The `main` ref is convenient for review builds. Pin a reviewed commit SHA for reproducible or controlled deployments.
+Use the version tag above for reproducible installation. Review builds may select an explicit commit SHA.
 
 To update the marketplace snapshot:
 
@@ -50,7 +50,7 @@ codex plugin marketplace upgrade codex-control-plane-hooks
 
 ## Configure
 
-The plugin reads `policy.json` from the host-provided `PLUGIN_DATA` directory. On macOS and Linux, an absolute `CONTROL_PLANE_POLICY` path can select a separate file after its ownership and mode are reviewed. Windows keeps policy inside `PLUGIN_DATA` so it inherits the host-managed directory boundary.
+The plugin reads `policy.json` from the host-provided `PLUGIN_DATA` directory. On macOS and Linux, an absolute `CONTROL_PLANE_POLICY` path can select a current-user-owned regular file only when it has no group or other permissions, such as mode `0600`. Windows keeps policy inside `PLUGIN_DATA` so it inherits the host-managed directory boundary.
 
 Start from [`examples/policy.example.json`](examples/policy.example.json). Keep real markers and terms in your private plugin-data directory; never commit that file.
 
@@ -101,7 +101,7 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 116 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
+| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 127 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
 | GitHub Actions runtime | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Linux Codex host | 2026-07-15 |
 | GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Windows Codex host | 2026-07-15 |
 
@@ -111,7 +111,7 @@ Runtime support and Codex-host compatibility are separate claims. Hook event nam
 
 - Checks only run for events matched by `hooks/hooks.json` and emitted by the host.
 - Secret detection covers selected patterns and scans a bounded amount of text.
-- Unknown `mcp__*` tools are treated as external destinations when sensitive context is active.
+- Unknown `mcp__*` tools are treated as external destinations when sensitive context is active and cannot consume a grant for a named connector.
 - Post-tool checks occur after a tool has produced output.
 - Natural-language approval parsing remains experimental even when explicitly enabled.
 - Browser, Computer Use, and connector behavior depends on the tool name and Hook events exposed by the host.

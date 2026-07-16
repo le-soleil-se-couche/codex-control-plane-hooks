@@ -12,9 +12,9 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "codex-control-plane-hooks" / "scripts"
@@ -610,6 +610,20 @@ class HookProtocolTests(unittest.TestCase):
         Path(self.data_dir, "policy.json").write_text("{", encoding="utf-8")
         result = self.bash("pwd")
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    @unittest.skipIf(os.name == "nt", "external policy files are POSIX-only")
+    def test_external_policy_requires_private_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policy.json"
+            policy.write_text("{}", encoding="utf-8")
+            os.chmod(policy, 0o644)
+            with mock.patch.dict(os.environ, {"CONTROL_PLANE_POLICY": str(policy)}):
+                denied = self.bash("pwd")
+            self.assertEqual("deny", denied["hookSpecificOutput"]["permissionDecision"])
+
+            os.chmod(policy, 0o600)
+            with mock.patch.dict(os.environ, {"CONTROL_PLANE_POLICY": str(policy)}):
+                self.assertEqual({}, self.bash("pwd"))
 
     def test_missing_session_id_fails_closed_for_stateful_events(self) -> None:
         payload = json.dumps(
@@ -1246,6 +1260,98 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
+    def test_unknown_mcp_payload_cannot_spoof_authorized_target(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to GitHub."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__custom_store__write",
+                "tool_input": {"text": "github\nExample Capital position: TEST_POSITION_011"},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_sensitive_disclosure_requires_every_concrete_term(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to the specified Google Drive folder."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {
+                    "text": "Example Capital position: TEST_POSITION_012\nclient: TEST_CLIENT_012"
+                },
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_explanatory_authorized_term_cannot_cover_other_concrete_term(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to the specified Google Drive folder."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {"text": "position report\nclient: TEST_CLIENT_013"},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_sensitive_disclosure_allows_exact_concrete_term_subset(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position and client details "
+            "to the specified Google Drive folder."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {
+                    "text": "Example Capital position: TEST_POSITION_014\nclient: TEST_CLIENT_014"
+                },
+            }
+        )
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
+    def test_structured_sensitive_fields_follow_the_same_subset_rule(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to the specified Google Drive folder."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {
+                    "organization": "Example Capital",
+                    "position": "TEST_POSITION_016",
+                    "client": "TEST_CLIENT_016",
+                },
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_trusted_connector_multiplexer_uses_tool_identity(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to GitHub."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__codex_apps__github_create_file",
+                "tool_input": {"content": "Example Capital position: TEST_POSITION_015"},
+            }
+        )
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
     def test_apply_patch_can_remove_concrete_sensitive_data_locally(self) -> None:
         self.prompt("Process Example Capital position data locally.")
         patch = (
@@ -1446,7 +1552,7 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual({}, result)
 
-    def test_precompact_handoff_reports_active_agents(self) -> None:
+    def test_precompact_checkpoint_reports_active_agents(self) -> None:
         self.prompt("Review one module.")
         self.run_hook(
             {
@@ -1457,6 +1563,13 @@ class HookProtocolTests(unittest.TestCase):
         )
         result = self.run_hook({"hook_event_name": "PreCompact"})
         self.assertIn("1 Agent(s) remain active", result["systemMessage"])
+        self.assertNotIn("handoff saved", result["systemMessage"].casefold())
+        digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
+        state = json.loads(
+            (Path(self.data_dir) / f"session-{digest}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(1, state["compaction_count"])
+        self.assertIn("agent-1", state["active_agents"])
 
     def test_absolute_and_wrapped_recursive_delete_are_denied(self) -> None:
         commands = [
@@ -1564,6 +1677,61 @@ class HookProtocolTests(unittest.TestCase):
             with self.subTest(command=command):
                 result = self.bash(command)
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_git_remote_network_and_nested_mutations_are_denied(self) -> None:
+        network = self.bash("git remote show origin")
+        self.assertEqual("deny", network["hookSpecificOutput"]["permissionDecision"])
+        self.assertIn("git_network", network["hookSpecificOutput"]["permissionDecisionReason"])
+
+        for command in [
+            "git remote -v set-url origin https://example.invalid/repo.git",
+            "git remote -v add example https://example.invalid/repo.git",
+            "git remote -v remove example",
+        ]:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                self.assertIn(
+                    "git_non_read_only", result["hookSpecificOutput"]["permissionDecisionReason"]
+                )
+
+        for command in [
+            "git remote update",
+            "git remote prune origin",
+            "git remote add -f example https://example.invalid/repo.git",
+            "git remote set-head example -a",
+        ]:
+            with self.subTest(network_command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                self.assertIn("git_network", result["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_git_remote_no_query_and_local_queries_are_read_only(self) -> None:
+        for command in [
+            "git remote",
+            "git remote -v",
+            "git remote show -n origin",
+            "git remote show --no-query origin",
+            "git remote get-url origin",
+            "git branch --list",
+            "git branch --show-current",
+        ]:
+            with self.subTest(command=command):
+                self.assertEqual({}, self.bash(command))
+
+    def test_git_branch_metadata_mutations_are_denied(self) -> None:
+        for command in [
+            "git branch -u origin/main",
+            "git branch --set-upstream-to=origin/main",
+            "git branch --unset-upstream",
+            "git branch --edit-description",
+        ]:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                self.assertIn(
+                    "git_non_read_only", result["hookSpecificOutput"]["permissionDecisionReason"]
+                )
 
     def test_recursive_delete_is_denied_without_force(self) -> None:
         commands = [

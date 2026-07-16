@@ -90,7 +90,7 @@
             "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "python \"$env:PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "timeout": 10,
-            "statusMessage": "Saving control-plane handoff"
+            "statusMessage": "Recording control-plane state checkpoint"
           }
         ]
       }

@@ -69,6 +69,13 @@ class ReleaseLayoutTests(unittest.TestCase):
         )
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(manifest["name"], marketplace["plugins"][0]["name"])
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"--ref v{manifest['version']}", readme)
+        self.assertNotIn("--ref main", readme)
+
+    def test_ci_runs_ruff(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("ruff check --no-cache .", workflow)
 
     def test_every_command_hook_has_a_windows_override(self) -> None:
         hooks = json.loads(

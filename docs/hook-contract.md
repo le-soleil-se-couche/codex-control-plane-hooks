@@ -39,7 +39,7 @@ When experimental natural-language approvals are enabled, a dangerous command gr
 
 The grant is consumed once. Replays, changed arguments, changed working directories, changed tool names, changed tool IDs, and cross-turn use are denied by the protocol tests.
 
-Sensitive-disclosure grants are separately disabled by default. When enabled, a grant is bound to the current turn, one recognized target, and hashes of configured data terms. It is consumed on first matching use.
+Sensitive-disclosure grants are separately disabled by default. When enabled, a grant is bound to the current turn, one recognized target derived from trusted tool identity, and hashes of configured data terms. Every concrete configured term in the outbound payload must be included in that grant. Unknown MCP servers remain external and cannot claim a named target through payload text. The grant is consumed on first matching use.
 
 ## Local redaction
 

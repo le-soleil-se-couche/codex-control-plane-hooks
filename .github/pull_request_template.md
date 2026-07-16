@@ -14,6 +14,7 @@
 - [ ] `python3 -B -m unittest discover -s tests -v`
 - [ ] `python3 scripts/smoke_hook_manifest.py`
 - [ ] `python3 scripts/check_release.py`
+- [ ] `ruff check --no-cache .`
 - [ ] Plugin validator, when available
 - [ ] No personal paths, private policy, credentials, or live data
 

@@ -19,9 +19,9 @@ On Windows, `PLUGIN_DATA` is required and policy must remain at `PLUGIN_DATA/pol
 | `enable_natural_language_approvals` | boolean | `false` | Enables experimental one-shot command and local Git approval parsing. |
 | `enable_sensitive_disclosure_approvals` | boolean | `false` | Enables experimental one-shot disclosure grants. |
 
-The policy file is capped at 64 KiB. Each string list is capped at 100 entries. A present policy that is malformed, oversized, symlinked, reparse-point, non-regular, or POSIX-owned by another user causes the current Hook event to fail closed. A missing default policy keeps private detection and natural-language approvals disabled; a missing explicitly configured POSIX policy fails closed. Boolean options activate only for the JSON value `true`.
+The policy file is capped at 64 KiB. Each string list is capped at 100 entries. A present policy that is malformed, oversized, symlinked, reparse-point, non-regular, or POSIX-owned by another user causes the current Hook event to fail closed. An explicitly configured POSIX policy also fails closed when any group or other permission bit is set; use mode `0600` or a stricter owner-only mode. A missing default policy keeps private detection and natural-language approvals disabled; a missing explicitly configured POSIX policy fails closed. Boolean options activate only for the JSON value `true`.
 
-Structured `Write`, `Edit`, and `apply_patch` calls count as durable local persistence when configured concrete sensitive data would remain. A redaction edit is allowed only when its newly persisted text is clean. All `mcp__*` tools default to external for this check. Add installation-specific durable path markers to the private policy instead of hard-coding them in public source.
+Structured `Write`, `Edit`, and `apply_patch` calls count as durable local persistence when configured concrete sensitive data would remain. A redaction edit is allowed only when its newly persisted text is clean. All `mcp__*` tools default to external for this check. Named disclosure grants are matched from trusted tool or MCP server identity, never from payload text, and every concrete configured term in the payload must be included in the grant. Add installation-specific durable path markers to the private policy instead of hard-coding them in public source.
 
 ## Private release-boundary markers
 
