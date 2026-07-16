@@ -8,9 +8,10 @@ Contributions are welcome under Apache-2.0.
 python3 -B -m unittest discover -s tests -v
 python3 scripts/smoke_hook_manifest.py
 python3 scripts/check_release.py
+ruff check --no-cache .
 ```
 
-Use `python` instead of `python3` on Windows PowerShell. Pull requests must pass the Ubuntu, macOS, Windows, and full-history secret-scan jobs.
+Use `python` instead of `python3` on Windows PowerShell. Use Ruff `0.15.12` for the release gate. Pull requests must pass the lint, Ubuntu, macOS, Windows, and full-history secret-scan jobs.
 
 Run the Codex-bundled plugin validator when available:
 

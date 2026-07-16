@@ -25,7 +25,7 @@
 - Selected credential-like strings crossing observed Hook boundaries.
 - Configured sensitive values being written to recognized external or durable destinations.
 - Completion while observed Agents remain active.
-- Symlink and ownership hazards around local state.
+- Symlink, ownership, and POSIX permission hazards around local state and explicitly configured policy files.
 - Windows reparse-point hazards and cross-process state races.
 - Private markers or selected credential formats entering the release tree or reachable Git history.
 

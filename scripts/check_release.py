@@ -13,7 +13,6 @@ import stat
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "codex-control-plane-hooks"
 REQUIRED = (
@@ -230,6 +229,12 @@ def _validate_metadata(errors: list[str]) -> None:
         errors.append("plugin manifest version is not semantic")
     elif f"## [{version}]" not in changelog:
         errors.append("plugin manifest version is missing from CHANGELOG.md")
+    if isinstance(version, str):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        if f"--ref v{version}" not in readme:
+            errors.append("README installation ref does not match the plugin manifest version")
+        if "--ref main" in readme:
+            errors.append("README installation must not follow the mutable main ref")
     if "hooks" in manifest:
         errors.append("plugin manifest must rely on default hooks/hooks.json discovery")
     entries = marketplace.get("plugins") if isinstance(marketplace, dict) else None
