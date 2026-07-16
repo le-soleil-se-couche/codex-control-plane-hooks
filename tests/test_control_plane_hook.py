@@ -1224,6 +1224,23 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
+    def test_relative_clause_future_ban_revokes_disclosure_grant(self) -> None:
+        for index, ban in enumerate(("will not", "must not", "won't"), start=1):
+            with self.subTest(ban=ban):
+                self.turn = f"relative-clause-ban-{index}"
+                self.prompt(
+                    "For this turn, I explicitly authorize sending Example Capital client, "
+                    f"which {ban} be uploaded, to Google Drive."
+                )
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "mcp__google_drive__upload",
+                        "tool_input": {"text": "Example Capital client: TEST_CLIENT_034"},
+                    }
+                )
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
     def test_long_distance_negated_sensitive_upload_never_authorizes_disclosure(self) -> None:
         self.prompt(
             "Do not send Example Capital position details to Google Drive under any circumstances; "
@@ -1302,6 +1319,20 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
+    def test_embedded_url_cannot_create_web_disclosure_grant(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to nothttps://example.invalid."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__web__upload",
+                "tool_input": {"text": "Example Capital position: TEST_POSITION_035"},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
     def test_grant_prompt_lookalike_target_is_not_canonicalized(self) -> None:
         for index, target in enumerate(
             (
@@ -1309,6 +1340,7 @@ class HookProtocolTests(unittest.TestCase):
                 "mcp__github-malicious",
                 "mcp__github.malicious",
                 "mcp__github/malicious",
+                "MCP__github_malicious",
                 "not-mcp__github__create_file",
                 "not/mcp__github__create_file",
                 "not\\mcp__github__create_file",
@@ -1317,10 +1349,8 @@ class HookProtocolTests(unittest.TestCase):
                 "mcp__github__create_file,evil",
                 "mcp__github__create_file，恶意",
                 "mcp__github__create_file;evil",
-                "mcp__github__create_file；恶意",
                 "mcp__github__create_file?evil",
                 "mcp__github__create_file!evil",
-                "mcp__github__create_file。恶意",
                 "mcp__github__create_file.恶意",
                 "mcp__github__create_file.，恶意",
                 "notgithub",
@@ -1364,6 +1394,47 @@ class HookProtocolTests(unittest.TestCase):
                 "hook_event_name": "PreToolUse",
                 "tool_name": "mcp__github__create_file",
                 "tool_input": {"text": "Example Capital position: TEST_POSITION_022"},
+            }
+        )
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
+    def test_cjk_delimiters_and_uppercase_mcp_target_are_allowed(self) -> None:
+        cases = (
+            (
+                "For this turn, I explicitly authorize sending Example Capital position details "
+                "to （Google Drive）.",
+                "mcp__google_drive__upload",
+            ),
+            (
+                "For this turn, I explicitly authorize sending Example Capital position details "
+                "to 【MCP__github__create_file】.",
+                "mcp__github__create_file",
+            ),
+        )
+        for index, (prompt, tool_name) in enumerate(cases, start=1):
+            with self.subTest(tool_name=tool_name):
+                self.turn = f"cjk-delimiter-{index}"
+                self.prompt(prompt)
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": tool_name,
+                        "tool_input": {
+                            "text": f"Example Capital position: TEST_POSITION_036_{index}"
+                        },
+                    }
+                )
+                self.assertNotEqual(
+                    "deny", result["hookSpecificOutput"].get("permissionDecision")
+                )
+
+    def test_cjk_sentence_punctuation_preserves_completed_grant_sentence(self) -> None:
+        self.prompt("本轮明确授权发送 Example Capital position 到 Google Drive。请继续")
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {"text": "Example Capital position: TEST_POSITION_037"},
             }
         )
         self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
@@ -1471,6 +1542,25 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
 
+    def test_unconfigured_sibling_terminates_placeholder_only_value(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital client details "
+            "to the specified Google Drive folder."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {
+                    "text": (
+                        "Example Capital position: {{redacted}}, note: public, "
+                        "client: TEST_CLIENT_038"
+                    )
+                },
+            }
+        )
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
     def test_line_wrapped_or_post_placeholder_values_remain_concrete(self) -> None:
         for index, value in enumerate(
             (
@@ -1478,6 +1568,7 @@ class HookProtocolTests(unittest.TestCase):
                 "\r\nTEST_POSITION_026",
                 " {{redacted}} TEST_POSITION_027",
                 " {{redacted}}, TEST_POSITION_028",
+                " {{redacted}}, https://example.invalid/TEST_POSITION_028B",
                 "\n\n\n\n\n\nTEST_POSITION_029",
             ),
             start=1,
@@ -1526,6 +1617,22 @@ class HookProtocolTests(unittest.TestCase):
                     "organization": "Example Capital",
                     "position": "TEST_POSITION_016",
                     "client": "TEST_CLIENT_016",
+                },
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_json_quoted_sensitive_assignment_is_concrete(self) -> None:
+        self.prompt("Process Example Capital position data locally.")
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {
+                    "text": (
+                        '{"organization":"Example Capital",'
+                        '"position":"TEST_POSITION_039"}'
+                    )
                 },
             }
         )
@@ -1643,6 +1750,20 @@ class HookProtocolTests(unittest.TestCase):
                 "hook_event_name": "PreToolUse",
                 "tool_name": "mcp__google_drive__upload",
                 "tool_input": {"text": "Example Capital client: TEST_CLIENT_023"},
+            }
+        )
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
+    def test_scan_notes_does_not_match_cannot_negation(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position scan notes "
+            "to Google Drive."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {"text": "Example Capital position: TEST_POSITION_040"},
             }
         )
         self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))

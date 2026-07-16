@@ -50,7 +50,9 @@ _SECRET_PATTERNS = (
 )
 _SENSITIVE_EXTERNAL_VERB_RE = re.compile(r"外发|披露|上传|发送|共享|external|upload|share|send", re.IGNORECASE)
 _SENSITIVE_NEGATION_RE = re.compile(
-    r"不要|别|禁止|不许|不得|不允许|拒绝|do\s+not|don't|never|can\s*not|can['’]t",
+    r"(?:不要|别|禁止|不许|不得|不允许|拒绝)|"
+    r"\b(?:do\s+not|don['’]t|never|can(?:not|\s+not)|can['’]t|"
+    r"(?:will|must|should|shall)\s+not|won['’]t)\b",
     re.IGNORECASE,
 )
 _TERM_NEGATION_SUFFIX_RE = re.compile(
@@ -149,10 +151,16 @@ _PROMPT_EXTERNAL_TARGET_PATTERNS = (
 )
 _MCP_TARGET_CANDIDATE_RE = re.compile(r"(?i)mcp__\S+")
 _MCP_TARGET_TOKEN_RE = re.compile(r"(?i)^mcp__[A-Za-z0-9_]+(?:__[A-Za-z0-9_]+)?$")
-_MCP_TARGET_TRAILING_PUNCTUATION = ".,!?;:，。！？；：`'\")]}"
-_PROMPT_TARGET_TERMINAL_PUNCTUATION = ".,!?;:，。！？；：`'\")]}"
+_MCP_TARGET_TRAILING_PUNCTUATION = ".,!?;:，。！？；：`'\")]})）】」』》〉〕］｝"
+_PROMPT_TARGET_TERMINAL_PUNCTUATION = ".,!?;:，。！？；：`'\")]})）】」』》〉〕］｝"
 _REDACTION_PLACEHOLDER_RE = re.compile(
     r"(?i)\{\{[ \t]*(?:redacted|removed|masked|omitted)[ \t]*\}\}"
+)
+_GENERIC_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[,，;；|{\[])[ \t]*"
+    r"(?P<quote>[\"']?)(?P<label>(?!\d)\w(?:[\w .-]{0,62}\w)?)(?P=quote)"
+    r"[ \t\r\n]*[:：=]",
+    re.MULTILINE,
 )
 _TRUSTED_MCP_SERVER_TARGETS = {
     "box": "box",
@@ -1822,17 +1830,32 @@ def _matching_concrete_term_hashes(text: str) -> set[str]:
         if value.strip(" \t\r\n,，;；|"):
             concrete.add(_policy_value_hash(term))
 
-    previous: tuple[str, int] | None = None
+    events: list[tuple[int, int, str | None, int]] = []
     for mention in pattern.finditer(text):
         cursor = mention.end()
+        if (
+            cursor < len(text)
+            and text[cursor] in "\"'"
+            and mention.start()
+            and text[mention.start() - 1] == text[cursor]
+        ):
+            cursor += 1
         while cursor < len(text) and text[cursor] in " \t\r\n":
             cursor += 1
         if cursor == len(text) or text[cursor] not in ":：=":
             continue
-        current = (mention.group("term"), cursor + 1)
+        events.append((mention.start(), 1, mention.group("term"), cursor + 1))
+    for assignment in _GENERIC_ASSIGNMENT_RE.finditer(text):
+        label = assignment.group("label")
+        if label.casefold() in {"http", "https"} and text[assignment.end() :].startswith("//"):
+            continue
+        events.append((assignment.start("label"), 0, None, assignment.end()))
+
+    previous: tuple[str, int] | None = None
+    for start, _, term, value_start in sorted(events):
         if previous is not None:
-            record(previous[0], previous[1], mention.start())
-        previous = current
+            record(previous[0], previous[1], start)
+        previous = (term, value_start) if term is not None else None
     if previous is not None:
         record(previous[0], previous[1], len(text))
     return concrete
@@ -1868,8 +1891,15 @@ def _external_target_scope_from_prompt(text: str) -> tuple[set[str], str | None]
         name
         for name, pattern in _PROMPT_EXTERNAL_TARGET_PATTERNS
         if any(
-            (name == "web" and match.group(0).casefold().startswith(("http://", "https://")))
-            or _prompt_target_match_is_delimited(natural_text, match.start(), match.end())
+            (
+                name == "web"
+                and match.group(0).casefold().startswith(("http://", "https://"))
+                and _prompt_target_start_is_delimited(natural_text, match.start())
+            )
+            or (
+                not match.group(0).casefold().startswith(("http://", "https://"))
+                and _prompt_target_match_is_delimited(natural_text, match.start(), match.end())
+            )
             for match in pattern.finditer(natural_text)
         )
     }
@@ -1899,9 +1929,10 @@ def _prompt_target_match_is_delimited(text: str, start: int, end: int) -> bool:
 
 
 def _external_targets_from_tool_name(tool_name: str) -> set[str]:
-    if not tool_name.startswith("mcp__"):
+    normalized = tool_name.casefold()
+    if not normalized.startswith("mcp__"):
         return {name for name, pattern in _EXTERNAL_TARGET_PATTERNS if pattern.search(tool_name)}
-    parts = tool_name.split("__", 2)
+    parts = normalized.split("__", 2)
     if len(parts) < 2:
         return set()
     server = parts[1].casefold()
@@ -1948,7 +1979,7 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
         return None
     sentences = [
         item.strip()
-        for item in re.split(r"(?:[。！？!?；;]+(?=\s|$)|\n+)", prompt)
+        for item in re.split(r"(?:[。！？；]+|[!?;]+(?=\s|$)|\n+)", prompt)
         if item.strip()
     ]
     if any(_SENSITIVE_NEGATION_RE.search(item) and _SENSITIVE_EXTERNAL_VERB_RE.search(item) for item in sentences):
