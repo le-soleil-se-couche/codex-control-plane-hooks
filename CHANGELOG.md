@@ -4,6 +4,11 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+- Unwrapped ordinary `pwsh` and `powershell.exe` launchers instead of classifying the launcher itself as dynamic evaluation, while continuing to classify dangerous `-Command` payloads recursively.
+- Treated literal `.ps1` entrypoints and leading PowerShell call operators consistently with other local script runtimes, without confusing the call operator with a trailing background operator.
+- Kept encoded commands or arguments, execution-policy overrides, environment-changing launcher options, interactive persistence, wildcard script targets, variables, script blocks, parenthesized expressions, and other indirect invocation forms behind the dangerous-command gate.
+- Added packaged Hook command smoke coverage for both PowerShell 7 (`pwsh`) and Windows PowerShell 5.1 (`powershell.exe`) on Windows CI.
+
 ## [0.2.3] - 2026-07-16
 
 - Parsed assigned field values before removing recognized redaction placeholders, preserving line-wrapped and post-placeholder concrete values.

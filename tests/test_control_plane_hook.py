@@ -135,7 +135,6 @@ class HookProtocolTests(unittest.TestCase):
             r"cmd.exe /c rmdir /s /q C:\work\cache",
             r"cmd.exe /d /s /c echo hello",
             r"del /s C:\work\cache\*",
-            r"powershell.exe -NoProfile -Command Get-ChildItem",
             r"powershell.exe -NoProfile -enc QQBBAEEA",
             r"iex 'Get-ChildItem'",
             r"Invoke-Expression 'Get-ChildItem'",
@@ -199,6 +198,114 @@ class HookProtocolTests(unittest.TestCase):
                 else:
                     self.assertEqual({}, result)
 
+    def test_powershell_command_mode_allows_safe_content_and_scans_inner_command(self) -> None:
+        safe_commands = [
+            "pwsh -NoLogo -NoProfile -NonInteractive -Command Get-ChildItem",
+            "pwsh -NoProfileLoadTime -NoProfile -OutputFormat Text -Command Get-ChildItem",
+            "pwsh -NoProfile -WindowStyle Normal -Command Get-Location",
+            "powershell -NoLogo -NoProfile -NonInteractive -Command Get-Content README.md",
+            'pwsh -Command "git status --short"',
+            "pwsh -Version",
+        ]
+        for command in safe_commands:
+            with self.subTest(safe_command=command):
+                self.assertEqual({}, self.bash(command))
+
+        dangerous_commands = [
+            r"pwsh -NoProfile -Command Remove-Item -Recurse -Force C:\work\cache",
+            'powershell.exe -NoProfile -Command "git commit -m checkpoint"',
+            'pwsh -Command "Invoke-Expression Get-Location"',
+            'pwsh -Command "pwsh -EncodedCommand QQBBAEEA"',
+            'pwsh -Command "& { Get-ChildItem }"',
+        ]
+        for command in dangerous_commands:
+            with self.subTest(dangerous_command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_powershell_literal_ps1_targets_are_allowed(self) -> None:
+        commands = [
+            r"pwsh -NoProfile -File C:\work\script.ps1",
+            r"pwsh -NoProfile C:\work\script.ps1 -Mode Check",
+            r'powershell.exe -NoProfile -File "C:\work trees\script.ps1"',
+            r'powershell.exe -NoProfile "C:\work trees\script.ps1" -Mode Check',
+            r'pwsh -NoProfile -File "C:\Program Files (x86)\check.ps1" "literal (value)"',
+            r'& "C:\work\script.ps1"',
+            r"& .\scripts\check.ps1 -Mode Check",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual({}, self.bash(command))
+
+    def test_powershell_high_risk_launcher_options_are_denied(self) -> None:
+        commands = [
+            "pwsh -EncodedCommand SQBuAHYAbwBrAGUALQBFAHgAcAByAGUAcwBzAGkAbwBuAA==",
+            "powershell.exe -enc SQBuAHYAbwBrAGUALQBFAHgAcAByAGUAcwBzAGkAbwBuAA==",
+            "pwsh -EncodedArguments QQBBAEEA",
+            "powershell.exe -ExecutionPolicy Bypass -File C:\\work\\script.ps1",
+            "pwsh -ExecutionPolicy Unrestricted -File C:\\work\\script.ps1",
+            "powershell.exe -ExecutionPolicy RemoteSigned -File C:\\work\\script.ps1",
+            "pwsh -NoExit -File C:\\work\\script.ps1",
+            "powershell.exe -NoExit -Command Get-ChildItem",
+            "powershell.exe -Version 2.0 -Command Get-ChildItem",
+            "pwsh -Login -Command Get-ChildItem",
+            "pwsh -ConfigurationFile C:\\work\\session.pssc -Command Get-ChildItem",
+            "pwsh -ConfigurationName AdminRoles -Command Get-ChildItem",
+            "pwsh -SettingsFile C:\\work\\powershell.config.json -Command Get-ChildItem",
+            "pwsh -CustomPipeName DebugPipe -Command Get-ChildItem",
+            "pwsh -WorkingDirectory C:\\work -Command Get-ChildItem",
+            "powershell.exe -WindowStyle Hidden -Command Get-ChildItem",
+            "pwsh -WindowStyle 1 -Command Get-Location",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_powershell_start_process_aliases_preserve_privilege_reason(self) -> None:
+        module = __import__("control_plane_hook")
+        commands = [
+            'pwsh -Command "saps powershell.exe -Verb:RunAs"',
+            'pwsh -Command "start powershell.exe -Verb=RunAs"',
+            'pwsh -Command "Start-Process powershell.exe -Verb RunAs"',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                codes = {
+                    item["code"] for item in module._structured_command_findings(command)
+                }
+                self.assertIn("background_process", codes)
+                self.assertIn("privilege_escalation", codes)
+
+    def test_powershell_dynamic_background_and_invalid_targets_are_denied(self) -> None:
+        commands = [
+            r"pwsh -Command $command",
+            r"pwsh -Command { Get-ChildItem }",
+            r"pwsh -Command (Remove-Item -Recurse C:\work\cache)",
+            r'pwsh -Command "(Remove-Item -Recurse C:\work\cache)"',
+            r"pwsh -Command @(npm install unsafe-package)",
+            r'pwsh -Command "saps powershell.exe -Verb RunAs"',
+            r"pwsh -File $script",
+            r"pwsh -File C:\work\script.ps1 (Remove-Item -Recurse C:\work\cache)",
+            r"pwsh -File C:\work\*.ps1",
+            r"pwsh C:\work\?.ps1",
+            r"& $script",
+            r"& { Get-ChildItem }",
+            r'& "C:\work\[ab].ps1"',
+            r'& "C:\work\script.ps1" &',
+            r"pwsh -File C:\work\script.ps1 &",
+            "pwsh -File",
+            "pwsh -Command",
+            r'powershell.exe -File "C:\work\unterminated.ps1',
+            r"pwsh -File C:\work\script.cmd",
+            r"powershell.exe -File C:\work\script.py",
+            r'& "C:\work\script.cmd"',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
     def test_powershell_call_operator_preserves_safe_windows_invocation(self) -> None:
         command = r'& "C:\Program Files\Git\bin\git.exe" status --short'
         self.assertEqual({}, self.bash(command))
@@ -230,7 +337,6 @@ class HookProtocolTests(unittest.TestCase):
             r"& { Get-ChildItem }",
             r"& Invoke-Build",
             r"& SomeFunction",
-            r'& "C:\work\script.ps1"',
             r'& "C:\work\script.cmd"',
             r'& "C:\Program Files\Git\bin\git.exe" status --short &',
         ]:

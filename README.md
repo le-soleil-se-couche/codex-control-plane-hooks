@@ -84,7 +84,8 @@ Windows PowerShell:
 
 ```powershell
 python -B -m unittest discover -s tests -v
-python scripts/smoke_hook_manifest.py
+python scripts/smoke_hook_manifest.py --windows-shell pwsh
+python scripts/smoke_hook_manifest.py --windows-shell powershell
 python scripts/check_release.py
 ```
 
@@ -101,20 +102,22 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 149 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
+| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 154 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
 | GitHub Actions runtime | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Linux Codex host | 2026-07-15 |
-| GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Windows Codex host | 2026-07-15 |
+| GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | protocol + `pwsh` + `powershell.exe` packaged-command gates required | [UNRUN] Windows Codex host | 2026-07-16 |
 
 Runtime support and Codex-host compatibility are separate claims. Hook event names, matchers, output schemas, environment variables, and trust behavior can change between Codex versions.
 
 ## Known limits
 
 - Checks only run for events matched by `hooks/hooks.json` and emitted by the host.
+- Hook process launch, timeout, and error handling remain host-owned; the plugin cannot enforce a deny decision when the host follows a fail-open path before accepting Hook output.
 - Secret detection covers selected patterns and scans a bounded amount of text.
 - Unknown `mcp__*` tools are treated as external destinations when sensitive context is active. Payload text and lookalike server namespaces cannot consume a grant for a named connector.
 - Post-tool checks occur after a tool has produced output.
 - Natural-language approval parsing remains experimental even when explicitly enabled.
 - Browser, Computer Use, and connector behavior depends on the tool name and Hook events exposed by the host.
+- Ordinary PowerShell launchers and literal `.ps1` entrypoints are treated like other script runtimes. Inline `-Command` payloads receive bounded recursive classification, while complete semantic review of script-file contents remains outside this pattern-based Hook and belongs to sandboxing, approval policy, repository review, and tests.
 - The project does not defend a compromised OS account, Python runtime, Codex binary, plugin cache, or writable policy file.
 - Native Windows uses `commandWindows`, requires an absolute host-provided `PLUGIN_DATA`, rejects external `CONTROL_PLANE_POLICY`, and relies on the host directory's inherited NTFS DACL. The Hook rejects observed symlinks and reparse points but does not independently audit every DACL ACE.
 - Linux and Windows Codex-host installation remain `[UNRUN]` until a clean-profile host smoke is recorded; their Python runtime and packaged Hook commands are CI-gated.

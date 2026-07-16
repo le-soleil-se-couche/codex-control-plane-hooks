@@ -42,8 +42,25 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Protocol and release tests
         run: python -B -m unittest discover -s tests -v
-      - name: Packaged Hook command smoke
+      - name: Packaged Hook command smoke (POSIX)
+        if: runner.os != 'Windows'
         run: python scripts/smoke_hook_manifest.py
+      - name: Packaged Hook command smoke (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 7) {
+            throw "Expected PowerShell 7, found $($PSVersionTable.PSVersion)"
+          }
+          python scripts/smoke_hook_manifest.py --windows-shell pwsh
+      - name: Packaged Hook command smoke (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+            throw "Expected Windows PowerShell 5.1, found $($PSVersionTable.PSVersion)"
+          }
+          python scripts/smoke_hook_manifest.py --windows-shell powershell
       - name: Public release boundary
         run: python scripts/check_release.py
 
