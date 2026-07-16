@@ -49,7 +49,10 @@ _SECRET_PATTERNS = (
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
 )
 _SENSITIVE_EXTERNAL_VERB_RE = re.compile(r"外发|披露|上传|发送|共享|external|upload|share|send", re.IGNORECASE)
-_SENSITIVE_NEGATION_RE = re.compile(r"不要|别|禁止|不许|不得|不允许|拒绝|do\s+not|don't|never", re.IGNORECASE)
+_SENSITIVE_NEGATION_RE = re.compile(
+    r"不要|别|禁止|不许|不得|不允许|拒绝|do\s+not|don't|never|can\s*not|can['’]t",
+    re.IGNORECASE,
+)
 _TERM_NEGATION_SUFFIX_RE = re.compile(
     r"(?ix)(?:"
     r"(?:but\s+)?not|except(?:\s+for)?|excluding|exclude|without|"
@@ -1847,7 +1850,7 @@ def _external_target_scope_from_prompt(text: str) -> tuple[set[str], str | None]
     mcp_targets: set[str] = set()
     exact_tool_hashes: set[str] = set()
     for match in _MCP_TARGET_CANDIDATE_RE.finditer(text):
-        if not _prompt_mcp_target_start_is_delimited(text, match.start()):
+        if not _prompt_target_start_is_delimited(text, match.start()):
             return set(), None
         token = match.group(0).rstrip(_MCP_TARGET_TRAILING_PUNCTUATION)
         if not _MCP_TARGET_TOKEN_RE.fullmatch(token):
@@ -1874,7 +1877,7 @@ def _external_target_scope_from_prompt(text: str) -> tuple[set[str], str | None]
     return mcp_targets | natural_targets, exact_tool_hash
 
 
-def _prompt_mcp_target_start_is_delimited(text: str, start: int) -> bool:
+def _prompt_target_start_is_delimited(text: str, start: int) -> bool:
     return bool(
         start == 0
         or text[start - 1].isspace()
@@ -1883,7 +1886,7 @@ def _prompt_mcp_target_start_is_delimited(text: str, start: int) -> bool:
 
 
 def _prompt_target_match_is_delimited(text: str, start: int, end: int) -> bool:
-    if start and text[start - 1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./-":
+    if not _prompt_target_start_is_delimited(text, start):
         return False
     if end == len(text) or text[end].isspace():
         return True

@@ -1210,6 +1210,20 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
+    def test_pronoun_level_cannot_revokes_disclosure_grant(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital position details "
+            "to Google Drive, but it cannot be uploaded."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {"text": "Example Capital position: TEST_POSITION_033"},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
     def test_long_distance_negated_sensitive_upload_never_authorizes_disclosure(self) -> None:
         self.prompt(
             "Do not send Example Capital position details to Google Drive under any circumstances; "
@@ -1310,6 +1324,9 @@ class HookProtocolTests(unittest.TestCase):
                 "mcp__github__create_file.恶意",
                 "mcp__github__create_file.，恶意",
                 "notgithub",
+                "恶意github",
+                "非github",
+                "not·github",
                 "github-malicious",
                 "not-github",
                 "github.malicious",

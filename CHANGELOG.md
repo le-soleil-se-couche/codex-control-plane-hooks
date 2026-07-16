@@ -7,11 +7,11 @@ All notable changes are documented here. The project follows Semantic Versioning
 ## [0.2.3] - 2026-07-16
 
 - Parsed assigned field values before removing recognized redaction placeholders, preserving line-wrapped and post-placeholder concrete values.
-- Required exact prompt-side connector phrases or complete trusted MCP identities to begin at an explicit delimiter and end before whitespace or terminal punctuation, rejecting path, identifier, mixed-punctuation, and Unicode-suffix lookalikes.
+- Required exact prompt-side connector phrases or complete trusted MCP identities to begin at an explicit delimiter and end before whitespace or terminal punctuation, rejecting ASCII and non-ASCII word embeddings, paths, identifiers, mixed punctuation, and Unicode suffixes.
 - Bound grants that name a complete MCP tool to that exact tool identity while retaining destination-level grants for natural connector names.
 - Honored common post-term exclusions, including punctuation-adjacent, future-tense, upload, and disclosure wording.
 - Segmented configured field values at the next assignment, including same-line fields and line-wrapped separators, with a single bounded scan across large payloads.
-- Honored `cannot` and `can't` post-term exclusions and rejected ASCII-punctuation target suffixes followed by Unicode lookalike text.
+- Honored `cannot` and `can't` in both term-specific and whole-sentence disclosure negation, and rejected ASCII-punctuation target suffixes followed by Unicode lookalike text.
 - Added positive and adversarial regressions for exact MCP tools, lookalikes, placeholders, line-wrapped and same-line values, post-term exclusions, and the 500 KB hook budget.
 
 ## [0.2.2] - 2026-07-16
