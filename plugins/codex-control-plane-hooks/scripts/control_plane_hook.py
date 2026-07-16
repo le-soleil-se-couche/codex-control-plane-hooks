@@ -151,7 +151,6 @@ _PROMPT_TARGET_TERMINAL_PUNCTUATION = ".,!?;:，。！？；：`'\")]}"
 _REDACTION_PLACEHOLDER_RE = re.compile(
     r"(?i)\{\{[ \t]*(?:redacted|removed|masked|omitted)[ \t]*\}\}"
 )
-_FIELD_VALUE_SEPARATOR_RE = re.compile(r"[,，;；|]")
 _TRUSTED_MCP_SERVER_TARGETS = {
     "box": "box",
     "browser": "browser",
@@ -1809,12 +1808,11 @@ def _line_contains_configured_assignment(line: str) -> bool:
 
 def _has_concrete_field_value(text: str, value_start: int) -> bool:
     lines = text[value_start:].splitlines()
-    for index, line in enumerate(lines[:4]):
+    for index, line in enumerate(lines):
         if index and _line_contains_configured_assignment(line):
             return False
-        fragment = _FIELD_VALUE_SEPARATOR_RE.split(line, maxsplit=1)[0]
-        remainder = _REDACTION_PLACEHOLDER_RE.sub("", fragment)
-        if remainder.strip():
+        remainder = _REDACTION_PLACEHOLDER_RE.sub("", line)
+        if remainder.strip(" \t\r\n,，;；|"):
             return True
     return False
 

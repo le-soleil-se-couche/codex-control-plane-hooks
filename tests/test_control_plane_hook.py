@@ -1420,7 +1420,13 @@ class HookProtocolTests(unittest.TestCase):
 
     def test_line_wrapped_or_post_placeholder_values_remain_concrete(self) -> None:
         for index, value in enumerate(
-            ("\nTEST_POSITION_025", "\r\nTEST_POSITION_026", " {{redacted}} TEST_POSITION_027"),
+            (
+                "\nTEST_POSITION_025",
+                "\r\nTEST_POSITION_026",
+                " {{redacted}} TEST_POSITION_027",
+                " {{redacted}}, TEST_POSITION_028",
+                "\n\n\n\n\n\nTEST_POSITION_029",
+            ),
             start=1,
         ):
             with self.subTest(value=repr(value)):
