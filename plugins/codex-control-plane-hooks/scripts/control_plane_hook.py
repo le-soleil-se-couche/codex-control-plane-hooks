@@ -1721,7 +1721,7 @@ def _matching_concrete_term_hashes(text: str) -> set[str]:
     for term in _policy()["terms"]:
         pattern = re.compile(
             _bounded_term_source(term)
-            + rf"\s*[:：=]\s*(?!\{{\{{)[^\n,，;；|]{{2,}}",
+            + r"\s*[:：=]\s*(?!\{\{)[^\n,，;；|]{2,}",
             re.IGNORECASE,
         )
         if pattern.search(text):

@@ -21,8 +21,6 @@ jobs:
           python-version: "3.12"
       - name: Install Ruff
         run: python -m pip install --disable-pip-version-check ruff==0.15.12
-      - name: Show import-order diff
-        run: ruff check --select I --fix --diff . || true
       - name: Lint
         run: ruff check --no-cache .
 
