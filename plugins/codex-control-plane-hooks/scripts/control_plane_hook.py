@@ -49,12 +49,29 @@ _SECRET_PATTERNS = (
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
 )
 _SENSITIVE_EXTERNAL_VERB_RE = re.compile(r"外发|披露|上传|发送|共享|external|upload|share|send", re.IGNORECASE)
-_SENSITIVE_NEGATION_RE = re.compile(r"不要|别|禁止|不许|不得|不允许|拒绝|do\s+not|don't|never", re.IGNORECASE)
+_SENSITIVE_NEGATION_RE = re.compile(
+    r"(?:不要|别|禁止|不许|不得|不允许|拒绝)|"
+    r"\b(?:do\s+not|don['’]t|never|can(?:not|\s+not)|can['’]t|"
+    r"(?:will|must|should|shall)\s+not|won['’]t)\b",
+    re.IGNORECASE,
+)
 _TERM_NEGATION_SUFFIX_RE = re.compile(
     r"(?ix)(?:"
     r"(?:but\s+)?not|except(?:\s+for)?|excluding|exclude|without|"
     r"do\s+not\s+(?:include|send)|不要|不包括|不含|排除|除外"
     r")\s*[,，:]?\s*$"
+)
+_TERM_NEGATION_POSTFIX_RE = re.compile(
+    r"(?ix)^[ \t]*[,，:]?[ \t]*(?:"
+    r"(?:is[ \t]+)?not[ \t]+(?:included|authorized|allowed|sent|shared|uploaded|disclosed)|"
+    r"(?:is[ \t]+)?excluded|"
+    r"(?:(?:must|should|will|shall)[ \t]+not(?:[ \t]+be)?|won['’]t(?:[ \t]+be)?)[ \t]+"
+    r"(?:included|sent|shared|uploaded|disclosed)|"
+    r"(?:can[ \t]*not|can['’]t)(?:[ \t]+be)?[ \t]+"
+    r"(?:included|sent|shared|uploaded|disclosed)|"
+    r"不包括|不包含|不含|排除|除外|不发送|不得发送|不上传|不得上传|不披露|不得披露|"
+    r"不会上传|不会披露"
+    r")(?=$|[\s,，;；:.])"
 )
 _SENSITIVE_EXPLICIT_AUTH_RE = re.compile(
     r"本轮明确授权|这次明确授权|现在明确授权|本轮明确允许|这次明确允许|I\s+explicitly\s+authorize",
@@ -71,6 +88,79 @@ _EXTERNAL_TARGET_PATTERNS = (
     ("github", re.compile(r"(?i)github|mcp__github|\bgh\b")),
     ("browser", re.compile(r"(?i)browser|chrome|computer[ _-]*use")),
     ("web", re.compile(r"(?i)(?:^|[^a-z])web(?:[^a-z]|$)|https?://")),
+)
+_PROMPT_EXTERNAL_TARGET_PATTERNS = (
+    (
+        "google_drive",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])google[ _-]*drive"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "gmail",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])gmail(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
+    (
+        "notion",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])notion(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
+    (
+        "slack",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])slack(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
+    (
+        "teams",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])(?:microsoft[ _-]*)?teams"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "sharepoint",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])sharepoint"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "box",
+        re.compile(r"(?i)(?<![A-Za-z0-9_./-])box(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"),
+    ),
+    (
+        "github",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])(?:github|gh)"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "browser",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])"
+            r"(?:browser|chrome|computer[ _-]*use)"
+            r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
+        ),
+    ),
+    (
+        "web",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_./-])web(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_])|https?://"
+        ),
+    ),
+)
+_MCP_TARGET_CANDIDATE_RE = re.compile(r"(?i)mcp__\S+")
+_MCP_TARGET_TOKEN_RE = re.compile(r"(?i)^mcp__[A-Za-z0-9_]+(?:__[A-Za-z0-9_]+)?$")
+_MCP_TARGET_TRAILING_PUNCTUATION = ".,!?;:，。！？；：`'\")]})）】」』》〉〕］｝"
+_PROMPT_TARGET_TERMINAL_PUNCTUATION = ".,!?;:，。！？；：`'\")]})）】」』》〉〕］｝"
+_REDACTION_PLACEHOLDER_RE = re.compile(
+    r"(?i)\{\{[ \t]*(?:redacted|removed|masked|omitted)[ \t]*\}\}"
+)
+_GENERIC_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[,，;；|{\[])[ \t]*"
+    r"(?P<quote>[\"']?)(?P<label>(?!\d)\w(?:[\w .-]{0,62}\w)?)(?P=quote)"
+    r"[ \t\r\n]*[:：=]",
+    re.MULTILINE,
 )
 _TRUSTED_MCP_SERVER_TARGETS = {
     "box": "box",
@@ -1716,16 +1806,58 @@ def _bounded_term_source(term: str) -> str:
     return rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])"
 
 
+def _configured_term_pattern(terms: list[str]) -> re.Pattern[str] | None:
+    alternatives = "|".join(
+        re.escape(term)
+        for term in sorted(set(terms), key=lambda item: (-len(item), item.casefold()))
+    )
+    if not alternatives:
+        return None
+    return re.compile(
+        rf"(?<![A-Za-z0-9_])(?P<term>{alternatives})(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    )
+
+
 def _matching_concrete_term_hashes(text: str) -> set[str]:
+    pattern = _configured_term_pattern(_policy()["terms"])
+    if pattern is None:
+        return set()
     concrete: set[str] = set()
-    for term in _policy()["terms"]:
-        pattern = re.compile(
-            _bounded_term_source(term)
-            + r"\s*[:：=]\s*(?!\{\{)[^\n,，;；|]{2,}",
-            re.IGNORECASE,
-        )
-        if pattern.search(text):
+
+    def record(term: str, value_start: int, value_end: int) -> None:
+        value = _REDACTION_PLACEHOLDER_RE.sub("", text[value_start:value_end])
+        if value.strip(" \t\r\n,，;；|"):
             concrete.add(_policy_value_hash(term))
+
+    events: list[tuple[int, int, str | None, int]] = []
+    for mention in pattern.finditer(text):
+        cursor = mention.end()
+        if (
+            cursor < len(text)
+            and text[cursor] in "\"'"
+            and mention.start()
+            and text[mention.start() - 1] == text[cursor]
+        ):
+            cursor += 1
+        while cursor < len(text) and text[cursor] in " \t\r\n":
+            cursor += 1
+        if cursor == len(text) or text[cursor] not in ":：=":
+            continue
+        events.append((mention.start(), 1, mention.group("term"), cursor + 1))
+    for assignment in _GENERIC_ASSIGNMENT_RE.finditer(text):
+        label = assignment.group("label")
+        if label.casefold() in {"http", "https"} and text[assignment.end() :].startswith("//"):
+            continue
+        events.append((assignment.start("label"), 0, None, assignment.end()))
+
+    previous: tuple[str, int] | None = None
+    for start, _, term, value_start in sorted(events):
+        if previous is not None:
+            record(previous[0], previous[1], start)
+        previous = (term, value_start) if term is not None else None
+    if previous is not None:
+        record(previous[0], previous[1], len(text))
     return concrete
 
 
@@ -1737,14 +1869,70 @@ def _sensitive_concrete(text: str) -> bool:
     return bool(_sensitive_context(text) and _contains_concrete_sensitive_term(text))
 
 
-def _external_targets_from_prompt(text: str) -> set[str]:
-    return {name for name, pattern in _EXTERNAL_TARGET_PATTERNS if pattern.search(text)}
+def _external_target_scope_from_prompt(text: str) -> tuple[set[str], str | None]:
+    mcp_targets: set[str] = set()
+    exact_tool_hashes: set[str] = set()
+    for match in _MCP_TARGET_CANDIDATE_RE.finditer(text):
+        if not _prompt_target_start_is_delimited(text, match.start()):
+            return set(), None
+        token = match.group(0).rstrip(_MCP_TARGET_TRAILING_PUNCTUATION)
+        if not _MCP_TARGET_TOKEN_RE.fullmatch(token):
+            return set(), None
+        targets = _external_targets_from_tool_name(token)
+        if not targets:
+            return set(), None
+        mcp_targets.update(targets)
+        if len(token.split("__", 2)) == 3:
+            exact_tool_hashes.add(_policy_value_hash(token))
+    if len(exact_tool_hashes) > 1:
+        return set(), None
+    natural_text = _MCP_TARGET_CANDIDATE_RE.sub(" ", text)
+    natural_targets = {
+        name
+        for name, pattern in _PROMPT_EXTERNAL_TARGET_PATTERNS
+        if any(
+            (
+                name == "web"
+                and match.group(0).casefold().startswith(("http://", "https://"))
+                and _prompt_target_start_is_delimited(natural_text, match.start())
+            )
+            or (
+                not match.group(0).casefold().startswith(("http://", "https://"))
+                and _prompt_target_match_is_delimited(natural_text, match.start(), match.end())
+            )
+            for match in pattern.finditer(natural_text)
+        )
+    }
+    exact_tool_hash = next(iter(exact_tool_hashes)) if exact_tool_hashes else None
+    return mcp_targets | natural_targets, exact_tool_hash
+
+
+def _prompt_target_start_is_delimited(text: str, start: int) -> bool:
+    return bool(
+        start == 0
+        or text[start - 1].isspace()
+        or text[start - 1] in "([{\"'`（【「『"
+    )
+
+
+def _prompt_target_match_is_delimited(text: str, start: int, end: int) -> bool:
+    if not _prompt_target_start_is_delimited(text, start):
+        return False
+    if end == len(text) or text[end].isspace():
+        return True
+    cursor = end
+    if text[cursor] not in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
+        return False
+    while cursor < len(text) and text[cursor] in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
+        cursor += 1
+    return cursor == len(text) or text[cursor].isspace()
 
 
 def _external_targets_from_tool_name(tool_name: str) -> set[str]:
-    if not tool_name.startswith("mcp__"):
+    normalized = tool_name.casefold()
+    if not normalized.startswith("mcp__"):
         return {name for name, pattern in _EXTERNAL_TARGET_PATTERNS if pattern.search(tool_name)}
-    parts = tool_name.split("__", 2)
+    parts = normalized.split("__", 2)
     if len(parts) < 2:
         return set()
     server = parts[1].casefold()
@@ -1770,7 +1958,11 @@ def _matching_grant_term_hashes(text: str) -> set[str]:
         mentions = list(re.finditer(_bounded_term_source(term), text, re.IGNORECASE))
         if not mentions:
             continue
-        if any(_TERM_NEGATION_SUFFIX_RE.search(text[max(0, item.start() - 48) : item.start()]) for item in mentions):
+        if any(
+            _TERM_NEGATION_SUFFIX_RE.search(text[max(0, item.start() - 48) : item.start()])
+            or _TERM_NEGATION_POSTFIX_RE.search(text[item.end() : item.end() + 48])
+            for item in mentions
+        ):
             continue
         matched.add(_policy_value_hash(term))
     return matched
@@ -1785,11 +1977,15 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
         or not turn_id
     ):
         return None
-    sentences = [item.strip() for item in re.split(r"[。！？!?；;\n]+", prompt) if item.strip()]
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?:[。！？；]+|[!?;]+(?=\s|$)|\n+)", prompt)
+        if item.strip()
+    ]
     if any(_SENSITIVE_NEGATION_RE.search(item) and _SENSITIVE_EXTERNAL_VERB_RE.search(item) for item in sentences):
         return None
     for item in sentences:
-        targets = _external_targets_from_prompt(item)
+        targets, exact_tool_hash = _external_target_scope_from_prompt(item)
         term_hashes = _matching_grant_term_hashes(item)
         if all(
             (
@@ -1800,11 +1996,14 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
                 len(targets) == 1,
             )
         ):
-            return {
+            grant = {
                 "turn_id": turn_id,
                 "target": next(iter(targets)),
                 "term_hashes": sorted(term_hashes),
             }
+            if exact_tool_hash:
+                grant["tool_name_hash"] = exact_tool_hash
+            return grant
     return None
 
 
@@ -2116,11 +2315,13 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
     grant = state.get("sensitive_disclosure_grant")
     concrete_terms = _matching_concrete_term_hashes(sensitive_text)
     grant_terms = set(grant.get("term_hashes") or []) if isinstance(grant, dict) else set()
+    grant_tool_hash = str(grant.get("tool_name_hash") or "") if isinstance(grant, dict) else ""
     disclosure = bool(
         isinstance(grant, dict)
         and str(grant.get("turn_id") or "") == event_turn
         and len(targets) == 1
         and str(grant.get("target") or "") == next(iter(targets))
+        and (not grant_tool_hash or grant_tool_hash == _policy_value_hash(tool_name))
         and concrete_terms
         and concrete_terms.issubset(grant_terms)
     )

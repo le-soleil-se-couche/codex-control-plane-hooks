@@ -33,7 +33,7 @@ The plugin does not impose an Agent-count ceiling. Runtime capacity remains owne
 Review the repository and its current compatibility table before installation.
 
 ```bash
-codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.2
+codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.3
 codex plugin add codex-control-plane-hooks@codex-control-plane-hooks
 codex plugin list --marketplace codex-control-plane-hooks
 ```
@@ -101,7 +101,7 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 131 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
+| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 149 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
 | GitHub Actions runtime | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Linux Codex host | 2026-07-15 |
 | GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Windows Codex host | 2026-07-15 |
 

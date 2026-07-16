@@ -4,6 +4,17 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-16
+
+- Parsed assigned field values before removing recognized redaction placeholders, preserving line-wrapped and post-placeholder concrete values.
+- Required URL, natural connector, and complete MCP prompt targets to begin at an explicit delimiter and end at a valid boundary, rejecting ASCII and non-ASCII word embeddings, paths, identifiers, mixed punctuation, Unicode suffixes, and case-variant MCP lookalikes.
+- Bound grants that name a complete MCP tool to that exact tool identity while retaining destination-level grants for natural connector names.
+- Honored common post-term exclusions, including punctuation-adjacent, future-tense, upload, and disclosure wording.
+- Segmented configured field values at any following sibling assignment, including unconfigured and JSON-quoted fields, same-line fields, and line-wrapped separators, with a single bounded scan across large payloads.
+- Honored `cannot`, `can't`, future-tense bans, and contractions in both term-specific and whole-sentence disclosure negation with standalone-word boundaries.
+- Supported paired CJK target delimiters and ordinary no-space CJK sentence punctuation without weakening suffix checks.
+- Added positive and adversarial regressions for exact MCP tools, lookalikes, placeholders, line-wrapped and same-line values, post-term exclusions, and the 500 KB hook budget.
+
 ## [0.2.2] - 2026-07-16
 
 - Bound disclosure destinations to exact trusted MCP server IDs or host multiplexer operation prefixes so payload text and lookalike namespaces cannot impersonate an authorized connector.
