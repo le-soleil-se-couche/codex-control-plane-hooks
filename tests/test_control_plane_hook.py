@@ -193,7 +193,11 @@ class HookProtocolTests(unittest.TestCase):
 
         for command in commands:
             with self.subTest(protocol_command=command):
-                self.assertEqual({}, self.bash(command))
+                result = self.bash(command)
+                if os.name == "nt":
+                    self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                else:
+                    self.assertEqual({}, result)
 
     def test_powershell_call_operator_preserves_safe_windows_invocation(self) -> None:
         command = r'& "C:\Program Files\Git\bin\git.exe" status --short'
