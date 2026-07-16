@@ -62,6 +62,8 @@ _TERM_NEGATION_POSTFIX_RE = re.compile(
     r"(?:is[ \t]+)?excluded|"
     r"(?:(?:must|should|will|shall)[ \t]+not(?:[ \t]+be)?|won['’]t(?:[ \t]+be)?)[ \t]+"
     r"(?:included|sent|shared|uploaded|disclosed)|"
+    r"(?:can[ \t]*not|can['’]t)(?:[ \t]+be)?[ \t]+"
+    r"(?:included|sent|shared|uploaded|disclosed)|"
     r"不包括|不包含|不含|排除|除外|不发送|不得发送|不上传|不得上传|不披露|不得披露|"
     r"不会上传|不会披露"
     r")(?=$|[\s,，;；:.])"
@@ -1795,37 +1797,38 @@ def _bounded_term_source(term: str) -> str:
     return rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])"
 
 
-def _line_contains_configured_assignment(line: str) -> bool:
-    return any(
-        re.search(
-            _bounded_term_source(term) + r"[^\S\r\n]*[:：=]",
-            line,
-            re.IGNORECASE,
-        )
-        for term in _policy()["terms"]
+def _configured_assignment_pattern(terms: list[str]) -> re.Pattern[str] | None:
+    alternatives = "|".join(
+        re.escape(term)
+        for term in sorted(set(terms), key=lambda item: (-len(item), item.casefold()))
+    )
+    if not alternatives:
+        return None
+    return re.compile(
+        rf"(?<![A-Za-z0-9_])(?P<term>{alternatives})(?![A-Za-z0-9_])"
+        r"[^\S\r\n]*[:：=]",
+        re.IGNORECASE,
     )
 
 
-def _has_concrete_field_value(text: str, value_start: int) -> bool:
-    lines = text[value_start:].splitlines()
-    for index, line in enumerate(lines):
-        if index and _line_contains_configured_assignment(line):
-            return False
-        remainder = _REDACTION_PLACEHOLDER_RE.sub("", line)
-        if remainder.strip(" \t\r\n,，;；|"):
-            return True
-    return False
-
-
 def _matching_concrete_term_hashes(text: str) -> set[str]:
+    pattern = _configured_assignment_pattern(_policy()["terms"])
+    if pattern is None:
+        return set()
     concrete: set[str] = set()
-    for term in _policy()["terms"]:
-        pattern = re.compile(
-            _bounded_term_source(term) + r"[^\S\r\n]*[:：=]",
-            re.IGNORECASE,
-        )
-        if any(_has_concrete_field_value(text, match.end()) for match in pattern.finditer(text)):
-            concrete.add(_policy_value_hash(term))
+
+    def record(match: re.Match[str], value_end: int) -> None:
+        value = _REDACTION_PLACEHOLDER_RE.sub("", text[match.end() : value_end])
+        if value.strip(" \t\r\n,，;；|"):
+            concrete.add(_policy_value_hash(match.group("term")))
+
+    previous: re.Match[str] | None = None
+    for current in pattern.finditer(text):
+        if previous is not None:
+            record(previous, current.start())
+        previous = current
+    if previous is not None:
+        record(previous, len(text))
     return concrete
 
 
@@ -1874,9 +1877,13 @@ def _prompt_target_match_is_delimited(text: str, start: int, end: int) -> bool:
     cursor = end
     if text[cursor] not in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
         return False
+    has_non_ascii_terminal = False
     while cursor < len(text) and text[cursor] in _PROMPT_TARGET_TERMINAL_PUNCTUATION:
+        has_non_ascii_terminal = has_non_ascii_terminal or ord(text[cursor]) > 127
         cursor += 1
-    return cursor == len(text) or text[cursor].isspace() or ord(text[cursor]) > 127
+    if cursor == len(text) or text[cursor].isspace():
+        return True
+    return has_non_ascii_terminal and ord(text[cursor]) > 127
 
 
 def _external_targets_from_tool_name(tool_name: str) -> set[str]:

@@ -1299,6 +1299,7 @@ class HookProtocolTests(unittest.TestCase):
                 "github-malicious",
                 "not-github",
                 "github.malicious",
+                "github.恶意",
                 "github..malicious",
                 "github.-malicious",
                 "github/malicious",
@@ -1418,6 +1419,25 @@ class HookProtocolTests(unittest.TestCase):
                     "deny", result["hookSpecificOutput"].get("permissionDecision")
                 )
 
+    def test_same_line_assignment_terminates_placeholder_only_value(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital client details "
+            "to the specified Google Drive folder."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {
+                    "text": (
+                        "Example Capital position: {{redacted}}, "
+                        "client: TEST_CLIENT_030"
+                    )
+                },
+            }
+        )
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
     def test_line_wrapped_or_post_placeholder_values_remain_concrete(self) -> None:
         for index, value in enumerate(
             (
@@ -1521,6 +1541,9 @@ class HookProtocolTests(unittest.TestCase):
                 "client not disclosed",
                 "client will not be uploaded",
                 "client will not be disclosed",
+                "client cannot be uploaded",
+                "client cannot be disclosed",
+                "client can't be uploaded",
                 "client 不包括",
             ),
             start=1,
@@ -1539,6 +1562,16 @@ class HookProtocolTests(unittest.TestCase):
                     }
                 )
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_placeholder_continuation_scan_stays_within_hook_budget(self) -> None:
+        module = __import__("control_plane_hook")
+        prefix = "Example Capital position: {{redacted}}\n"
+        payload = prefix + ("\n" * (module.MAX_SCAN_CHARS - len(prefix)))
+        started = time.monotonic()
+        result = module._matching_concrete_term_hashes(payload)
+        elapsed = time.monotonic() - started
+        self.assertEqual(set(), result)
+        self.assertLess(elapsed, 3.0)
 
     def test_affirmative_post_term_wording_remains_authorized(self) -> None:
         self.prompt(

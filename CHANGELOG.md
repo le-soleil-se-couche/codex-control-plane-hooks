@@ -10,7 +10,9 @@ All notable changes are documented here. The project follows Semantic Versioning
 - Required exact prompt-side connector phrases or complete trusted MCP identities so punctuation and identifier lookalikes cannot create a canonical disclosure grant.
 - Bound grants that name a complete MCP tool to that exact tool identity while retaining destination-level grants for natural connector names.
 - Honored common post-term exclusions, including punctuation-adjacent, future-tense, upload, and disclosure wording.
-- Added positive and adversarial regressions for exact MCP tools, lookalikes, placeholders, line-wrapped values, and post-term exclusions.
+- Segmented configured field values at the next assignment, including same-line fields, with a single bounded scan across large payloads.
+- Honored `cannot` and `can't` post-term exclusions and rejected ASCII-punctuation target suffixes followed by Unicode lookalike text.
+- Added positive and adversarial regressions for exact MCP tools, lookalikes, placeholders, line-wrapped and same-line values, post-term exclusions, and the 500 KB hook budget.
 
 ## [0.2.2] - 2026-07-16
 
