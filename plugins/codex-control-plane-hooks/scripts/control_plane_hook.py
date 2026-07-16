@@ -57,11 +57,12 @@ _TERM_NEGATION_SUFFIX_RE = re.compile(
     r")\s*[,，:]?\s*$"
 )
 _TERM_NEGATION_POSTFIX_RE = re.compile(
-    r"(?ix)^[ \t]*(?:"
-    r"(?:is[ \t]+)?not[ \t]+(?:included|authorized|allowed|sent|shared)|"
+    r"(?ix)^[ \t]*[,，:]?[ \t]*(?:"
+    r"(?:is[ \t]+)?not[ \t]+(?:included|authorized|allowed|sent|shared|uploaded|disclosed)|"
     r"(?:is[ \t]+)?excluded|"
-    r"(?:must|should)[ \t]+not[ \t]+be[ \t]+(?:included|sent|shared)|"
-    r"不包括|不包含|不含|排除|除外|不发送|不得发送"
+    r"(?:must|should)[ \t]+not[ \t]+be[ \t]+"
+    r"(?:included|sent|shared|uploaded|disclosed)|"
+    r"不包括|不包含|不含|排除|除外|不发送|不得发送|不上传|不得上传|不披露|不得披露"
     r")(?=$|[\s,，;；:.])"
 )
 _SENSITIVE_EXPLICIT_AUTH_RE = re.compile(
@@ -101,7 +102,7 @@ _PROMPT_EXTERNAL_TARGET_PATTERNS = (
     ("web", re.compile(r"(?i)(?<![A-Za-z0-9_])web(?![A-Za-z0-9_])|https?://")),
 )
 _MCP_TARGET_TOKEN_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])mcp__[A-Za-z0-9_]+(?:__[A-Za-z0-9_]+)?(?![A-Za-z0-9_])"
+    r"(?i)(?<![A-Za-z0-9_-])mcp__[A-Za-z0-9_-]+(?![A-Za-z0-9_-])"
 )
 _TRUSTED_MCP_SERVER_TARGETS = {
     "box": "box",

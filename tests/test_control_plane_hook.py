@@ -1289,7 +1289,9 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     def test_grant_prompt_lookalike_target_is_not_canonicalized(self) -> None:
-        for index, target in enumerate(("mcp__github_malicious", "notgithub"), start=1):
+        for index, target in enumerate(
+            ("mcp__github_malicious", "mcp__github-malicious", "notgithub"), start=1
+        ):
             with self.subTest(target=target):
                 self.turn = f"lookalike-target-{index}"
                 self.prompt(
@@ -1366,20 +1368,28 @@ class HookProtocolTests(unittest.TestCase):
         self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
 
     def test_placeholder_value_does_not_expand_concrete_term_subset(self) -> None:
-        self.prompt(
-            "For this turn, I explicitly authorize sending Example Capital client details "
-            "to the specified Google Drive folder."
-        )
-        result = self.run_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "tool_name": "mcp__google_drive__upload",
-                "tool_input": {
-                    "text": "Example Capital position:   {{redacted}}\nclient: TEST_CLIENT_019"
-                },
-            }
-        )
-        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+        for index, spacing in enumerate((" ", "   ", "\t", "\r\n"), start=1):
+            with self.subTest(spacing=repr(spacing)):
+                self.turn = f"placeholder-value-{index}"
+                self.prompt(
+                    "For this turn, I explicitly authorize sending Example Capital client details "
+                    "to the specified Google Drive folder."
+                )
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "mcp__google_drive__upload",
+                        "tool_input": {
+                            "text": (
+                                f"Example Capital position:{spacing}{{{{redacted}}}}\n"
+                                f"client: TEST_CLIENT_019_{index}"
+                            )
+                        },
+                    }
+                )
+                self.assertNotEqual(
+                    "deny", result["hookSpecificOutput"].get("permissionDecision")
+                )
 
     def test_structured_sensitive_fields_follow_the_same_subset_rule(self) -> None:
         self.prompt(
@@ -1452,7 +1462,16 @@ class HookProtocolTests(unittest.TestCase):
 
     def test_post_term_exclusion_is_excluded_from_grant(self) -> None:
         for index, exclusion in enumerate(
-            ("client not included", "client is excluded", "client 不包括"), start=1
+            (
+                "client not included",
+                "client, not included",
+                "client: not included",
+                "client is excluded",
+                "client not uploaded",
+                "client not disclosed",
+                "client 不包括",
+            ),
+            start=1,
         ):
             with self.subTest(exclusion=exclusion):
                 self.turn = f"post-term-exclusion-{index}"
@@ -1468,6 +1487,20 @@ class HookProtocolTests(unittest.TestCase):
                     }
                 )
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_affirmative_post_term_wording_remains_authorized(self) -> None:
+        self.prompt(
+            "For this turn, I explicitly authorize sending Example Capital client included "
+            "to Google Drive."
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__google_drive__upload",
+                "tool_input": {"text": "Example Capital client: TEST_CLIENT_023"},
+            }
+        )
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
 
     def test_trusted_connector_multiplexer_uses_tool_identity(self) -> None:
         self.prompt(

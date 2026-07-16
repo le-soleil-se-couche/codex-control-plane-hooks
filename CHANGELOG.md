@@ -7,8 +7,8 @@ All notable changes are documented here. The project follows Semantic Versioning
 ## [0.2.3] - 2026-07-16
 
 - Kept redaction templates such as `{{redacted}}` from counting as concrete sensitive values, including when horizontal whitespace precedes the placeholder.
-- Required exact prompt-side connector phrases or trusted MCP identities so lookalike targets cannot create a canonical disclosure grant.
-- Honored common post-term exclusions such as `client not included`, `client is excluded`, and `client 不包括`.
+- Required exact prompt-side connector phrases or trusted MCP identities so underscore, hyphen, and identifier lookalikes cannot create a canonical disclosure grant.
+- Honored common post-term exclusions, including punctuation-adjacent and upload or disclosure wording.
 - Added positive and adversarial regressions for exact MCP targets, lookalikes, placeholders, and post-term exclusions.
 
 ## [0.2.2] - 2026-07-16
