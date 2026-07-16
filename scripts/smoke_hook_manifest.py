@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SOURCE = ROOT / "plugins" / "codex-control-plane-hooks"
+WINDOWS_SHELL_EXECUTABLES = {"pwsh": "pwsh", "powershell": "powershell.exe"}
 
 
 def _pretool_handler(hooks: dict[str, Any]) -> dict[str, Any]:
@@ -31,13 +33,15 @@ def _run_command(
     plugin_root: Path,
     plugin_data: Path,
     payload: dict[str, Any],
+    windows_shell: str,
 ) -> dict[str, Any]:
     environment = os.environ.copy()
     environment["PLUGIN_ROOT"] = str(plugin_root)
     environment["PLUGIN_DATA"] = str(plugin_data)
     if os.name == "nt":
         command = handler.get("commandWindows")
-        argv = ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+        executable = WINDOWS_SHELL_EXECUTABLES[windows_shell]
+        argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
     else:
         command = handler.get("command")
         argv = ["/bin/sh", "-c", command]
@@ -64,7 +68,22 @@ def _run_command(
     return response
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--windows-shell",
+        choices=tuple(WINDOWS_SHELL_EXECUTABLES),
+        help="Windows shell used to execute commandWindows (default: pwsh)",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = _parse_args()
+    if os.name != "nt" and args.windows_shell is not None:
+        raise RuntimeError("--windows-shell is only supported on Windows")
+    windows_shell = args.windows_shell or "pwsh"
+
     with tempfile.TemporaryDirectory(prefix="codex hook manifest ") as directory:
         root = Path(directory)
         plugin_root = root / "plugin root"
@@ -85,6 +104,7 @@ def main() -> int:
             handler,
             plugin_root=plugin_root,
             plugin_data=plugin_data,
+            windows_shell=windows_shell,
             payload={
                 **base_event,
                 "tool_use_id": "safe-tool",
@@ -98,6 +118,7 @@ def main() -> int:
             handler,
             plugin_root=plugin_root,
             plugin_data=plugin_data,
+            windows_shell=windows_shell,
             payload={
                 **base_event,
                 "tool_use_id": "dangerous-tool",
@@ -117,7 +138,8 @@ def main() -> int:
             if stat.S_IMODE(state_files[0].stat().st_mode) != 0o600:
                 raise RuntimeError("state file mode is not 0600")
 
-    print(f"manifest smoke passed on {os.name}")
+    shell = f" via {WINDOWS_SHELL_EXECUTABLES[windows_shell]}" if os.name == "nt" else ""
+    print(f"manifest smoke passed on {os.name}{shell}")
     return 0
 
 

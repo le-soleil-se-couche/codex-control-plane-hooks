@@ -299,6 +299,39 @@ _POWERSHELL_READ_ONLY_COMMANDS = {
     "get-process",
     "select-string",
 }
+_POWERSHELL_SAFE_SWITCHES = {
+    "mta",
+    "nol",
+    "nologo",
+    "noni",
+    "noninteractive",
+    "nop",
+    "noprofile",
+    "noprofileloadtime",
+    "sta",
+}
+_POWERSHELL_TERMINAL_SWITCHES = {"?", "h", "help", "v", "version"}
+_POWERSHELL_VALUE_OPTIONS = {
+    "if",
+    "inp",
+    "inputformat",
+    "of",
+    "o",
+    "out",
+    "outputformat",
+    "w",
+    "windowstyle",
+}
+_POWERSHELL_ENVIRONMENT_OPTIONS = {
+    "config",
+    "configurationfile",
+    "configurationname",
+    "settings",
+    "settingsfile",
+    "wd",
+    "wo",
+    "workingdirectory",
+}
 _READ_ONLY_GIT_SUBCOMMANDS = {
     "blame",
     "branch",
@@ -451,6 +484,7 @@ _COMMAND_EXECUTABLES = {
     "rm",
     "rd",
     "remove-item",
+    "ri",
     "rmdir",
     "runas",
     "runuser",
@@ -462,10 +496,12 @@ _COMMAND_EXECUTABLES = {
     "su",
     "sudo",
     "scoop",
+    "saps",
     "set-executionpolicy",
     "start-bitstransfer",
     "start-job",
     "start-process",
+    "start",
     "timeout",
     "toybox",
     "uv",
@@ -495,7 +531,9 @@ def _finding(code: str, severity: str = "high") -> dict[str, str]:
     return {"severity": severity, "category": "dangerous_command", "code": code}
 
 
-def _windows_segment_findings(executable: str, args: list[str]) -> list[dict[str, str]]:
+def _windows_segment_findings(
+    executable: str, args: list[str], *, depth: int = 0
+) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     lowered = [token.casefold() for token in args]
     powershell_delete = executable in {"del", "erase", "rd", "remove-item", "ri", "rm", "rmdir"}
@@ -504,16 +542,15 @@ def _windows_segment_findings(executable: str, args: list[str]) -> list[dict[str
     if (powershell_delete and recursive_parameter) or cmd_recursive:
         findings.append(_finding("windows_recursive_delete"))
 
-    if executable in {"cmd", "iex", "invoke-expression", "powershell", "pwsh"}:
+    if executable in {"cmd", "iex", "invoke-expression"}:
         findings.append(_finding("dynamic_eval", "medium"))
+    if executable in {"powershell", "pwsh"}:
+        findings.extend(_powershell_launcher_findings(args, depth=depth))
     if executable == "." and args:
         findings.append(_finding("dynamic_eval", "medium"))
     if executable == "runas" or (
-        executable == "start-process"
-        and any(
-            token == "-verb" and index + 1 < len(lowered) and lowered[index + 1] == "runas"
-            for index, token in enumerate(lowered)
-        )
+        executable in {"saps", "start", "start-process"}
+        and _powershell_runas_requested(args)
     ):
         findings.append(_finding("privilege_escalation", "medium"))
     if executable == "set-executionpolicy":
@@ -522,7 +559,7 @@ def _windows_segment_findings(executable: str, args: list[str]) -> list[dict[str
         joined = " ".join(lowered)
         if "/grant" in lowered and "everyone" in joined and "/t" in lowered:
             findings.append(_finding("recursive_world_writable", "medium"))
-    if executable in {"start-job", "start-process"}:
+    if executable in {"saps", "start", "start-job", "start-process"}:
         findings.append(_finding("background_process", "medium"))
     if executable in {"choco", "scoop", "winget"} and any(
         token in {"install", "remove", "uninstall", "update", "upgrade"} for token in lowered
@@ -549,15 +586,144 @@ def _strip_token_quotes(token: str) -> str:
     return token
 
 
+def _is_literal_powershell_script_target(token: str) -> bool:
+    target = _strip_token_quotes(token)
+    if not target or any(char in target for char in "$`{};&|<>*?[]"):
+        return False
+    if target.startswith(("\\\\", "//")) or re.match(r"(?i)^[a-z][a-z0-9+.-]*://", target):
+        return False
+    return target.casefold().endswith(".ps1")
+
+
 def _is_literal_powershell_call_target(token: str) -> bool:
     target = _strip_token_quotes(token)
     if not target or any(char in target for char in "$`{};&|<>"):
         return False
-    if re.search(r"(?i)\.(?:ps1|cmd|bat)$", target):
+    if target.casefold().endswith(".ps1"):
+        return _is_literal_powershell_script_target(target)
+    if re.search(r"(?i)\.(?:cmd|bat)$", target):
         return False
     if re.search(r"(?i)\.(?:exe|com)$", target):
         return True
     return target.casefold() in _POWERSHELL_READ_ONLY_COMMANDS
+
+
+def _powershell_option(token: str) -> tuple[str, str | None]:
+    if len(token) < 2 or token[0] not in {"-", "/"}:
+        return "", None
+    option = token[1:]
+    for separator in (":", "="):
+        if separator in option:
+            name, value = option.split(separator, 1)
+            return name.casefold(), value
+    return option.casefold(), None
+
+
+def _powershell_runas_requested(args: list[str]) -> bool:
+    for index, token in enumerate(args):
+        name, inline_value = _powershell_option(token)
+        if name not in {"v", "verb"}:
+            continue
+        value = inline_value if inline_value is not None else (
+            args[index + 1] if index + 1 < len(args) else ""
+        )
+        if _strip_token_quotes(value).casefold() == "runas":
+            return True
+    return False
+
+
+def _powershell_launcher_findings(args: list[str], *, depth: int) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    index = 0
+    while index < len(args):
+        name, inline_value = _powershell_option(args[index])
+        encoded_option = (
+            bool(name)
+            and (
+                "encodedcommand".startswith(name)
+                or (len(name) >= 2 and "encodedarguments".startswith(name))
+            )
+        )
+        if encoded_option:
+            findings.append(_finding("dynamic_eval", "medium"))
+            return findings
+        if name == "ep" or (len(name) >= 2 and "executionpolicy".startswith(name)):
+            value_index = index if inline_value is not None else index + 1
+            value = inline_value if inline_value is not None else (
+                args[value_index] if value_index < len(args) else ""
+            )
+            if not value:
+                findings.append(_finding("dynamic_eval", "medium"))
+                return findings
+            findings.append(_finding("execution_environment_override", "medium"))
+            index = value_index + 1
+            continue
+        if len(name) >= 3 and "noexit".startswith(name):
+            findings.append(_finding("background_process", "medium"))
+            return findings
+        if name in {"c", "command"}:
+            command_args = ([inline_value] if inline_value is not None else []) + args[index + 1 :]
+            if not command_args or command_args[0] in {"", "-"} or depth >= 4:
+                findings.append(_finding("dynamic_eval", "medium"))
+            elif any(any(char in token for char in "(){}") for token in command_args):
+                findings.append(_finding("dynamic_eval", "medium"))
+            elif len(command_args) == 1:
+                findings.extend(_structured_command_findings(command_args[0], depth=depth + 1))
+            else:
+                findings.extend(_segment_findings(command_args, depth=depth + 1))
+            return findings
+        if name in {"f", "file"}:
+            file_args = ([inline_value] if inline_value is not None else []) + args[index + 1 :]
+            if not file_args or not _is_literal_powershell_script_target(file_args[0]):
+                findings.append(_finding("dynamic_eval", "medium"))
+            return findings
+        if not name and _is_literal_powershell_script_target(args[index]):
+            return findings
+        if name in _POWERSHELL_TERMINAL_SWITCHES:
+            if inline_value is not None or index + 1 != len(args):
+                code = (
+                    "execution_environment_override"
+                    if name in {"v", "version"}
+                    else "dynamic_eval"
+                )
+                findings.append(_finding(code, "medium"))
+            return findings
+        if name in _POWERSHELL_SAFE_SWITCHES:
+            if inline_value is not None:
+                findings.append(_finding("dynamic_eval", "medium"))
+                return findings
+            index += 1
+            continue
+        if name in _POWERSHELL_ENVIRONMENT_OPTIONS or name == "custompipename":
+            value_index = index if inline_value is not None else index + 1
+            value = inline_value if inline_value is not None else (
+                args[value_index] if value_index < len(args) else ""
+            )
+            if not value:
+                findings.append(_finding("dynamic_eval", "medium"))
+                return findings
+            code = "background_process" if name == "custompipename" else "execution_environment_override"
+            findings.append(_finding(code, "medium"))
+            index = value_index + 1
+            continue
+        if name in _POWERSHELL_VALUE_OPTIONS:
+            value_index = index if inline_value is not None else index + 1
+            value = inline_value if inline_value is not None else (
+                args[value_index] if value_index < len(args) else ""
+            )
+            if not value:
+                findings.append(_finding("dynamic_eval", "medium"))
+                return findings
+            if name in {"w", "windowstyle"}:
+                visible_styles = {"normal", "minimized", "maximized"}
+                if _strip_token_quotes(value).casefold() not in visible_styles:
+                    findings.append(_finding("background_process", "medium"))
+            index = value_index + 1
+            continue
+        findings.append(_finding("dynamic_eval", "medium"))
+        return findings
+    findings.append(_finding("dynamic_eval", "medium"))
+    return findings
 
 
 def _shell_tokens(command: str) -> list[str]:
@@ -607,6 +773,8 @@ def _has_shell_indirection(command: str) -> bool:
                 quote = ""
                 continue
         next_char = command[index + 1] if index + 1 < len(command) else ""
+        if windows_style and not quote and char in "(){}":
+            return True
         if char == "\x60" or (char == "<" and next_char in {"(", "<"}) or (
             char == ">" and next_char == "("
         ):
@@ -935,7 +1103,7 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
         findings.append(_finding("execution_environment_override", "medium"))
     if not executable:
         return findings
-    findings.extend(_windows_segment_findings(executable, args))
+    findings.extend(_windows_segment_findings(executable, args, depth=depth))
 
     if executable == "rg" and any(token == "--pre" or token.startswith("--pre=") for token in args):
         findings.append(_finding("rg_preprocessor"))

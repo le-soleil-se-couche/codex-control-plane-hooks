@@ -35,7 +35,9 @@
 - Independent verification of every Windows NTFS DACL ACE; the Windows runtime requires host-provided plugin data and inherits that directory's access boundary.
 - Complete secret detection, data-loss prevention, malware detection, prompt-injection prevention, or sandbox escape prevention.
 - Tools and effects for which the host emits no matched Hook event.
+- Hook launcher, timeout, and error paths that the host handles without accepting a deny response; the plugin cannot convert a host fail-open path into fail-closed enforcement.
 - Network activity performed by the host before or outside a Hook boundary.
+- Complete semantic inspection of local script files, including `.ps1`; the Hook classifies selected launcher flags and inline command payloads while the host sandbox, approval policy, repository controls, and review remain authoritative for script execution.
 - Semantic correctness of arbitrary commands, code, research, or generated artifacts.
 
 ## Security posture
