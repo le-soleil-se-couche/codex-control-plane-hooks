@@ -2582,10 +2582,12 @@ def _contains_clone_invocation(command: str, *, depth: int = 0) -> bool:
                 return True
         if executable == "gh" and args[:2] == ["repo", "clone"]:
             return True
-        if executable in _SHELL_EVAL and depth == 0:
+        if executable in _SHELL_EVAL and depth < 4:
             for index, token in enumerate(args):
                 if _is_shell_eval_flag(token) and index + 1 < len(args):
-                    if _contains_clone_invocation(args[index + 1], depth=1):
+                    if _contains_clone_invocation(
+                        args[index + 1], depth=depth + 1
+                    ):
                         return True
                     break
         if executable in {"powershell", "pwsh"} and depth < 4:
