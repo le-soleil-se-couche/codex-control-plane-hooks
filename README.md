@@ -108,7 +108,7 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.5 bundled desktop CLI | macOS arm64 | 3.9.6 | 201 local tests + manifest/release/plugin checks passed | clean-profile checkout install, Hook discovery/trust, safe allow, and dangerous deny passed | 2026-07-17 |
+| 0.144.5 bundled desktop CLI | macOS arm64 | 3.9.6 | 205 local tests + manifest/release/plugin checks passed | clean-profile checkout install, Hook discovery/trust, safe allow, and dangerous deny passed | 2026-07-17 |
 | GitHub Actions + `@openai/codex@0.144.4` | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | pinned clean-profile host smoke required by CI | 2026-07-17 |
 | GitHub Actions + `@openai/codex@0.144.4` | Windows Server 2022 x64 | 3.9 / 3.12 | protocol + `pwsh` + `powershell.exe` packaged-command gates required | pinned clean-profile host smoke required by CI | 2026-07-17 |
 
@@ -122,7 +122,7 @@ Runtime support and Codex-host compatibility are separate claims. Hook event nam
 - Unknown `mcp__*` tools are treated as external destinations when sensitive context is active. Payload text and lookalike server namespaces cannot consume a grant for a named connector.
 - Post-tool checks occur after a tool has produced output.
 - Natural-language approval parsing remains experimental even when explicitly enabled.
-- Scoped Git/GitHub transactions and the constrained GitHub HTTPS clone lane remain experimental, separately opt-in, and default to disabled. Transaction grants bind explicit repository mappings and consume each declared operation once. An exact one-shot Git command grant remains available when the prompt does not form a complete transaction, with cwd and push target bound into its digest. Clone provenance restricts execution or mutation inside a newly tracked checkout until one exact command is approved.
+- Scoped Git/GitHub transactions and the constrained GitHub HTTPS clone lane remain experimental, separately opt-in, and default to disabled. Transaction grants bind explicit repository mappings and consume each declared operation once. An exact one-shot Git command grant remains available for a single unambiguous scope when the prompt does not form a complete transaction. Exact push fallback accepts only a bounded option subset, literal `origin`, one safe branch, and one configured HTTPS/SSH/SCP push URL; cwd, command options, and the hashed URL are bound into its digest. Helper, local, insecure, bulk, recursive, multi-ref, custom receive-pack, ambiguous multi-scope, and multi-target forms fail closed. Clone provenance restricts execution or mutation inside a newly tracked checkout until one exact command is approved.
 - Browser, Computer Use, and connector behavior depends on the tool name and Hook events exposed by the host.
 - Ordinary PowerShell launchers and literal `.ps1` entrypoints are treated like other script runtimes. Inline `-Command` payloads receive bounded recursive classification, while complete semantic review of script-file contents remains outside this pattern-based Hook and belongs to sandboxing, approval policy, repository review, and tests.
 - The project does not defend a compromised OS account, Python runtime, Codex binary, plugin cache, or writable policy file.
