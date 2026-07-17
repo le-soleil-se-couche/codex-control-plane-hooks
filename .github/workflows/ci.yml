@@ -64,6 +64,63 @@ jobs:
       - name: Public release boundary
         run: python scripts/check_release.py
 
+  host-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Install pinned Codex CLI (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          npm install \
+            --prefix "${RUNNER_TEMP}/codex-cli" \
+            --cache "${RUNNER_TEMP}/npm-cache" \
+            --userconfig "${RUNNER_TEMP}/empty-npmrc" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            --package-lock=false \
+            @openai/codex@0.144.4
+      - name: Install pinned Codex CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm install `
+            --prefix "$env:RUNNER_TEMP\codex-cli" `
+            --cache "$env:RUNNER_TEMP\npm-cache" `
+            --userconfig "$env:RUNNER_TEMP\empty-npmrc" `
+            --ignore-scripts `
+            --no-audit `
+            --no-fund `
+            --package-lock=false `
+            @openai/codex@0.144.4
+      - name: Clean-profile Codex CLI Hook host smoke (POSIX)
+        if: runner.os != 'Windows'
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-host-smoke-home
+        run: >-
+          python -B scripts/smoke_codex_host.py
+          --codex "${RUNNER_TEMP}/codex-cli/node_modules/.bin/codex"
+      - name: Clean-profile Codex CLI Hook host smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-host-smoke-home
+        run: >-
+          python -B scripts/smoke_codex_host.py
+          --codex "$env:RUNNER_TEMP\codex-cli\node_modules\.bin\codex.cmd"
+
   secret-scan:
     runs-on: ubuntu-latest
     steps:

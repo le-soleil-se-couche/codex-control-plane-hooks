@@ -42,6 +42,8 @@ class HookProtocolTests(unittest.TestCase):
                     "durable_destination_markers": ["/tmp/private-notes/"],
                     "enable_natural_language_approvals": True,
                     "enable_sensitive_disclosure_approvals": True,
+                    "enable_scoped_git_transactions": True,
+                    "enable_constrained_github_clone": True,
                 }
             ),
             encoding="utf-8",
@@ -96,12 +98,54 @@ class HookProtocolTests(unittest.TestCase):
     def prompt(self, text: str, *, cwd: str = DEFAULT_CWD) -> dict:
         return self.run_hook({"hook_event_name": "UserPromptSubmit", "prompt": text, "cwd": cwd})
 
+    def update_policy(self, **updates: object) -> None:
+        path = Path(self.data_dir, "policy.json")
+        policy = json.loads(path.read_text(encoding="utf-8"))
+        policy.update(updates)
+        path.write_text(json.dumps(policy), encoding="utf-8")
+
     def bash(self, command: str, *, cwd: str = DEFAULT_CWD) -> dict:
         return self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
                 "tool_name": "Bash",
                 "tool_input": {"command": command},
+                "cwd": cwd,
+            }
+        )
+
+    def exec_command(
+        self,
+        command: str,
+        *,
+        cwd: str = DEFAULT_CWD,
+        tool_use_id: str | None = None,
+        **options: object,
+    ) -> dict:
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": command, "workdir": cwd, **options},
+            "cwd": cwd,
+        }
+        if tool_use_id is not None:
+            event["tool_use_id"] = tool_use_id
+        return self.run_hook(event)
+
+    def post_tool(
+        self,
+        output: str,
+        *,
+        tool_name: str = "Read",
+        tool_input: dict | None = None,
+        cwd: str = DEFAULT_CWD,
+    ) -> dict:
+        return self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool_name,
+                "tool_input": tool_input or {"file_path": str(SCRIPT)},
+                "tool_response": {"output": output},
                 "cwd": cwd,
             }
         )
@@ -366,10 +410,15 @@ class HookProtocolTests(unittest.TestCase):
         module = __import__("control_plane_hook")
         scope = r"C:\Work Trees\example-repo"
         prompt = f'批准在 "{scope}" 执行 git.exe add 和 git.exe commit。'
-        self.assertEqual(module._scope_hash(scope), module._prompt_scope_hash(prompt, DEFAULT_CWD, None))
+        self.assertEqual(
+            [module._scope_identity(scope)],
+            module._prompt_git_scopes(
+                prompt, DEFAULT_CWD, None, {"add", "commit"}
+            ),
+        )
 
     def test_quoted_windows_executable_authorization_preserves_spaces(self) -> None:
-        command = r'"C:\Program Files\Git\bin\git.exe" push origin main'
+        command = r'"C:\Program Files\Python\python.exe" -c print(1)'
         module = __import__("control_plane_hook")
         self.assertEqual([command], module._authorization_command_candidates(f"允许执行 {command}"))
 
@@ -390,12 +439,12 @@ class HookProtocolTests(unittest.TestCase):
         self.assertNotEqual("deny", first["hookSpecificOutput"].get("permissionDecision"))
         self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
 
-        malformed = r'允许执行 "C:\Program Files\Git\bin\git.exe push origin main'
+        malformed = r'允许执行 "C:\Program Files\Python\python.exe -c print(1)'
         self.assertEqual([], module._authorization_command_candidates(malformed))
 
         embedded = f"允许执行 echo {command}"
         self.assertNotIn(command, module._authorization_command_candidates(embedded))
-        self.assertNotIn("git_push", module._dangerous_authorization_hashes(embedded, DEFAULT_CWD))
+        self.assertNotIn("dynamic_eval", module._dangerous_authorization_hashes(embedded, DEFAULT_CWD))
 
     def test_linux_shells_package_managers_and_transfers_are_classified(self) -> None:
         commands = [
@@ -558,7 +607,7 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual({}, self.bash("pwd"))
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(2, state["schema_version"])
+        self.assertEqual(3, state["schema_version"])
         self.assertIn("pending_permission_authorizations", state)
 
     def test_malformed_state_fails_closed_without_replacement(self) -> None:
@@ -711,6 +760,75 @@ class HookProtocolTests(unittest.TestCase):
                 data_dir=data_dir,
             )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_new_policy_features_require_literal_json_true(self) -> None:
+        cases = (
+            ("enable_scoped_git_transactions", None),
+            ("enable_scoped_git_transactions", "true"),
+            ("enable_constrained_github_clone", None),
+            ("enable_constrained_github_clone", "true"),
+        )
+        for flag, value in cases:
+            with self.subTest(flag=flag, value=value), tempfile.TemporaryDirectory() as data_dir:
+                policy = {
+                    "enable_natural_language_approvals": True,
+                    "enable_scoped_git_transactions": True,
+                    "enable_constrained_github_clone": True,
+                }
+                if value is None:
+                    policy.pop(flag)
+                else:
+                    policy[flag] = value
+                Path(data_dir, "policy.json").write_text(
+                    json.dumps(policy), encoding="utf-8"
+                )
+                workspace = Path(data_dir) / "workspace"
+                workspace.mkdir()
+                if flag == "enable_scoped_git_transactions":
+                    self.run_hook(
+                        {
+                            "hook_event_name": "UserPromptSubmit",
+                            "prompt": f"本轮明确授权在 {workspace} 执行 git add。",
+                            "cwd": str(workspace),
+                        },
+                        data_dir=data_dir,
+                    )
+                    result = self.run_hook(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "tool_name": "Bash",
+                            "tool_input": {"command": "git add src/app.py"},
+                            "cwd": str(workspace),
+                        },
+                        data_dir=data_dir,
+                    )
+                else:
+                    destination = workspace / "clone"
+                    command = (
+                        "git clone --depth 1 --no-checkout "
+                        "https://github.com/sample-owner/sample-repo.git "
+                        f"{destination}"
+                    )
+                    result = self.run_hook(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "tool_name": "exec_command",
+                            "tool_input": {"cmd": command, "workdir": str(workspace)},
+                            "cwd": str(workspace),
+                        },
+                        data_dir=data_dir,
+                    )
+                self.assertEqual(
+                    "deny", result["hookSpecificOutput"]["permissionDecision"]
+                )
+
+    def test_public_plugin_version_remains_v0_2_4(self) -> None:
+        manifest = json.loads(
+            (SCRIPTS.parent / ".codex-plugin" / "plugin.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("0.2.4", manifest["version"])
 
     def test_malformed_present_policy_fails_closed(self) -> None:
         Path(self.data_dir, "policy.json").write_text("{", encoding="utf-8")
@@ -1238,6 +1356,91 @@ class HookProtocolTests(unittest.TestCase):
         state_files = list(Path(self.data_dir).glob("session-*.json"))
         state = json.loads(state_files[0].read_text(encoding="utf-8"))
         self.assertEqual({}, state["pending_permission_authorizations"])
+
+    def test_posttool_ast_proven_python_call_assignments_pass(self) -> None:
+        label = "to" + "ken"
+        callable_name = "normalize_model_call_" + "token"
+        source = f"{label} = {callable_name}(value)\n"
+        source_path = Path(self.data_dir) / "source.py"
+        source_path.write_text(source, encoding="utf-8")
+        cases = (
+            ("Read", {"file_path": str(source_path)}, source),
+            ("Bash", {"command": f"sed -n 1,20p {source_path}"}, source),
+            (
+                "functions__exec_command",
+                {"cmd": "rg -n token source.py", "workdir": self.data_dir},
+                f"source.py:1:{source}",
+            ),
+            ("Bash", {"command": f"nl -ba {source_path}"}, f"    1\t{source}"),
+        )
+        for tool_name, tool_input, output in cases:
+            with self.subTest(tool_name=tool_name):
+                self.assertEqual(
+                    {},
+                    self.post_tool(
+                        output,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        cwd=self.data_dir,
+                    ),
+                )
+
+    def test_posttool_ast_suppression_fails_closed_on_ambiguous_reads(self) -> None:
+        label = "to" + "ken"
+        callable_name = "normalize_model_call_" + "token"
+        source = f"{label} = {callable_name}(value)\n"
+        source_path = Path(self.data_dir) / "source.py"
+        other_path = Path(self.data_dir) / "other.py"
+        text_path = Path(self.data_dir) / "notes.txt"
+        source_path.write_text(source, encoding="utf-8")
+        other_path.write_text(source, encoding="utf-8")
+        text_path.write_text(source, encoding="utf-8")
+        cases = (
+            ("Read", {"file_path": str(text_path)}),
+            ("Read", {"file_path": str(source_path)}, "mismatch"),
+            ("Bash", {"command": f"cat {source_path} {other_path}"}),
+            ("Bash", {"command": f"env cat {source_path}"}),
+            ("Bash", {"command": f"cat {source_path} | head"}),
+            ("Bash", {"command": f"rg -f {source_path} {text_path}"}),
+        )
+        for case in cases:
+            tool_name, tool_input, *variant = case
+            output = source.replace(callable_name, "different_model_call_token") if variant else source
+            with self.subTest(tool_input=tool_input):
+                result = self.post_tool(output, tool_name=tool_name, tool_input=tool_input)
+                self.assertEqual("block", result["decision"])
+
+    def test_posttool_ast_suppression_preserves_secret_detectors(self) -> None:
+        label = "to" + "ken"
+        callable_name = "retrieve_access_" + "token"
+        literal = "abcdefghijklmnop"
+        source_path = Path(self.data_dir) / "literal.py"
+        source = f'{label} = {callable_name}("{literal}")\n'
+        source_path.write_text(source, encoding="utf-8")
+        self.assertEqual(
+            "block",
+            self.post_tool(source, tool_input={"file_path": str(source_path)})["decision"],
+        )
+
+        provider = "sk-" + "proj-" + hashlib.sha256(b"provider-fixture").hexdigest()[:24]
+        provider_source = f"{label} = {provider}(value)\n"
+        provider_path = Path(self.data_dir) / "provider.py"
+        provider_path.write_text(provider_source, encoding="utf-8")
+        result = self.post_tool(provider_source, tool_input={"file_path": str(provider_path)})
+        self.assertEqual("block", result["decision"])
+        self.assertNotIn(provider, json.dumps(result))
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink fixture")
+    def test_posttool_symlinked_python_source_is_not_suppressed(self) -> None:
+        label = "to" + "ken"
+        callable_name = "normalize_model_call_" + "token"
+        source = f"{label} = {callable_name}(value)\n"
+        payload = Path(self.data_dir) / "payload.txt"
+        alias = Path(self.data_dir) / "alias.py"
+        payload.write_text(source, encoding="utf-8")
+        alias.symlink_to(payload)
+        result = self.post_tool(source, tool_input={"file_path": str(alias)})
+        self.assertEqual("block", result["decision"])
 
     def test_negated_authorization_does_not_authorize_dangerous_command(self) -> None:
         self.prompt("我不同意执行 rm -rf /tmp/example，只讨论风险。")
@@ -2299,8 +2502,8 @@ class HookProtocolTests(unittest.TestCase):
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     def test_exact_command_authorization_does_not_cross_scope(self) -> None:
-        authorized_command = "git " + "push origin feature/a"
-        other_command = "git " + "push origin feature/b"
+        authorized_command = "rm " + "-r /tmp/exact-scope-a"
+        other_command = "rm " + "-r /tmp/exact-scope-b"
         self.prompt(f"本轮明确授权执行 {authorized_command}。")
         allowed = self.bash(authorized_command)
         self.assertNotEqual("deny", allowed["hookSpecificOutput"].get("permissionDecision"))
@@ -2363,15 +2566,123 @@ class HookProtocolTests(unittest.TestCase):
         self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
 
     def test_git_c_dangerous_command_requires_exact_one_shot_authorization(self) -> None:
-        command = "git -C /tmp/repo-a push origin main"
-        denied = self.bash(command, cwd="/tmp")
+        self.update_policy(enable_scoped_git_transactions=False)
+        repo = Path(self.data_dir) / "git-c-push"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sample-owner/sample-repo.git",
+            ],
+            check=True,
+        )
+        command = f"git -C '{repo}' push origin main"
+        denied = self.bash(command, cwd=self.data_dir)
         self.assertEqual("deny", denied["hookSpecificOutput"]["permissionDecision"])
 
-        self.prompt(f"批准执行 `{command}`。", cwd="/tmp")
-        allowed = self.bash(command, cwd="/tmp")
-        replay = self.bash(command, cwd="/tmp")
-        self.assertNotEqual("deny", allowed["hookSpecificOutput"].get("permissionDecision"))
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=self.data_dir)
+        allowed = self.bash(command, cwd=self.data_dir)
+        replay = self.bash(command, cwd=self.data_dir)
+        self.assertNotEqual(
+            "deny", allowed["hookSpecificOutput"].get("permissionDecision"), msg=allowed
+        )
         self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+    def test_exact_git_grant_remains_available_when_transaction_is_incomplete(self) -> None:
+        repo = Path(self.data_dir) / "exact-fallback"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sample-owner/exact-fallback.git",
+            ],
+            check=True,
+        )
+
+        commit = "git commit -m checkpoint"
+        self.prompt(f"本轮明确授权执行 `{commit}`。", cwd=str(repo))
+        allowed_commit = self.bash(commit, cwd=str(repo))
+        replay_commit = self.bash(commit, cwd=str(repo))
+        self.assertNotEqual(
+            "deny",
+            allowed_commit["hookSpecificOutput"].get("permissionDecision"),
+            msg=allowed_commit,
+        )
+        self.assertEqual(
+            "deny", replay_commit["hookSpecificOutput"]["permissionDecision"]
+        )
+
+        self.turn = "exact-push-fallback"
+        push = f"git -C '{repo}' push origin main"
+        self.prompt(f"本轮明确授权执行 `{push}`。", cwd=self.data_dir)
+        allowed_push = self.bash(push, cwd=self.data_dir)
+        replay_push = self.bash(push, cwd=self.data_dir)
+        self.assertNotEqual(
+            "deny",
+            allowed_push["hookSpecificOutput"].get("permissionDecision"),
+            msg=allowed_push,
+        )
+        self.assertEqual("deny", replay_push["hookSpecificOutput"]["permissionDecision"])
+
+    def test_exact_push_fallback_rechecks_remote_target(self) -> None:
+        repo = Path(self.data_dir) / "exact-push-drift"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sample-owner/original-target.git",
+            ],
+            check=True,
+        )
+        push = f"git -C '{repo}' push origin main"
+        self.prompt(f"本轮明确授权执行 `{push}`。", cwd=self.data_dir)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/sample-owner/changed-target.git",
+            ],
+            check=True,
+        )
+        result = self.bash(push, cwd=self.data_dir)
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     @unittest.skipIf(os.name == "nt", "POSIX symlink retarget semantics")
     def test_repo_scope_resolves_symlinks_before_authorization(self) -> None:
@@ -2437,6 +2748,763 @@ class HookProtocolTests(unittest.TestCase):
         self.assertNotEqual("deny", add["hookSpecificOutput"].get("permissionDecision"))
         self.assertNotEqual("deny", commit["hookSpecificOutput"].get("permissionDecision"))
         self.assertNotEqual("deny", run["hookSpecificOutput"].get("permissionDecision"))
+
+    def test_scoped_git_transaction_binds_operation_branch_and_replay(self) -> None:
+        repo_path = Path(self.data_dir) / "transaction-repo"
+        repo_path.mkdir()
+        repo = str(repo_path)
+        branch = "feature/publication"
+        target = "sample-owner/transaction-repo"
+        subprocess.run(
+            ["git", "init", "-q", repo],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "-C", repo, "remote", "add", "origin", f"https://github.com/{target}.git"],
+            check=True,
+        )
+        self.prompt(
+            f"允许在 `{repo}` 执行 git add/commit，并在 sample-owner 下创建 "
+            f"transaction-repo private repository，推送 {branch}。"
+        )
+        allowed = (
+            self.bash("git add src/app.py", cwd=repo),
+            self.bash("git commit -m checkpoint", cwd=repo),
+            self.bash(f"git push origin {branch}", cwd=repo),
+        )
+        for result in allowed:
+            self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+        self.assertEqual(
+            "deny",
+            self.bash(f"git push origin {branch}", cwd=repo)["hookSpecificOutput"][
+                "permissionDecision"
+            ],
+        )
+        self.assertEqual(
+            "deny",
+            self.bash("git push origin main", cwd=repo)["hookSpecificOutput"][
+                "permissionDecision"
+            ],
+        )
+
+    def test_private_publication_transaction_binds_repo_target_and_origin(self) -> None:
+        root = Path(self.data_dir) / "publication"
+        repo = root / "alpha-workbench"
+        repo.mkdir(parents=True)
+        target = "example-owner/alpha-workbench"
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", f"https://github.com/{target}.git"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        prompt = (
+            f"允许在 `{repo}` 执行 git init/add/commit，并在 example-owner 下创建 "
+            "alpha-workbench private repository，推送 main。"
+        )
+        module = __import__("control_plane_hook")
+        authorization_text = module._git_authorization_text(prompt)
+        self.assertIn("推送 main", authorization_text, msg=authorization_text)
+        self.prompt(prompt, cwd=str(root))
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        grant = json.loads(state_path.read_text(encoding="utf-8"))["local_git_grant"]
+        self.assertEqual(
+            {"init", "add", "commit", "repo_create", "push"},
+            set(grant["operations"]),
+        )
+        self.assertEqual(target, next(iter(grant["bindings"].values()))["target"])
+        commands = (
+            f"git -C '{repo}' init -b main",
+            f"git -C '{repo}' add -- .",
+            f"git -C '{repo}' commit -m 'feat: publish'",
+            f"gh repo create {target} --private --source '{repo}' --remote origin",
+            f"git -C '{repo}' push -u origin main",
+        )
+        for command in commands:
+            with self.subTest(command=command.split()[0]):
+                result = self.bash(command, cwd=str(root))
+                self.assertNotEqual(
+                    "deny", result["hookSpecificOutput"].get("permissionDecision"), msg=result
+                )
+        replay = self.bash(f"git -C '{repo}' push -u origin main", cwd=str(root))
+        self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+    def test_publication_transaction_rejects_visibility_target_force_and_fake_tools(self) -> None:
+        root = Path(self.data_dir) / "publication-attacks"
+        repo = root / "alpha-workbench"
+        repo.mkdir(parents=True)
+        prompt = (
+            f"允许在 `{repo}` 执行 git init/add/commit，并在 example-owner 下创建 "
+            "alpha-workbench private repository，推送 main。"
+        )
+        fake_git = root / "git"
+        attacks = (
+            f"gh repo create example-owner/alpha-workbench --public --source '{repo}' --remote origin",
+            f"gh repo create example-owner/other-workbench --private --source '{repo}' --remote origin",
+            f"git -C '{repo}' push --force origin main",
+            f"'{fake_git}' add src/app.py",
+        )
+        for index, command in enumerate(attacks):
+            with self.subTest(index=index):
+                self.turn = f"publication-attack-{index}"
+                self.prompt(prompt, cwd=str(root))
+                result = self.bash(command, cwd=str(root))
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_publication_transaction_never_infers_wildcard_repo_scopes(self) -> None:
+        self.prompt(
+            "允许在两个源目录执行 git init/add/commit，并创建两个 private repository，推送 main。"
+        )
+        result = self.bash(
+            f"git -C '{Path(self.data_dir) / 'unlisted'}' init -b main",
+            cwd=self.data_dir,
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_constrained_github_https_clone_lane_and_adversarial_forms(self) -> None:
+        workspace = Path(self.data_dir) / "clone-workspace"
+        workspace.mkdir()
+        destination = workspace / "audit-clone"
+        source = "https://github.com/example-owner/example-repo.git"
+        safe = f"git clone --depth 1 --no-checkout {source} {destination}"
+        self.assertEqual({}, self.exec_command(safe, cwd=str(workspace)))
+
+        attacks = (
+            f"git clone --depth 1 {source} {destination}",
+            f"git clone --depth 2 --no-checkout {source} {destination}",
+            f"git clone --depth 1 --no-checkout --filter=blob:none {source} {destination}",
+            f"git clone --depth 1 --no-checkout --branch ../main {source} {destination}",
+            f"git clone --depth 1 --no-checkout http://github.com/example-owner/example-repo.git {destination}",
+            f"git clone --depth 1 --no-checkout https://github.com.evil.example/a/b.git {destination}",
+            f"env git clone --depth 1 --no-checkout {source} {destination}",
+            f"{safe} && python3 setup.py",
+            f"git clone --depth 1 --no-checkout {source} relative-clone",
+            f"git clone --depth 1 --no-checkout {source} {workspace / '..' / 'escape'}",
+            f"git clone --depth 1 --no-checkout {source} {workspace / '.git' / 'nested'}",
+        )
+        for index, command in enumerate(attacks):
+            with self.subTest(index=index):
+                result = self.bash(command, cwd=str(workspace))
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_clone_provenance_gates_execution_and_mutation_but_allows_reads(self) -> None:
+        workspace = Path(self.data_dir) / "tracked-clone-workspace"
+        workspace.mkdir()
+        destination = workspace / "tracked-clone"
+        command = (
+            "git clone --depth 1 --no-checkout "
+            f"https://github.com/example-owner/example-repo.git {destination}"
+        )
+        event = {
+            "tool_name": "exec_command",
+            "tool_use_id": "tracked-clone",
+            "tool_input": {"cmd": command, "workdir": str(workspace)},
+            "cwd": str(workspace),
+        }
+        self.assertEqual({}, self.run_hook({"hook_event_name": "PreToolUse", **event}))
+        destination.mkdir()
+        (destination / ".git").mkdir()
+        setup = destination / "setup.py"
+        setup.write_text("print('fixture')\n", encoding="utf-8")
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                **event,
+                "tool_response": {"output": "clone complete"},
+            }
+        )
+        self.assertEqual({}, self.bash(f"cat '{setup}'", cwd=str(workspace)))
+        self.assertEqual(
+            {}, self.bash(f"git -C '{destination}' status --short", cwd=str(workspace))
+        )
+        execution = f"python3 '{setup}'"
+        blocked = (
+            (execution, str(workspace)),
+            ("python3 setup.py", str(destination)),
+            (f"cp '{setup}' '{workspace / 'copy.py'}'", str(workspace)),
+            (f"git -C '{destination}' checkout main", str(workspace)),
+        )
+        for blocked_command, cwd in blocked:
+            with self.subTest(command=blocked_command):
+                result = self.bash(blocked_command, cwd=cwd)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                self.assertIn(
+                    "downloaded_code_execution",
+                    result["hookSpecificOutput"]["permissionDecisionReason"],
+                )
+        self.prompt(f"本轮明确授权执行 `{execution}`。", cwd=str(workspace))
+        self.assertNotEqual(
+            "deny",
+            self.bash(execution, cwd=str(workspace))["hookSpecificOutput"].get(
+                "permissionDecision"
+            ),
+        )
+        self.assertEqual(
+            "deny",
+            self.bash(execution, cwd=str(workspace))["hookSpecificOutput"][
+                "permissionDecision"
+            ],
+        )
+
+    def test_untrackable_clone_forms_fail_even_with_exact_authorization(self) -> None:
+        workspace = Path(self.data_dir) / "untrackable-clone"
+        workspace.mkdir()
+        commands = (
+            "git clone https://github.com/example-owner/example-repo.git",
+            "gh repo clone example-owner/example-repo",
+            "gh repo clone example-owner/example-repo relative-clone",
+            "sh -c 'git clone https://github.com/example-owner/example-repo.git nested'",
+        )
+        for index, command in enumerate(commands):
+            with self.subTest(index=index):
+                self.turn = f"untrackable-clone-{index}"
+                self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workspace))
+                result = self.bash(command, cwd=str(workspace))
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                self.assertIn(
+                    "explicit absolute destination",
+                    result["hookSpecificOutput"]["permissionDecisionReason"],
+                )
+
+    def test_exec_command_reservation_rejects_namespace_fallback_and_changed_options(self) -> None:
+        workspace = Path(self.data_dir) / "exec-binding"
+        workspace.mkdir()
+        command = f"rm -r '{workspace / 'build'}'"
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workspace))
+        pretool = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "functions__exec_command",
+                "tool_use_id": "exec-family",
+                "tool_input": {"cmd": command, "workdir": str(workspace), "shell": "/bin/zsh"},
+                "cwd": str(workspace),
+            }
+        )
+        permission = self.run_hook(
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "exec_command",
+                "tool_use_id": "exec-family",
+                "tool_input": {"cmd": command, "workdir": str(workspace), "shell": "/bin/zsh"},
+                "cwd": str(workspace),
+            }
+        )
+        self.assertNotEqual("deny", pretool["hookSpecificOutput"].get("permissionDecision"))
+        self.assertEqual("deny", permission["hookSpecificOutput"]["decision"]["behavior"])
+
+        self.turn = "exec-options-changed"
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workspace))
+        self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec_command",
+                "tool_use_id": "exec-options",
+                "tool_input": {"cmd": command, "workdir": str(workspace), "shell": "/bin/zsh"},
+                "cwd": str(workspace),
+            }
+        )
+        changed = self.run_hook(
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "exec_command",
+                "tool_use_id": "exec-options",
+                "tool_input": {
+                    "cmd": command,
+                    "workdir": str(workspace),
+                    "shell": "/bin/zsh",
+                    "tty": True,
+                },
+                "cwd": str(workspace),
+            }
+        )
+        self.assertEqual("deny", changed["hookSpecificOutput"]["decision"]["behavior"])
+
+    def test_exec_command_rejects_untrusted_shell_override(self) -> None:
+        workspace = Path(self.data_dir) / "shell-override"
+        workspace.mkdir()
+        destination = workspace / "clone"
+        command = (
+            "git clone --depth 1 --no-checkout "
+            f"https://github.com/example-owner/example-repo.git {destination}"
+        )
+        for shell in (None, "", "zsh", str(workspace / "attacker-shell")):
+            with self.subTest(shell=shell):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "exec_command",
+                        "tool_input": {"cmd": command, "workdir": str(workspace), "shell": shell},
+                        "cwd": str(workspace),
+                    }
+                )
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                self.assertIn(
+                    "Execution tool input rejected",
+                    result["hookSpecificOutput"]["permissionDecisionReason"],
+                )
+
+    def test_permission_request_requires_exact_tool_name(self) -> None:
+        workspace = Path(self.data_dir) / "permission-tool"
+        workspace.mkdir()
+        command = f"rm -r '{workspace / 'build'}'"
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workspace))
+        event = {
+            "tool_use_id": "permission-tool",
+            "tool_input": {"cmd": command, "workdir": str(workspace)},
+            "cwd": str(workspace),
+        }
+        pretool = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "functions__exec_command",
+                **event,
+            }
+        )
+        mismatched = self.run_hook(
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "exec_command",
+                **event,
+            }
+        )
+        self.assertNotEqual("deny", pretool["hookSpecificOutput"].get("permissionDecision"))
+        self.assertEqual("deny", mismatched["hookSpecificOutput"]["decision"]["behavior"])
+
+    def test_permission_request_requires_exact_tool_use_id_and_is_one_shot(self) -> None:
+        workspace = Path(self.data_dir) / "permission-id"
+        workspace.mkdir()
+        command = f"rm -r '{workspace / 'build'}'"
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workspace))
+        base = {
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": command, "workdir": str(workspace)},
+            "cwd": str(workspace),
+        }
+        self.run_hook(
+            {"hook_event_name": "PreToolUse", "tool_use_id": "exact-id", **base}
+        )
+        wrong_id = self.run_hook(
+            {"hook_event_name": "PermissionRequest", "tool_use_id": "other-id", **base}
+        )
+        exact = self.run_hook(
+            {"hook_event_name": "PermissionRequest", "tool_use_id": "exact-id", **base}
+        )
+        replay = self.run_hook(
+            {"hook_event_name": "PermissionRequest", "tool_use_id": "exact-id", **base}
+        )
+        self.assertEqual("deny", wrong_id["hookSpecificOutput"]["decision"]["behavior"])
+        self.assertEqual("allow", exact["hookSpecificOutput"]["decision"]["behavior"])
+        self.assertEqual("deny", replay["hookSpecificOutput"]["decision"]["behavior"])
+
+    def test_permission_request_binds_session_and_turn(self) -> None:
+        workspace = Path(self.data_dir) / "permission-session"
+        workspace.mkdir()
+        command = f"rm -r '{workspace / 'build'}'"
+        base = {
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": command, "workdir": str(workspace)},
+            "cwd": str(workspace),
+        }
+        for index, override in enumerate(
+            ({"session_id": "other-session"}, {"turn_id": "other-turn"})
+        ):
+            with self.subTest(override=override):
+                self.turn = f"permission-scope-{index}"
+                self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workspace))
+                tool_use_id = f"scope-{index}"
+                self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_use_id": tool_use_id,
+                        **base,
+                    }
+                )
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PermissionRequest",
+                        "tool_use_id": tool_use_id,
+                        **base,
+                        **override,
+                    }
+                )
+                self.assertEqual(
+                    "deny", result["hookSpecificOutput"]["decision"]["behavior"]
+                )
+
+    def test_permission_request_binds_base_and_effective_cwd(self) -> None:
+        workspace = Path(self.data_dir) / "permission-cwd"
+        workdir = workspace / "workdir"
+        other = workspace / "other"
+        workdir.mkdir(parents=True)
+        other.mkdir()
+        command = f"rm -r '{workspace / 'build'}'"
+        for index, (permission_cwd, permission_workdir) in enumerate(
+            ((str(other), str(workdir)), (str(workspace), str(other)))
+        ):
+            with self.subTest(index=index):
+                self.turn = f"permission-cwd-{index}"
+                self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workdir))
+                tool_use_id = f"permission-cwd-{index}"
+                self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "exec_command",
+                        "tool_use_id": tool_use_id,
+                        "tool_input": {"cmd": command, "workdir": str(workdir)},
+                        "cwd": str(workspace),
+                    }
+                )
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PermissionRequest",
+                        "tool_name": "exec_command",
+                        "tool_use_id": tool_use_id,
+                        "tool_input": {"cmd": command, "workdir": permission_workdir},
+                        "cwd": permission_cwd,
+                    }
+                )
+                self.assertEqual(
+                    "deny", result["hookSpecificOutput"]["decision"]["behavior"]
+                )
+
+    def test_exec_command_rejects_prefix_rule(self) -> None:
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": "pwd", "prefix_rule": ["pwd"]},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+        self.assertIn("prefix_rule", result["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_exec_command_rejects_unknown_execution_fields(self) -> None:
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": "pwd", "environment": {"PATH": "/tmp"}},
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+        self.assertIn("unknown fields", result["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_permission_request_binds_all_execution_options(self) -> None:
+        workspace = Path(self.data_dir) / "permission-options"
+        other = workspace / "other"
+        other.mkdir(parents=True)
+        command = f"rm -r '{workspace / 'build'}'"
+        base_input = {
+            "cmd": command,
+            "workdir": str(workspace),
+            "shell": "/bin/zsh",
+            "login": True,
+            "tty": False,
+            "sandbox_permissions": "use_default",
+        }
+        changes = (
+            {"shell": "/bin/bash"},
+            {"login": False},
+            {"tty": True},
+            {"sandbox_permissions": "require_escalated"},
+            {"workdir": str(other)},
+        )
+        for index, change in enumerate(changes):
+            with self.subTest(change=change):
+                self.turn = f"permission-option-{index}"
+                self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(workspace))
+                tool_use_id = f"permission-option-{index}"
+                self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "exec_command",
+                        "tool_use_id": tool_use_id,
+                        "tool_input": base_input,
+                        "cwd": str(workspace),
+                    }
+                )
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PermissionRequest",
+                        "tool_name": "exec_command",
+                        "tool_use_id": tool_use_id,
+                        "tool_input": {**base_input, **change},
+                        "cwd": str(workspace),
+                    }
+                )
+                self.assertEqual(
+                    "deny", result["hookSpecificOutput"]["decision"]["behavior"]
+                )
+
+    def test_constrained_clone_requires_exact_exec_tool_and_nonempty_id(self) -> None:
+        workspace = Path(self.data_dir) / "clone-tool-binding"
+        workspace.mkdir()
+        source = "https://github.com/sample-owner/sample-repo.git"
+        cases = (
+            ("functions__exec_command", "clone-namespaced"),
+            ("exec_command", ""),
+            ("Bash", "clone-bash"),
+        )
+        for index, (tool_name, tool_use_id) in enumerate(cases):
+            destination = workspace / f"clone-{index}"
+            command = f"git clone --depth 1 --no-checkout {source} {destination}"
+            tool_input = (
+                {"command": command}
+                if tool_name == "Bash"
+                else {"cmd": command, "workdir": str(workspace)}
+            )
+            with self.subTest(tool_name=tool_name, tool_use_id=tool_use_id):
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": tool_name,
+                        "tool_use_id": tool_use_id,
+                        "tool_input": tool_input,
+                        "cwd": str(workspace),
+                    }
+                )
+                self.assertEqual(
+                    "deny", result["hookSpecificOutput"]["permissionDecision"]
+                )
+
+    def test_constrained_clone_rejects_nondefault_sandbox(self) -> None:
+        workspace = Path(self.data_dir) / "clone-sandbox"
+        workspace.mkdir()
+        destination = workspace / "clone"
+        command = (
+            "git clone --depth 1 --no-checkout "
+            f"https://github.com/sample-owner/sample-repo.git {destination}"
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec_command",
+                "tool_use_id": "clone-sandbox",
+                "tool_input": {
+                    "cmd": command,
+                    "workdir": str(workspace),
+                    "sandbox_permissions": "require_escalated",
+                },
+                "cwd": str(workspace),
+            }
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+        self.assertIn("default sandbox", result["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_constrained_clone_rejects_unresolved_git(self) -> None:
+        workspace = Path(self.data_dir) / "clone-fake-git"
+        workspace.mkdir()
+        fake_git = workspace / "git"
+        fake_git.write_text("fixture\n", encoding="utf-8")
+        destination = workspace / "clone"
+        command = (
+            f"'{fake_git}' clone --depth 1 --no-checkout "
+            f"https://github.com/sample-owner/sample-repo.git {destination}"
+        )
+        result = self.exec_command(command, cwd=str(workspace), tool_use_id="fake-git")
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_constrained_clone_rejects_destination_outside_host_workspace(self) -> None:
+        workspace = Path(self.data_dir) / "clone-host"
+        workspace.mkdir()
+        destination = Path(self.data_dir).parent / f"outside-{Path(self.data_dir).name}"
+        command = (
+            "git clone --depth 1 --no-checkout "
+            f"https://github.com/sample-owner/sample-repo.git {destination}"
+        )
+        result = self.exec_command(command, cwd=str(workspace), tool_use_id="outside-host")
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_clone_reservation_collision_does_not_remove_risk(self) -> None:
+        workspace = Path(self.data_dir) / "clone-reservation"
+        workspace.mkdir()
+        source = "https://github.com/sample-owner/sample-repo.git"
+        first = (
+            f"git clone --depth 1 --no-checkout {source} {workspace / 'first'}"
+        )
+        second = (
+            f"git clone --depth 1 --no-checkout {source} {workspace / 'second'}"
+        )
+        self.assertEqual(
+            {}, self.exec_command(first, cwd=str(workspace), tool_use_id="same-clone-id")
+        )
+        collision = self.exec_command(
+            second, cwd=str(workspace), tool_use_id="same-clone-id"
+        )
+        self.assertEqual("deny", collision["hookSpecificOutput"]["permissionDecision"])
+        self.assertIn(
+            "reservation", collision["hookSpecificOutput"]["permissionDecisionReason"]
+        )
+
+    def test_exact_command_grant_preserves_exact_cwd(self) -> None:
+        self.update_policy(enable_scoped_git_transactions=False)
+        repo = Path(self.data_dir) / "exact-cwd-repo"
+        nested = repo / "nested"
+        nested.mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        command = "git commit -m checkpoint"
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(repo))
+        result = self.bash(command, cwd=str(nested))
+        allowed = self.bash(command, cwd=str(repo))
+        self.assertNotEqual(
+            "deny", allowed["hookSpecificOutput"].get("permissionDecision")
+        )
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_push_rejects_multiple_origin_push_urls(self) -> None:
+        repo = Path(self.data_dir) / "multi-push-url"
+        repo.mkdir()
+        target = "sample-owner/sample-repo"
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                f"https://github.com/{target}.git",
+            ],
+            check=True,
+        )
+        for remote_target in (target, "sample-owner/other-repo"):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "set-url",
+                    "--add",
+                    "--push",
+                    "origin",
+                    f"https://github.com/{remote_target}.git",
+                ],
+                check=True,
+            )
+        self.prompt(
+            f"允许在 `{repo}` 执行 git add/commit，并在 sample-owner 下创建 "
+            "sample-repo private repository，推送 main。",
+            cwd=str(repo.parent),
+        )
+        result = self.bash("git push origin main", cwd=str(repo))
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_permission_request_rereads_origin_before_allowing_push(self) -> None:
+        repo = Path(self.data_dir) / "remote-reread"
+        repo.mkdir()
+        target = "sample-owner/sample-repo"
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                f"https://github.com/{target}.git",
+            ],
+            check=True,
+        )
+        self.prompt(
+            f"允许在 `{repo}` 执行 git add/commit，并在 sample-owner 下创建 "
+            "sample-repo private repository，推送 main。",
+            cwd=str(repo.parent),
+        )
+        event = {
+            "tool_name": "Bash",
+            "tool_use_id": "push-reread",
+            "tool_input": {"command": "git push origin main"},
+            "cwd": str(repo),
+        }
+        pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+        self.assertNotEqual("deny", pretool["hookSpecificOutput"].get("permissionDecision"))
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/sample-owner/changed-repo.git",
+            ],
+            check=True,
+        )
+        permission = self.run_hook({"hook_event_name": "PermissionRequest", **event})
+        self.assertEqual("deny", permission["hookSpecificOutput"]["decision"]["behavior"])
+
+    def test_multi_repo_transaction_rejects_positional_target_pairing(self) -> None:
+        repo_a = Path(self.data_dir) / "mapping-a"
+        repo_b = Path(self.data_dir) / "mapping-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        self.prompt(
+            "本轮明确授权执行以下 publication transaction：\n"
+            f"`git -C '{repo_a}' add -- .`\n"
+            f"`git -C '{repo_b}' add -- .`\n"
+            "`gh repo create sample-owner/alpha --private`\n"
+            "`gh repo create sample-owner/beta --private`",
+            cwd=self.data_dir,
+        )
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(state["local_git_grant"])
+        result = self.bash(f"git -C '{repo_a}' add -- .", cwd=self.data_dir)
+        self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_multi_repo_transaction_accepts_explicit_source_target_mapping(self) -> None:
+        repo_a = Path(self.data_dir) / "explicit-a"
+        repo_b = Path(self.data_dir) / "explicit-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        self.prompt(
+            "本轮明确授权执行以下 publication transaction：\n"
+            f"`git -C '{repo_a}' add -- .`\n"
+            f"`git -C '{repo_b}' add -- .`\n"
+            f"`gh repo create sample-owner/alpha --private --source '{repo_a}' --remote origin`\n"
+            f"`gh repo create sample-owner/beta --private --source '{repo_b}' --remote origin`",
+            cwd=self.data_dir,
+        )
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        grant = json.loads(state_path.read_text(encoding="utf-8"))["local_git_grant"]
+        self.assertIsInstance(grant, dict)
+        mappings = {
+            binding["scope"]: binding["target"]
+            for binding in grant["bindings"].values()
+        }
+        self.assertEqual(
+            {
+                str(repo_a.resolve()): "sample-owner/alpha",
+                str(repo_b.resolve()): "sample-owner/beta",
+            },
+            mappings,
+        )
 
     def test_dangerous_authorization_does_not_cross_turn(self) -> None:
         command = "sudo -n codesign --force --deep --sign - /tmp/Example.app"

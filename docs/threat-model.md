@@ -22,6 +22,7 @@
 
 - Accidental execution of selected high-risk command patterns.
 - Replay and scope drift for experimental one-shot approvals.
+- Cross-tool, cross-working-directory, remote-target, and execution-option drift for opt-in Git/GitHub transaction and clone flows.
 - Selected credential-like strings crossing observed Hook boundaries.
 - Configured sensitive values being written to recognized external or durable destinations.
 - Completion while observed Agents remain active.
@@ -44,4 +45,4 @@
 
 The plugin returns deny responses for recognized conditions when the host invokes the event and accepts the response. It should be deployed as defense in depth with `on-request` approvals, a restrictive sandbox, repository permissions, backups, and review of Hook trust changes.
 
-The release checker scans the current tree, including its own source, rejects binary release files, and applies generic rules plus optional POSIX repository-external private literals. CI adds Gitleaks over reachable Git history and runs protocol plus packaged-command smoke tests on Ubuntu, macOS, and Windows. These checks reduce accidental disclosure and remain bounded pattern scanners rather than complete data-loss prevention.
+The release checker scans the current tree, including its own source, rejects binary release files, and applies generic rules plus optional POSIX repository-external private literals. CI adds Gitleaks over reachable Git history, protocol and packaged-command tests on Ubuntu, macOS, and Windows, and clean-profile Codex CLI Hook discovery/runtime smoke on Ubuntu and Windows. These checks reduce accidental disclosure and remain bounded pattern scanners rather than complete data-loss prevention.

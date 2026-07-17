@@ -22,9 +22,11 @@ The plugin does not impose an Agent-count ceiling. Runtime capacity remains owne
 ## Safe defaults
 
 - Natural-language command approvals are disabled.
+- Scoped Git/GitHub transaction grants are disabled.
+- The constrained GitHub HTTPS clone lane is disabled.
 - Sensitive-disclosure approvals are disabled.
 - No organization markers or private data terms are bundled.
-- Release code initiates no network connections.
+- The Hook runtime initiates no network connections; CI host smoke uses only a loopback model endpoint after installing the pinned official Codex CLI package.
 - Session state is logically expired after seven days. A successful Stop removes the session JSON while retaining a lock sentinel for cross-process ordering.
 - The Rules example contains no active allow rule.
 
@@ -33,7 +35,7 @@ The plugin does not impose an Agent-count ceiling. Runtime capacity remains owne
 Review the repository and its current compatibility table before installation.
 
 ```bash
-codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.3
+codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.4
 codex plugin add codex-control-plane-hooks@codex-control-plane-hooks
 codex plugin list --marketplace codex-control-plane-hooks
 ```
@@ -48,6 +50,8 @@ To update the marketplace snapshot:
 codex plugin marketplace upgrade codex-control-plane-hooks
 ```
 
+Version `0.2.4` expands the matched tool set. Review the updated manifest and accept the new Hook hash before relying on the added nested-command and `Read` coverage.
+
 ## Configure
 
 The plugin reads `policy.json` from the host-provided `PLUGIN_DATA` directory. On macOS and Linux, an absolute `CONTROL_PLANE_POLICY` path can select a current-user-owned regular file only when it has no group or other permissions, such as mode `0600`. Windows keeps policy inside `PLUGIN_DATA` so it inherits the host-managed directory boundary.
@@ -60,6 +64,8 @@ Start from [`examples/policy.example.json`](examples/policy.example.json). Keep 
   "sensitive_terms": ["account", "client", "position"],
   "durable_destination_markers": [],
   "enable_natural_language_approvals": false,
+  "enable_scoped_git_transactions": false,
+  "enable_constrained_github_clone": false,
   "enable_sensitive_disclosure_approvals": false
 }
 ```
@@ -102,9 +108,9 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.2 bundled desktop CLI | macOS arm64 | 3.9.6 | 154 local tests + manifest smoke passed | [UNRUN] clean profile | 2026-07-16 |
-| GitHub Actions runtime | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | [UNRUN] Linux Codex host | 2026-07-15 |
-| GitHub Actions runtime | Windows Server 2022 x64 | 3.9 / 3.12 | protocol + `pwsh` + `powershell.exe` packaged-command gates required | [UNRUN] Windows Codex host | 2026-07-16 |
+| 0.144.5 bundled desktop CLI | macOS arm64 | 3.9.6 | 190 local tests + manifest/release/plugin checks passed | clean-profile checkout install, Hook discovery/trust, safe allow, and dangerous deny passed | 2026-07-17 |
+| GitHub Actions + `@openai/codex@0.144.4` | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | pinned clean-profile host smoke required by CI | 2026-07-17 |
+| GitHub Actions + `@openai/codex@0.144.4` | Windows Server 2022 x64 | 3.9 / 3.12 | protocol + `pwsh` + `powershell.exe` packaged-command gates required | pinned clean-profile host smoke required by CI | 2026-07-17 |
 
 Runtime support and Codex-host compatibility are separate claims. Hook event names, matchers, output schemas, environment variables, and trust behavior can change between Codex versions.
 
@@ -116,11 +122,12 @@ Runtime support and Codex-host compatibility are separate claims. Hook event nam
 - Unknown `mcp__*` tools are treated as external destinations when sensitive context is active. Payload text and lookalike server namespaces cannot consume a grant for a named connector.
 - Post-tool checks occur after a tool has produced output.
 - Natural-language approval parsing remains experimental even when explicitly enabled.
+- Scoped Git/GitHub transactions and the constrained GitHub HTTPS clone lane remain experimental, separately opt-in, and default to disabled. Transaction grants bind explicit repository mappings and consume each declared operation once. An exact one-shot Git command grant remains available when the prompt does not form a complete transaction, with cwd and push target bound into its digest. Clone provenance restricts execution or mutation inside a newly tracked checkout until one exact command is approved.
 - Browser, Computer Use, and connector behavior depends on the tool name and Hook events exposed by the host.
 - Ordinary PowerShell launchers and literal `.ps1` entrypoints are treated like other script runtimes. Inline `-Command` payloads receive bounded recursive classification, while complete semantic review of script-file contents remains outside this pattern-based Hook and belongs to sandboxing, approval policy, repository review, and tests.
 - The project does not defend a compromised OS account, Python runtime, Codex binary, plugin cache, or writable policy file.
 - Native Windows uses `commandWindows`, requires an absolute host-provided `PLUGIN_DATA`, rejects external `CONTROL_PLANE_POLICY`, and relies on the host directory's inherited NTFS DACL. The Hook rejects observed symlinks and reparse points but does not independently audit every DACL ACE.
-- Linux and Windows Codex-host installation remain `[UNRUN]` until a clean-profile host smoke is recorded; their Python runtime and packaged Hook commands are CI-gated.
+- Linux and Windows clean-profile Codex CLI host smoke is CI-gated. Desktop GUI trust prompts remain outside hosted-runner coverage.
 
 ## Publishing sanitized configurations
 

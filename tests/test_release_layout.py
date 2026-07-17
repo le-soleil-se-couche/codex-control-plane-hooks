@@ -76,6 +76,13 @@ class ReleaseLayoutTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("ruff check --no-cache .", workflow)
 
+    def test_ci_runs_pinned_linux_and_windows_codex_host_smoke(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("host-smoke:", workflow)
+        self.assertIn("os: [ubuntu-24.04, windows-2022]", workflow)
+        self.assertIn("@openai/codex@0.144.4", workflow)
+        self.assertIn("scripts/smoke_codex_host.py", workflow)
+
     def test_every_command_hook_has_a_windows_override(self) -> None:
         hooks = json.loads(
             (
@@ -97,6 +104,23 @@ class ReleaseLayoutTests(unittest.TestCase):
         for handler in commands:
             self.assertIn("$PLUGIN_ROOT", handler["command"])
             self.assertIn("$env:PLUGIN_ROOT", handler["commandWindows"])
+
+    def test_manifest_covers_nested_exec_and_posttool_reads(self) -> None:
+        hooks = json.loads(
+            (
+                ROOT
+                / "plugins"
+                / "codex-control-plane-hooks"
+                / "hooks"
+                / "hooks.json"
+            ).read_text(encoding="utf-8")
+        )
+        pretool = hooks["hooks"]["PreToolUse"][0]["matcher"]
+        permission = hooks["hooks"]["PermissionRequest"][0]["matcher"]
+        posttool = hooks["hooks"]["PostToolUse"][0]["matcher"]
+        for matcher in (pretool, permission, posttool):
+            self.assertIn(".*__exec_command", matcher)
+        self.assertIn("Read", posttool)
 
     def test_release_checker_rejects_windows_homes_and_binary_files(self) -> None:
         private_path = "C:\\" + "Users" + r"\example\project"
@@ -141,6 +165,8 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertEqual([], active)
         policy = json.loads((ROOT / "examples" / "policy.example.json").read_text(encoding="utf-8"))
         self.assertFalse(policy["enable_natural_language_approvals"])
+        self.assertFalse(policy["enable_scoped_git_transactions"])
+        self.assertFalse(policy["enable_constrained_github_clone"])
         self.assertFalse(policy["enable_sensitive_disclosure_approvals"])
         self.assertEqual([], policy["durable_destination_markers"])
 

@@ -4,10 +4,21 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-17
+
 - Unwrapped ordinary `pwsh` and `powershell.exe` launchers instead of classifying the launcher itself as dynamic evaluation, while continuing to classify dangerous `-Command` payloads recursively.
 - Treated literal `.ps1` entrypoints and leading PowerShell call operators consistently with other local script runtimes, without confusing the call operator with a trailing background operator.
 - Kept encoded commands or arguments, execution-policy overrides, environment-changing launcher options, interactive persistence, wildcard script targets, variables, script blocks, parenthesized expressions, and other indirect invocation forms behind the dangerous-command gate.
 - Added packaged Hook command smoke coverage for both PowerShell 7 (`pwsh`) and Windows PowerShell 5.1 (`powershell.exe`) on Windows CI.
+- Suppressed assignment-like credential false positives only for AST-proven Python call expressions read from one verified local source file, while preserving literal-secret, ambiguous-read, non-source, symlink, and provider-key detection.
+- Bound `PermissionRequest` reservations to the exact session, turn, base and effective working directory, command, tool name, tool-use ID, and execution options; rejected reusable `prefix_rule`, unknown execution fields, namespace drift, replay, and option changes.
+- Added separately opt-in scoped Git/GitHub transaction grants with explicit repository-to-target mappings, exact branch binding, unique canonical `origin` push URL verification, PermissionRequest-time remote rechecks, and one-shot operation consumption.
+- Preserved exact one-shot Git authorization as a fallback when a prompt does not form a complete transaction, while retaining cwd and push-target drift checks.
+- Added a separately opt-in constrained GitHub HTTPS clone lane that requires an exact local execution tool, non-empty tool-use ID, trusted resolved Git executable, authenticated workspace destination, default execution options, and successful provenance reservation before relaxing Hook classification.
+- Tracked successful clone provenance so read-only inspection remains available while execution or mutation inside the checkout requires a separate exact one-shot authorization.
+- Expanded command matchers to nested `*__exec_command` names and added `Read` to `PostToolUse`; this changes the Hook trust hash and requires review before trust is accepted again.
+- Kept the new transaction and clone capabilities disabled by default through `enable_scoped_git_transactions` and `enable_constrained_github_clone`; malformed policy continues to fail closed.
+- Added clean-profile Codex CLI host smoke on Ubuntu and Windows using pinned `@openai/codex@0.144.4`, local checkout installation, `hooks/list` trust verification, and deterministic loopback safe-allow/dangerous-deny runtime cases without credentials.
 
 ## [0.2.3] - 2026-07-16
 
