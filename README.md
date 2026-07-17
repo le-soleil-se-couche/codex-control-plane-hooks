@@ -108,7 +108,7 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
-| 0.144.5 bundled desktop CLI | macOS arm64 | 3.9.6 | 190 local tests + manifest/release/plugin checks passed | clean-profile checkout install, Hook discovery/trust, safe allow, and dangerous deny passed | 2026-07-17 |
+| 0.144.5 bundled desktop CLI | macOS arm64 | 3.9.6 | 197 local tests + manifest/release/plugin checks passed | clean-profile checkout install, Hook discovery/trust, safe allow, and dangerous deny passed | 2026-07-17 |
 | GitHub Actions + `@openai/codex@0.144.4` | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | pinned clean-profile host smoke required by CI | 2026-07-17 |
 | GitHub Actions + `@openai/codex@0.144.4` | Windows Server 2022 x64 | 3.9 / 3.12 | protocol + `pwsh` + `powershell.exe` packaged-command gates required | pinned clean-profile host smoke required by CI | 2026-07-17 |
 

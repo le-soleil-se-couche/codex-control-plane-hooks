@@ -2724,6 +2724,143 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertNotEqual("deny", allowed["hookSpecificOutput"].get("permissionDecision"))
 
+    def test_pending_push_can_be_approved_without_restating_the_command(self) -> None:
+        repo = Path(self.data_dir) / "pending-push"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sample-owner/pending-push.git",
+            ],
+            check=True,
+        )
+        command = "git push origin main"
+        blocked = self.bash(command, cwd=str(repo))
+        self.assertEqual("deny", blocked["hookSpecificOutput"]["permissionDecision"])
+
+        self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "批准上述命令。",
+                "cwd": str(repo),
+                "turn_id": "pending-push-turn-2",
+            }
+        )
+        changed = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "git push origin other"},
+                "cwd": str(repo),
+                "turn_id": "pending-push-turn-2",
+            }
+        )
+        self.assertEqual("deny", changed["hookSpecificOutput"]["permissionDecision"])
+        allowed = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "cwd": str(repo),
+                "turn_id": "pending-push-turn-2",
+            }
+        )
+        self.assertNotEqual("deny", allowed["hookSpecificOutput"].get("permissionDecision"))
+        replay = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "cwd": str(repo),
+                "turn_id": "pending-push-turn-2",
+            }
+        )
+        self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+    def test_pending_reference_recovers_every_scoped_operation(self) -> None:
+        module = __import__("control_plane_hook")
+        scope = str(Path(self.data_dir) / "pending-operations")
+        target = "sample-owner/pending-operations"
+        common = {
+            "scope": scope,
+            "scope_hash": module._scope_hash(scope, exact=True),
+            "digest": "a" * 64,
+            "created_at": time.time(),
+        }
+        cases = {
+            "init": {"branch": "main"},
+            "add": {},
+            "commit": {},
+            "push": {
+                "remote": "origin",
+                "refspec": "main",
+                "remote_targets": [target],
+            },
+            "repo_create": {
+                "target": target,
+                "visibility": "private",
+                "remote": "origin",
+            },
+        }
+
+        for operation, details in cases.items():
+            with self.subTest(operation=operation):
+                pending = {**common, **details, "operation": operation}
+                grant = module._local_git_grant_from_prompt(
+                    "批准上述命令。", scope, "pending-reference-turn", pending
+                )
+                self.assertIsInstance(grant, dict)
+                self.assertEqual({operation}, set(grant["operations"]))
+                self.assertEqual(common["digest"], grant["pending_digest"])
+                self.assertTrue(
+                    module._git_grant_matches(
+                        grant, pending, "pending-reference-turn"
+                    )
+                )
+                module._consume_git_grant(grant, pending)
+                self.assertFalse(
+                    module._git_grant_matches(
+                        grant, pending, "pending-reference-turn"
+                    )
+                )
+
+    def test_pending_reference_rejects_unusable_or_ambiguous_targets(self) -> None:
+        module = __import__("control_plane_hook")
+        scope = str(Path(self.data_dir) / "invalid-pending")
+        common = {
+            "operation": "push",
+            "scope": scope,
+            "scope_hash": module._scope_hash(scope, exact=True),
+            "digest": "b" * 64,
+            "created_at": time.time(),
+            "remote": "origin",
+            "refspec": "main",
+        }
+        invalid = (
+            {**common, "created_at": time.time() - module._PENDING_GIT_TTL_SECONDS - 1},
+            {**common, "ambiguous": True},
+            {**common, "remote_targets": []},
+            {**common, "remote_targets": ["sample-owner/a", "sample-owner/b"]},
+        )
+        for pending in invalid:
+            with self.subTest(pending=pending):
+                self.assertIsNone(
+                    module._local_git_grant_from_prompt(
+                        "批准上述命令。", scope, "invalid-pending-turn", pending
+                    )
+                )
+
     def test_exact_high_impact_authorization_is_one_shot(self) -> None:
         command = "sudo -n codesign --force --deep --sign - /tmp/Example.app"
         self.prompt(f"本轮明确授权执行 {command}。")
@@ -2788,6 +2925,69 @@ class HookProtocolTests(unittest.TestCase):
                 "permissionDecision"
             ],
         )
+
+    def test_scoped_transaction_parses_push_remote_and_branch(self) -> None:
+        repo = Path(self.data_dir) / "push-origin-main"
+        repo.mkdir()
+        target = "sample-owner/push-origin-main"
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                f"https://github.com/{target}.git",
+            ],
+            check=True,
+        )
+        self.prompt(
+            f"允许在 `{repo}` 执行 git add/commit，并在 sample-owner 下创建 "
+            "push-origin-main private repository，push origin main。",
+            cwd=str(repo),
+        )
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        grant = json.loads(state_path.read_text(encoding="utf-8"))["local_git_grant"]
+        binding = next(iter(grant["bindings"].values()))
+        self.assertEqual("origin", binding["remote"])
+        self.assertEqual("main", binding["push_branch"])
+        result = self.bash("git push origin main", cwd=str(repo))
+        self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
+
+    def test_prompt_push_target_requires_complete_safe_syntax(self) -> None:
+        module = __import__("control_plane_hook")
+        valid = {
+            "push main": ("origin", "main"),
+            "push origin feature/x": ("origin", "feature/x"),
+            "推送 release/next": ("origin", "release/next"),
+            "推送 origin main": ("origin", "main"),
+        }
+        for prompt, expected in valid.items():
+            with self.subTest(valid=prompt):
+                self.assertEqual(
+                    expected, module._prompt_push_target(prompt, self.data_dir, None)
+                )
+
+        invalid = (
+            "push upstream main",
+            "push origin",
+            "push origin main:release",
+            "push origin main~1",
+            "push origin main^",
+            "push origin main now",
+        )
+        for prompt in invalid:
+            with self.subTest(invalid=prompt):
+                self.assertIsNone(
+                    module._prompt_push_target(prompt, self.data_dir, None)
+                )
 
     def test_private_publication_transaction_binds_repo_target_and_origin(self) -> None:
         root = Path(self.data_dir) / "publication"
@@ -2894,6 +3094,34 @@ class HookProtocolTests(unittest.TestCase):
             with self.subTest(index=index):
                 result = self.bash(command, cwd=str(workspace))
                 self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_clone_detection_only_matches_command_positions(self) -> None:
+        module = __import__("control_plane_hook")
+        documentation_commands = (
+            "rg git clone .",
+            "echo git clone",
+            "printf '%s\\n' 'gh repo clone'",
+        )
+        for command in documentation_commands:
+            with self.subTest(command=command):
+                self.assertFalse(module._contains_clone_invocation(command))
+                self.assertEqual({}, self.bash(command))
+
+        self.assertTrue(
+            module._contains_clone_invocation(
+                "echo ready && git clone https://github.com/example/a.git /tmp/a"
+            )
+        )
+        self.assertTrue(module._contains_clone_invocation("gh repo clone example/a"))
+        executable_contexts = (
+            "env git clone https://github.com/example/a.git /tmp/a",
+            "sh -c 'git clone https://github.com/example/a.git /tmp/a'",
+            'pwsh -Command "git clone https://github.com/example/a.git C:\\Temp\\a"',
+            'cmd /c "git clone https://github.com/example/a.git C:\\Temp\\a"',
+        )
+        for command in executable_contexts:
+            with self.subTest(executable_context=command):
+                self.assertTrue(module._contains_clone_invocation(command))
 
     def test_clone_provenance_gates_execution_and_mutation_but_allows_reads(self) -> None:
         workspace = Path(self.data_dir) / "tracked-clone-workspace"
@@ -3503,6 +3731,70 @@ class HookProtocolTests(unittest.TestCase):
             {
                 module._normalized_cwd(str(repo_a)): "sample-owner/alpha",
                 module._normalized_cwd(str(repo_b)): "sample-owner/beta",
+            },
+            mappings,
+        )
+
+    def test_prompt_github_mapping_does_not_require_gh_on_path(self) -> None:
+        module = __import__("control_plane_hook")
+        repo_a = Path(self.data_dir) / "prompt-without-gh-a"
+        repo_b = Path(self.data_dir) / "prompt-without-gh-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        target_a = "sample-owner/prompt-without-gh-a"
+        target_b = "sample-owner/prompt-without-gh-b"
+        create_a = (
+            f"gh repo create {target_a} --private --source '{repo_a}' --remote origin"
+        )
+        create_b = (
+            f"gh repo create {target_b} --private --source '{repo_b}' --remote origin"
+        )
+        prompt = (
+            "本轮明确授权执行以下 publication transaction：\n"
+            f"`git -C '{repo_a}' add -- .`\n"
+            f"`git -C '{repo_b}' add -- .`\n"
+            f"`{create_a}`\n"
+            f"`{create_b}`"
+        )
+        real_which = module.shutil.which
+
+        def without_gh(command: str) -> str | None:
+            return None if module._executable_name(command) == "gh" else real_which(command)
+
+        with mock.patch.object(module.shutil, "which", side_effect=without_gh):
+            self.assertIsNone(
+                module._scoped_github_create_candidate(
+                    create_a,
+                    self.data_dir,
+                    {"github_network", "github_repo_create"},
+                )
+            )
+            parsed = module._prompt_github_create_candidate(
+                create_a,
+                self.data_dir,
+                {"github_network", "github_repo_create"},
+            )
+            self.assertIsInstance(parsed, dict)
+            self.assertIsNone(
+                module._prompt_github_create_candidate(
+                    create_a.replace("gh repo create", "/tmp/gh repo create"),
+                    self.data_dir,
+                    {"github_network", "github_repo_create"},
+                )
+            )
+            grant = module._local_git_grant_from_prompt(
+                prompt, self.data_dir, "prompt-without-gh-turn", None
+            )
+
+        self.assertIsInstance(grant, dict)
+        mappings = {
+            binding["scope"]: binding["target"]
+            for binding in grant["bindings"].values()
+        }
+        self.assertEqual(
+            {
+                module._normalized_cwd(str(repo_a)): target_a,
+                module._normalized_cwd(str(repo_b)): target_b,
             },
             mappings,
         )

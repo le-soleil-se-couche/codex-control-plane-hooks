@@ -236,6 +236,8 @@ _LOCAL_GIT_APPROVAL_RE = re.compile(
     r")"
 )
 _LOCAL_GIT_OPERATION_RE = re.compile(r"(?i)\b(init|add|commit|push)\b")
+_SCOPED_GIT_OPERATIONS = frozenset({"init", "add", "commit", "push"})
+_SCOPED_TRANSACTION_OPERATIONS = _SCOPED_GIT_OPERATIONS | {"repo_create"}
 _NEGATED_GIT_OPERATION_RE = re.compile(
     r"(?i)(?:不要|别|禁止|不许|不得|无需|不用|do\s+not|don't|never).{0,24}?"
     r"(?P<operation>init|add|commit|push|初始化|暂存|提交|推送|创建(?:仓库|repo(?:sitory)?)?)"
@@ -2477,24 +2479,46 @@ def _reserve_clone(state: dict[str, Any], tool_use_id: str, metadata: dict[str, 
     return True
 
 
-def _contains_clone_invocation(command: str) -> bool:
+def _contains_clone_invocation(command: str, *, depth: int = 0) -> bool:
     tokens = _shell_tokens(command)
-    for index, token in enumerate(tokens):
-        name = _executable_name(token)
-        if name == "git":
-            _, args = _git_scope_and_args(tokens[index + 1 :], ".")
+    commands, _ = _split_shell_commands(
+        tokens, windows_style=_looks_like_windows_command(command)
+    )
+    for segment in commands:
+        executable, args, _ = _unwrap_command(segment)
+        if executable == "git":
+            _, args = _git_scope_and_args(args, ".")
             subcommand, _, dynamic = _git_command(args)
             if not dynamic and subcommand == "clone":
                 return True
-        if name == "gh" and tokens[index + 1 : index + 3] == ["repo", "clone"]:
+        if executable == "gh" and args[:2] == ["repo", "clone"]:
             return True
-    return bool(
-        re.search(
-            r"(?i)(?:^|[\s'\"])(?:\S*[\\/])?git(?:\.exe)?\s+clone\b|"
-            r"(?:^|[\s'\"])(?:\S*[\\/])?gh(?:\.exe)?\s+repo\s+clone\b",
-            command,
-        )
-    )
+        if executable in _SHELL_EVAL and depth == 0:
+            for index, token in enumerate(args):
+                if _is_shell_eval_flag(token) and index + 1 < len(args):
+                    if _contains_clone_invocation(args[index + 1], depth=1):
+                        return True
+                    break
+        if executable in {"powershell", "pwsh"} and depth < 4:
+            for index, token in enumerate(args):
+                name, inline_value = _powershell_option(token)
+                if name in {"c", "command"}:
+                    payload = ([inline_value] if inline_value is not None else []) + args[
+                        index + 1 :
+                    ]
+                    if payload and _contains_clone_invocation(" ".join(payload), depth=depth + 1):
+                        return True
+                    break
+        if executable == "cmd" and depth < 4:
+            for index, token in enumerate(args):
+                lowered = token.casefold()
+                if lowered in {"/c", "-c"} and index + 1 < len(args):
+                    if _contains_clone_invocation(
+                        " ".join(args[index + 1 :]), depth=depth + 1
+                    ):
+                        return True
+                    break
+    return False
 
 
 def _looks_like_git_clone(destination: str) -> bool:
@@ -2638,7 +2662,7 @@ def _scoped_git_candidate(
     ):
         return None
     subcommand, git_args, dynamic_config = _git_command(canonical_args)
-    if dynamic_config or subcommand not in {"init", "add", "commit", "push"}:
+    if dynamic_config or subcommand not in _SCOPED_GIT_OPERATIONS:
         return None
     branch = ""
     push_target: tuple[str, str] | None = None
@@ -2712,9 +2736,9 @@ def _scoped_git_candidate(
     return candidate
 
 
-def _scoped_github_create_candidate(
+def _parse_github_create_candidate(
     command: str, cwd: str, dangerous: set[str]
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], str] | None:
     if (
         dangerous != {"github_network", "github_repo_create"}
         or _SHELL_CONTROL_RE.search(command)
@@ -2727,7 +2751,6 @@ def _scoped_github_create_candidate(
         executable != "gh"
         or wrappers
         or not tokens
-        or not _trusted_executable_token(tokens[0], "gh")
         or len(args) < 3
         or args[:2] != ["repo", "create"]
     ):
@@ -2773,16 +2796,42 @@ def _scoped_github_create_candidate(
         return None
     source_path = source if os.path.isabs(source) else os.path.join(cwd, source)
     scope = _git_repo_root(source_path)
-    return {
-        "digest": _command_hash(command, cwd),
-        "operation": "repo_create",
-        "scope": scope,
-        "scope_hash": _scope_hash(scope, exact=True),
-        "codes": sorted(dangerous),
-        "target": target,
-        "visibility": "private",
-        "remote": remote,
-    }
+    return (
+        {
+            "digest": _command_hash(command, cwd),
+            "operation": "repo_create",
+            "scope": scope,
+            "scope_hash": _scope_hash(scope, exact=True),
+            "codes": sorted(dangerous),
+            "target": target,
+            "visibility": "private",
+            "remote": remote,
+        },
+        tokens[0],
+    )
+
+
+def _scoped_github_create_candidate(
+    command: str, cwd: str, dangerous: set[str]
+) -> dict[str, Any] | None:
+    parsed = _parse_github_create_candidate(command, cwd, dangerous)
+    if not parsed:
+        return None
+    candidate, executable_token = parsed
+    return candidate if _trusted_executable_token(executable_token, "gh") else None
+
+
+def _prompt_github_create_candidate(
+    command: str, cwd: str, dangerous: set[str]
+) -> dict[str, Any] | None:
+    parsed = _parse_github_create_candidate(command, cwd, dangerous)
+    if not parsed:
+        return None
+    candidate, executable_token = parsed
+    raw = _strip_token_quotes(executable_token)
+    if any(separator in raw for separator in ("/", "\\")):
+        return None
+    return candidate
 
 
 def _ordered_unique(items: list[str]) -> list[str]:
@@ -2857,10 +2906,10 @@ def _prompt_command_scopes(
                     continue
                 scope, canonical_args = _git_scope_and_args(args, cwd)
                 subcommand, _, dynamic_config = _git_command(canonical_args)
-                if not dynamic_config and subcommand in {"init", "add", "commit", "push"}:
+                if not dynamic_config and subcommand in _SCOPED_GIT_OPERATIONS:
                     scopes.append(_scope_identity(scope, exact=subcommand == "init"))
                 continue
-            candidate = _scoped_github_create_candidate(
+            candidate = _prompt_github_create_candidate(
                 command, cwd, {"github_network", "github_repo_create"}
             )
             if candidate:
@@ -2910,9 +2959,25 @@ def _prompt_push_target(
             )
             if candidate and candidate.get("operation") == "push":
                 return str(candidate["remote"]), str(candidate["refspec"])
-    match = re.search(r"(?i)(?:推送|push)\s+(?P<ref>[A-Za-z0-9._/-]+)", prompt)
-    if match:
-        return "origin", match.group("ref")
+    for clause in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        match = re.search(
+            r"(?i)(?:推送|(?<![A-Za-z0-9_])push\b)\s+"
+            r"(?P<arguments>\S+(?:\s+\S+)?)\s*$",
+            clause.strip(),
+        )
+        if not match:
+            continue
+        arguments = match.group("arguments").split()
+        if len(arguments) == 1:
+            if arguments[0].casefold() == "origin":
+                return None
+            refspec = arguments[0]
+        elif len(arguments) == 2 and arguments[0].casefold() == "origin":
+            refspec = arguments[1]
+        else:
+            return None
+        branch = _safe_branch_name(refspec)
+        return ("origin", branch) if branch else None
     if (
         _PENDING_COMMAND_REFERENCE_RE.search(prompt)
         and _pending_git_usable(pending)
@@ -2961,7 +3026,7 @@ def _prompt_github_mappings(prompt: str, cwd: str) -> dict[str, str]:
     mappings: dict[str, str] = {}
     for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
         for command in _authorization_command_candidates(segment):
-            candidate = _scoped_github_create_candidate(
+            candidate = _prompt_github_create_candidate(
                 command, cwd, {"github_network", "github_repo_create"}
             )
             if candidate:
@@ -3002,8 +3067,16 @@ def _local_git_grant_from_prompt(
     )
     if not operations and pending_reference:
         operation = str(pending.get("operation") or "")
-        if operation in {"add", "commit"}:
+        if operation in _SCOPED_TRANSACTION_OPERATIONS:
             operations.add(operation)
+    if not github_targets and pending_reference:
+        pending_target = str(pending.get("target") or "")
+        if not pending_target and "push" in operations:
+            remote_targets = pending.get("remote_targets")
+            if isinstance(remote_targets, list) and len(remote_targets) == 1:
+                pending_target = str(remote_targets[0] or "")
+        if pending_target:
+            github_targets = [pending_target]
     scopes = _prompt_git_scopes(authorization_text, cwd, pending, operations)
     push_target = (
         _prompt_push_target(authorization_text, cwd, pending)
