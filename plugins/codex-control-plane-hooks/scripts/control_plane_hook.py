@@ -452,6 +452,20 @@ _GIT_GLOBAL_VALUE_FLAGS = {
 }
 _GIT_SCOPE_FLAGS = {"--git-dir", "--work-tree", "--namespace"}
 _GIT_NETWORK_SUBCOMMANDS = {"push", "pull", "fetch", "clone"}
+_EXACT_PUSH_BOOLEAN_OPTIONS = frozenset(
+    "--atomic --dry-run --force --force-if-includes --force-with-lease --ipv4 "
+    "--ipv6 --no-atomic --no-force-if-includes --no-progress --no-signed "
+    "--no-thin --no-verify --porcelain --progress --quiet --set-upstream "
+    "--signed --thin --verbose --verify".split()
+)
+_EXACT_PUSH_VALUE_OPTIONS = frozenset({"-o", "--push-option"})
+_EXACT_PUSH_VALUE_PREFIXES = tuple(
+    option + "=" for option in _EXACT_PUSH_VALUE_OPTIONS if option.startswith("--")
+)
+_EXACT_PUSH_OPTIONAL_VALUE_PREFIXES = (
+    "--force-with-lease=",
+    "--signed=",
+)
 _TRUSTED_EXEC_COMMAND_SHELLS = {"/bin/bash", "/bin/sh", "/bin/zsh"}
 _TRUSTED_WINDOWS_EXEC_COMMAND_SHELLS = {"bash", "cmd", "powershell", "pwsh", "sh"}
 _EXEC_COMMAND_ALLOWED_FIELDS = frozenset(
@@ -2192,8 +2206,8 @@ def _command_hash(command: str, cwd: str) -> str:
         if subcommand == "push":
             if wrappers or dynamic_config or not _trusted_executable_token(tokens[0], "git"):
                 return ""
-            push_target = _safe_push_target(git_args)
-            if push_target is None:
+            push_remote = _exact_push_remote(git_args)
+            if push_remote is None:
                 return ""
             _, exact_git_args, _ = _git_command(args)
             global_arg_count = len(args) - len(exact_git_args) - 1
@@ -2208,14 +2222,14 @@ def _command_hash(command: str, cwd: str) -> str:
                 for token in exact_global_args
             ):
                 return ""
-            remote_targets = _git_remote_targets(
+            remote_identities = _git_remote_identities(
                 normalized_cwd,
-                push_target[0],
+                push_remote,
                 exact_global_args=exact_global_args,
             )
-            if len(remote_targets) != 1:
+            if len(remote_identities) != 1:
                 return ""
-            canonical += "\0push-target\0" + remote_targets[0]
+            canonical += "\0push-target\0" + remote_identities[0]
     return hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -2682,6 +2696,53 @@ def _safe_push_target(git_args: list[str]) -> tuple[str, str] | None:
     return (remote, branch) if branch else None
 
 
+def _exact_push_remote(git_args: list[str]) -> str | None:
+    positionals: list[str] = []
+    options_done = False
+    index = 0
+    while index < len(git_args):
+        token = git_args[index]
+        if options_done:
+            positionals.append(token)
+            index += 1
+            continue
+        if token == "--":
+            options_done = True
+            index += 1
+            continue
+        if token in _EXACT_PUSH_BOOLEAN_OPTIONS:
+            index += 1
+            continue
+        if re.fullmatch(r"-[46fnquv]+", token):
+            index += 1
+            continue
+        if token.startswith("-o") and token != "-o":
+            index += 1
+            continue
+        if token in _EXACT_PUSH_VALUE_OPTIONS:
+            if index + 1 >= len(git_args):
+                return None
+            index += 2
+            continue
+        if token.startswith(_EXACT_PUSH_VALUE_PREFIXES):
+            index += 1
+            continue
+        if token.startswith(_EXACT_PUSH_OPTIONAL_VALUE_PREFIXES):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        positionals.append(token)
+        index += 1
+
+    if len(positionals) != 2:
+        return None
+    remote, refspec = positionals
+    if remote != "origin" or not _safe_branch_name(refspec):
+        return None
+    return remote
+
+
 def _github_target_from_remote(url: str) -> str:
     patterns = (
         r"git@github\.com:(?P<target>[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(?:\.git)?/?$",
@@ -2695,13 +2756,13 @@ def _github_target_from_remote(url: str) -> str:
     return ""
 
 
-def _git_remote_targets(
+def _git_remote_urls(
     scope: str,
     remote: str,
     *,
     exact_global_args: list[str] | None = None,
 ) -> tuple[str, ...]:
-    if remote != "origin":
+    if not remote or remote.startswith("-"):
         return ()
     if exact_global_args is None:
         command = ["git", "-C", scope, "remote", "get-url", "--push", "--all", remote]
@@ -2730,9 +2791,143 @@ def _git_remote_targets(
         return ()
     if completed.returncode != 0:
         return ()
-    urls = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return tuple(
+        line.strip() for line in completed.stdout.splitlines() if line.strip()
+    )
+
+
+def _git_remote_targets(
+    scope: str,
+    remote: str,
+    *,
+    exact_global_args: list[str] | None = None,
+) -> tuple[str, ...]:
+    if remote != "origin":
+        return ()
+    urls = _git_remote_urls(
+        scope,
+        remote,
+        exact_global_args=exact_global_args,
+    )
     targets = tuple(_github_target_from_remote(url) for url in urls)
     return targets if targets and all(targets) else ()
+
+
+def _git_config_values(
+    scope: str,
+    key: str,
+    *,
+    exact_global_args: list[str] | None = None,
+) -> tuple[str, ...] | None:
+    if exact_global_args is None:
+        command = ["git", "-C", scope, "config", "--get-all", key]
+        run_cwd = None
+    else:
+        command = ["git", *exact_global_args, "config", "--get-all", key]
+        run_cwd = scope
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=run_cwd,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode == 1:
+        return ()
+    if completed.returncode != 0:
+        return None
+    return tuple(
+        line.strip() for line in completed.stdout.splitlines() if line.strip()
+    )
+
+
+def _safe_git_push_url(url: str) -> str:
+    value = url.strip()
+    if not value or any(character.isspace() or ord(character) < 32 for character in value):
+        return ""
+    scp_match = re.fullmatch(
+        r"[A-Za-z0-9._-]+@(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:]+\]):(?P<path>.+)",
+        value,
+    )
+    if scp_match:
+        path = scp_match.group("path")
+        return value if path and not path.startswith("-") else ""
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"https", "ssh"} or not parsed.hostname:
+        return ""
+    if parsed.query or parsed.fragment or not parsed.path or parsed.path == "/":
+        return ""
+    if parsed.password is not None:
+        return ""
+    if scheme == "https" and parsed.username is not None:
+        return ""
+    if scheme == "ssh" and parsed.username and not re.fullmatch(
+        r"[A-Za-z0-9._-]+", parsed.username
+    ):
+        return ""
+    return value
+
+
+def _git_remote_identities(
+    scope: str,
+    remote: str,
+    *,
+    exact_global_args: list[str] | None = None,
+) -> tuple[str, ...]:
+    if remote != "origin":
+        return ()
+    for key in (
+        f"remote.{remote}.vcs",
+        f"remote.{remote}.receivepack",
+    ):
+        values = _git_config_values(
+            scope,
+            key,
+            exact_global_args=exact_global_args,
+        )
+        if values is None or values:
+            return ()
+    recurse_values = _git_config_values(
+        scope,
+        "push.recurseSubmodules",
+        exact_global_args=exact_global_args,
+    )
+    if recurse_values is None or any(
+        value.casefold() not in {"0", "false", "no", "off"}
+        for value in recurse_values
+    ):
+        return ()
+    urls = _git_remote_urls(
+        scope,
+        remote,
+        exact_global_args=exact_global_args,
+    )
+    safe_urls = tuple(_safe_git_push_url(url) for url in urls)
+    if not safe_urls or not all(safe_urls):
+        return ()
+    if any(url.startswith("ssh://") or re.match(r"^[^@]+@[^:]+:", url) for url in safe_urls):
+        ssh_command = _git_config_values(
+            scope,
+            "core.sshCommand",
+            exact_global_args=exact_global_args,
+        )
+        if ssh_command is None or ssh_command or os.environ.get("GIT_SSH") or os.environ.get("GIT_SSH_COMMAND"):
+            return ()
+    return tuple(
+        hashlib.sha256(
+            ("git-push-url\0" + url).encode("utf-8", errors="replace")
+        ).hexdigest()
+        for url in safe_urls
+    )
 
 
 def _scoped_git_candidate(
@@ -3417,6 +3612,52 @@ def _pure_authorization_command_candidates(segment: str) -> list[str]:
     return _authorization_command_candidates(stripped)
 
 
+def _transaction_operation_from_command(command: str, cwd: str) -> str:
+    tokens = _shell_tokens(command)
+    executable, args, wrappers = _unwrap_command(tokens)
+    if not tokens or wrappers:
+        return ""
+    if executable == "git" and _trusted_executable_token(tokens[0], "git"):
+        _, canonical_args = _git_scope_and_args(args, cwd)
+        subcommand, _, _ = _git_command(canonical_args)
+        return subcommand if subcommand in _SCOPED_GIT_OPERATIONS else ""
+    candidate = _prompt_github_create_candidate(
+        command,
+        cwd,
+        {"github_network", "github_repo_create"},
+    )
+    return "repo_create" if candidate else ""
+
+
+def _prompt_has_unresolved_git_scope_override(prompt: str, cwd: str) -> bool:
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            tokens = _shell_tokens(command)
+            executable, args, wrappers = _unwrap_command(tokens)
+            if (
+                executable != "git"
+                or wrappers
+                or not tokens
+                or not _trusted_executable_token(tokens[0], "git")
+            ):
+                continue
+            _, canonical_args = _git_scope_and_args(args, cwd)
+            subcommand, git_args, _ = _git_command(canonical_args)
+            if not subcommand:
+                continue
+            global_arg_count = len(canonical_args) - len(git_args) - 1
+            if global_arg_count < 0:
+                return True
+            global_args = canonical_args[:global_arg_count]
+            if "--bare" in global_args or any(
+                token in _GIT_SCOPE_FLAGS
+                or any(token.startswith(flag + "=") for flag in _GIT_SCOPE_FLAGS)
+                for token in global_args
+            ):
+                return True
+    return False
+
+
 def _dangerous_authorization_hashes(
     prompt: str,
     cwd: str,
@@ -3444,9 +3685,10 @@ def _dangerous_authorization_hashes(
             dangerous = _dangerous_codes(_structured_command_findings(candidate))
             if _command_uses_untrusted_clone(candidate, cwd, untrusted_roots):
                 dangerous.add("downloaded_code_execution")
-            if skip_scoped_candidates and policy["enable_scoped_git_transactions"] and (
-                _scoped_git_candidate(candidate, cwd, dangerous)
-                or _scoped_github_create_candidate(candidate, cwd, dangerous)
+            if (
+                skip_scoped_candidates
+                and policy["enable_scoped_git_transactions"]
+                and _transaction_operation_from_command(candidate, cwd)
             ):
                 continue
             for code in dangerous:
@@ -3944,16 +4186,25 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
             pending if isinstance(pending, dict) else None,
         )
         authorization_text = _git_authorization_text(prompt)
+        transaction_scopes = _ordered_unique(
+            _prompt_command_scopes(
+                authorization_text,
+                cwd,
+                include_implicit_cwd=True,
+            )
+            + _prompt_absolute_paths(authorization_text)
+        )
+        transaction_targets = _prompt_github_targets(authorization_text)
         transaction_intent_requires_grant = bool(
-            len(
-                _prompt_command_scopes(
+            transaction_targets
+            and (
+                len(transaction_scopes) > 1
+                or len(transaction_targets) > 1
+                or _prompt_has_unresolved_git_scope_override(
                     authorization_text,
                     cwd,
-                    include_implicit_cwd=True,
                 )
             )
-            > 1
-            or _prompt_github_targets(authorization_text)
         )
         authorization_hashes = _dangerous_authorization_hashes(
             prompt,
