@@ -3479,6 +3479,7 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
     def test_multi_repo_transaction_accepts_explicit_source_target_mapping(self) -> None:
+        module = __import__("control_plane_hook")
         repo_a = Path(self.data_dir) / "explicit-a"
         repo_b = Path(self.data_dir) / "explicit-b"
         repo_a.mkdir()
@@ -3500,8 +3501,8 @@ class HookProtocolTests(unittest.TestCase):
         }
         self.assertEqual(
             {
-                str(repo_a.resolve()): "sample-owner/alpha",
-                str(repo_b.resolve()): "sample-owner/beta",
+                module._normalized_cwd(str(repo_a)): "sample-owner/alpha",
+                module._normalized_cwd(str(repo_b)): "sample-owner/beta",
             },
             mappings,
         )
