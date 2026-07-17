@@ -2646,6 +2646,252 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("deny", replay_push["hookSpecificOutput"]["permissionDecision"])
 
+    def test_exact_git_fallback_survives_single_incomplete_transaction_intent(
+        self,
+    ) -> None:
+        repo = Path(self.data_dir) / "single-incomplete-transaction"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        command = "git commit -m checkpoint"
+        self.prompt(
+            f"本轮明确授权执行 `{command}`，并在 sample-owner 下创建 "
+            "single-incomplete-transaction private repository。",
+            cwd=str(repo),
+        )
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(state["local_git_grant"])
+
+        allowed = self.bash(command, cwd=str(repo))
+        replay = self.bash(command, cwd=str(repo))
+        self.assertNotEqual(
+            "deny", allowed["hookSpecificOutput"].get("permissionDecision"), msg=allowed
+        )
+        self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+    def test_incomplete_transaction_with_scope_override_fails_closed(self) -> None:
+        root = Path(self.data_dir) / "scope-override-transaction"
+        repo_a = root / "repo-a"
+        repo_b = root / "repo-b"
+        for repo in (repo_a, repo_b):
+            repo.mkdir(parents=True)
+            subprocess.run(
+                ["git", "init", "-q", str(repo)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        command_a = (
+            "git --git-dir='repo-a/.git' --work-tree='repo-a' "
+            "commit -m checkpoint-a"
+        )
+        command_b = (
+            "git --git-dir='repo-b/.git' --work-tree='repo-b' "
+            "commit -m checkpoint-b"
+        )
+        self.prompt(
+            f"本轮明确授权执行 `{command_a}` 和 `{command_b}`，并在 sample-owner 下创建 "
+            "scope-override-transaction private repository。",
+            cwd=str(root),
+        )
+        for command in (command_a, command_b):
+            result = self.bash(command, cwd=str(root))
+            self.assertEqual(
+                "deny", result["hookSpecificOutput"]["permissionDecision"]
+            )
+
+        self.turn = "scope-override-without-publication"
+        self.prompt(f"本轮明确授权执行 `{command_a}`。", cwd=str(root))
+        allowed = self.bash(command_a, cwd=str(root))
+        self.assertNotEqual(
+            "deny", allowed["hookSpecificOutput"].get("permissionDecision"), msg=allowed
+        )
+
+    def test_exact_push_options_are_hashable_and_one_shot(self) -> None:
+        repo = Path(self.data_dir) / "exact-push-options"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sample-owner/exact-push-options.git",
+            ],
+            check=True,
+        )
+        commands = (
+            "git push --force origin main",
+            "git push -f -o ci.skip origin main",
+            "git push --force-with-lease=main:deadbeef --push-option=ci.skip origin main",
+            "git push --atomic --no-verify -u origin main",
+            "git push -4 --signed=if-asked origin refs/heads/main",
+            "git push --force -- origin main",
+        )
+        module = __import__("control_plane_hook")
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                self.turn = f"exact-push-option-{index}"
+                self.assertTrue(module._command_hash(command, str(repo)))
+                self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(repo))
+                allowed = self.bash(command, cwd=str(repo))
+                replay = self.bash(command, cwd=str(repo))
+                self.assertNotEqual(
+                    "deny",
+                    allowed["hookSpecificOutput"].get("permissionDecision"),
+                    msg=allowed,
+                )
+                self.assertEqual(
+                    "deny", replay["hookSpecificOutput"]["permissionDecision"]
+                )
+        rejected = (
+            "git push --unknown origin main",
+            "git push --repo=origin main",
+            "git push --repo origin main",
+            "git push --receive-pack=git-receive-pack origin main",
+            "git push --exec=git-receive-pack origin main",
+            "git push --all origin",
+            "git push --tags origin",
+            "git push --delete origin main",
+            "git push --prune origin main",
+            "git push --follow-tags origin main",
+            "git push --recurse-submodules=on-demand origin main",
+            "git push origin main feature/next",
+            "git push origin +main",
+            "git push origin main:release",
+            "git push https://github.com/sample-owner/direct.git main",
+        )
+        for command in rejected:
+            with self.subTest(rejected=command):
+                self.assertEqual("", module._command_hash(command, str(repo)))
+
+    def test_exact_push_supports_non_github_origin_and_rechecks_drift(self) -> None:
+        repo = Path(self.data_dir) / "exact-push-gitlab"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        original = "https://gitlab.com/sample-owner/exact-push-gitlab.git"
+        changed = "ssh://git@git.example.com/sample-owner/changed.git"
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", original],
+            check=True,
+        )
+        command = "git push origin main"
+
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(repo))
+        allowed = self.bash(command, cwd=str(repo))
+        replay = self.bash(command, cwd=str(repo))
+        self.assertNotEqual(
+            "deny", allowed["hookSpecificOutput"].get("permissionDecision"), msg=allowed
+        )
+        self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+        self.turn = "exact-push-non-github-drift"
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(repo))
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "set-url", "origin", changed],
+            check=True,
+        )
+        drifted = self.bash(command, cwd=str(repo))
+        self.assertEqual("deny", drifted["hookSpecificOutput"]["permissionDecision"])
+
+        module = __import__("control_plane_hook")
+        safe_remotes = (
+            "https://bitbucket.org/sample-owner/example.git",
+            "ssh://git@git.example.com/sample-owner/example.git",
+            "git@gitlab.com:sample-owner/example.git",
+        )
+        for remote in safe_remotes:
+            with self.subTest(safe_remote=remote):
+                subprocess.run(
+                    ["git", "-C", str(repo), "remote", "set-url", "origin", remote],
+                    check=True,
+                )
+                self.assertTrue(module._command_hash(command, str(repo)))
+
+        unsafe_remotes = (
+            "http://git.example.com/sample-owner/example.git",
+            "git://git.example.com/sample-owner/example.git",
+            "file:///tmp/example.git",
+            "ext::echo unsafe",
+            f"https://user{chr(58)}embedded-value@git.example.com/sample-owner/example.git",
+        )
+        for remote in unsafe_remotes:
+            with self.subTest(unsafe_remote=remote):
+                subprocess.run(
+                    ["git", "-C", str(repo), "remote", "set-url", "origin", remote],
+                    check=True,
+                )
+                self.assertEqual("", module._command_hash(command, str(repo)))
+
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "set-url", "origin", original],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                original,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                "https://gitlab.com/sample-owner/second.git",
+            ],
+            check=True,
+        )
+        self.assertEqual("", module._command_hash(command, str(repo)))
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "--unset-all", "remote.origin.pushurl"],
+            check=True,
+        )
+
+        unsafe_config = (
+            ("remote.origin.vcs", "ext"),
+            ("remote.origin.receivepack", "custom-receive-pack"),
+            ("push.recurseSubmodules", "on-demand"),
+        )
+        for key, value in unsafe_config:
+            with self.subTest(unsafe_config=key):
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", key, value],
+                    check=True,
+                )
+                self.assertEqual("", module._command_hash(command, str(repo)))
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", "--unset-all", key],
+                    check=True,
+                )
+
     def test_exact_push_fallback_rechecks_remote_target(self) -> None:
         repo = Path(self.data_dir) / "exact-push-drift"
         repo.mkdir()
