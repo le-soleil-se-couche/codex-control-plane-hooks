@@ -3,17 +3,21 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import ntpath
 import os
 import re
 import shlex
+import shutil
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 try:
     import fcntl
@@ -28,9 +32,11 @@ except ImportError:  # pragma: no cover - unavailable on macOS/Linux.
 
 MAX_SCAN_CHARS = 500_000
 MAX_POLICY_BYTES = 64_000
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 STATE_TTL_SECONDS = 7 * 24 * 60 * 60
 SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_PYTHON_SOURCE_SUFFIXES = {".py", ".pyi"}
+_LOCAL_SOURCE_READ_EXECUTABLES = {"nl", "rg", "sed"}
 
 _SECRET_PATTERNS = (
     ("openai_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
@@ -47,6 +53,10 @@ _SECRET_PATTERNS = (
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+)
+_CREDENTIAL_ASSIGNMENT_DETAIL_RE = re.compile(
+    r"(?i)\b(?P<label>api[_-]?key|token|secret|password|client[_-]?secret|access[_-]?key)"
+    r"\s*(?P<separator>[:=])\s*(?P<quote>['\"]?)(?P<value>[A-Za-z0-9_./+=:-]{16,})"
 )
 _SENSITIVE_EXTERNAL_VERB_RE = re.compile(r"外发|披露|上传|发送|共享|external|upload|share|send", re.IGNORECASE)
 _SENSITIVE_NEGATION_RE = re.compile(
@@ -220,9 +230,36 @@ _DANGEROUS_APPROVAL_RE = re.compile(
     r")"
 )
 _LOCAL_GIT_APPROVAL_RE = re.compile(
-    r"(?i)^\s*(?:我\s*)?(?:(?:本轮|这次|现在)\s*)?(?:明确\s*)?(?:批准|同意|确认|授权|允许)"
+    r"(?ix)^\s*(?:"
+    r"(?:我\s*)?(?:(?:本轮|这次|现在)\s*)?(?:明确\s*)?(?:批准|同意|确认|授权|允许)"
+    r"|I\s+explicitly\s+authorize(?:\s+execution\s+of)?"
+    r")"
 )
-_LOCAL_GIT_OPERATION_RE = re.compile(r"(?i)\bgit(?:\.exe)?\s+(add|commit)\b")
+_SCOPED_GIT_OPERATIONS = frozenset({"init", "add", "commit", "push"})
+_SCOPED_TRANSACTION_OPERATIONS = _SCOPED_GIT_OPERATIONS | {"repo_create"}
+_GIT_OPERATION_LIST_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_./-])git(?:\.exe)?\s+"
+    r"(?P<operations>(?:init|add|commit|push)(?![A-Za-z0-9_.-])"
+    r"(?:\s*(?:/|,|，|、|\+|和|及|与|and(?:\s+then)?|then)\s*"
+    r"(?:git(?:\.exe)?\s+)?(?:init|add|commit|push)(?![A-Za-z0-9_.-]))*)"
+)
+_CHINESE_GIT_OPERATION_LIST_RE = re.compile(
+    r"(?i)(?:^|(?:执行|运行|进行|批准|授权|允许|同意|确认|随后|然后|以及|同时|并)\s*)"
+    r"(?:git\s*)?"
+    r"(?P<operations>(?:初始化|暂存|提交|推送)"
+    r"(?:\s*(?:/|,|，|、|\+|和|及|与)\s*(?:初始化|暂存|提交|推送))*)"
+    r"(?=$|\s|[。；])"
+)
+_CHINESE_GIT_OPERATION_MAP = {
+    "初始化": "init",
+    "暂存": "add",
+    "提交": "commit",
+    "推送": "push",
+}
+_NEGATED_GIT_OPERATION_RE = re.compile(
+    r"(?i)(?:不要|别|禁止|不许|不得|无需|不用|do\s+not|don't|never).{0,24}?"
+    r"(?P<operation>init|add|commit|push|初始化|暂存|提交|推送|创建(?:仓库|repo(?:sitory)?)?)"
+)
 _PENDING_COMMAND_REFERENCE_RE = re.compile(r"上述|上面|刚才|前述|该命令|这个命令|previous\s+command", re.IGNORECASE)
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(/[^\s，。；;`\"']+)")
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
@@ -230,7 +267,25 @@ _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"\"(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^\"\r\n]+\""
     r"|(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^\s，。；;`\"']+)"
 )
+_QUOTED_ABSOLUTE_PATH_RE = re.compile(
+    r"(?i)(?P<quote>[\"'`])(?P<path>"
+    r"/[^\n\r]*?"
+    r"|(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^\n\r]*?"
+    r")(?P=quote)"
+)
 _CURRENT_REPO_RE = re.compile(r"当前(?:仓库|repo)|这个(?:仓库|repo)|current\s+(?:repository|repo)", re.IGNORECASE)
+_GITHUB_OWNER_CONTEXT_RE = re.compile(
+    r"(?i)(?:在|under)\s+(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9.-]{0,37}[A-Za-z0-9])?)\s*"
+    r"(?:下|账户|账号|account|owner)"
+)
+_GITHUB_CREATE_COMMAND_RE = re.compile(
+    r"(?i)\bgh(?:\.exe)?\s+repo\s+create\s+"
+    r"(?P<target>[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9][A-Za-z0-9._-]*)"
+)
+_GITHUB_CREATE_INTENT_RE = re.compile(
+    r"(?i)(?:创建|create).{0,240}(?:private\s+(?:repo|repository)|私有仓库)"
+)
+_GITHUB_REPO_NAME_RE = re.compile(r"(?i)\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b")
 _CURRENT_EXPANSION_RE = re.compile(
     r"(?i)(?:开|开启|启动|使用|派|创建)\s*(?:到|共|最多)?\s*(?:[4-9]|[1-9]\d+)\s*个?\s*(?:子\s*)?agent"
 )
@@ -243,10 +298,28 @@ _NESTED_AUTH_RE = re.compile(
 _EXPANSION_NEGATED_RE = re.compile(
     r"(?i)(?:不要|别|禁止|不许|无需|不用).{0,6}(?:开|开启|启动|使用|派|创建).{0,16}(?:子\s*)?agent"
 )
-_CONTINUATION_RE = re.compile(r"(?i)^\s*(?:继续|接着|沿用|按刚才|按上面|然后呢|go\s+on|continue|proceed)\b")
 _SHELL_CONTROL_RE = re.compile(r"[;&|<>]|\$\(|\x60")
 _WINDOWS_ENV_EXPANSION_RE = re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%|![A-Za-z_][A-Za-z0-9_]*!")
-_AUTH_SEGMENT_SPLIT_RE = re.compile(r"[，。；！？\n\r]+")
+_WINDOWS_INLINE_GIT_GLOBAL_VALUE_RE = re.compile(
+    r"(?i)(?<!\S)(?P<option>--(?:config-env|git-dir|work-tree|namespace|exec-path))="
+    r"(?P<quote>['\"])(?P<value>[^'\"\r\n]*)(?P=quote)(?=\s|$)"
+)
+_AUTH_SEGMENT_SPLIT_RE = re.compile(r"[，。；！？、\n\r]+")
+_AUTH_GIT_CONTINUATION_RE = re.compile(
+    r"(?i)^\s*(?:(?:并(?:且)?|随后|然后|以及|同时|and(?:\s+then)?|then)\s*)?"
+    r"(?!.*(?:文档|示例|日志|报告|说明|教程|文本|"
+    r"(?<![A-Za-z0-9_-])(?:documentation|example|log|report)(?![A-Za-z0-9_-])))"
+    r"(?:在\s+.{0,300}?\s*)?"
+    r"(?:执行|运行|创建|推送|初始化|暂存|提交|git\b|gh\b|push\b|create\b)"
+)
+_NEGATED_AUTH_COMMENT_RE = re.compile(
+    r"(?i)^\s*#.*(?:不要|禁止|别|不许|不得|do\s+not|don't|never)"
+)
+_COMMAND_NEGATION_RE = re.compile(
+    r"(?i)(?:不要|别|禁止|不许|不得|无需|不用|do\s+not|don't|never).{0,32}"
+    r"(?:git|gh|rm|sudo|python3?|node|bash|sh|zsh)\b"
+)
+_PENDING_GIT_TTL_SECONDS = 600
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SENSITIVE_ENV_NAMES = {
     "BASH_ENV",
@@ -368,9 +441,52 @@ _GIT_GLOBAL_FLAGS = {
     "--noglob-pathspecs",
     "--icase-pathspecs",
 }
-_GIT_GLOBAL_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+_GIT_GLOBAL_VALUE_FLAGS = {
+    "-C",
+    "-c",
+    "--config-env",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+}
 _GIT_SCOPE_FLAGS = {"--git-dir", "--work-tree", "--namespace"}
 _GIT_NETWORK_SUBCOMMANDS = {"push", "pull", "fetch", "clone"}
+_EXACT_PUSH_BOOLEAN_OPTIONS = frozenset(
+    "--atomic --dry-run --force --force-if-includes --force-with-lease --ipv4 "
+    "--ipv6 --no-atomic --no-force-if-includes --no-progress --no-signed "
+    "--no-thin --no-verify --porcelain --progress --quiet --set-upstream "
+    "--signed --thin --verbose --verify".split()
+)
+_EXACT_PUSH_VALUE_OPTIONS = frozenset({"-o", "--push-option"})
+_EXACT_PUSH_VALUE_PREFIXES = tuple(
+    option + "=" for option in _EXACT_PUSH_VALUE_OPTIONS if option.startswith("--")
+)
+_EXACT_PUSH_OPTIONAL_VALUE_PREFIXES = (
+    "--force-with-lease=",
+    "--signed=",
+)
+_TRUSTED_EXEC_COMMAND_SHELLS = {"/bin/bash", "/bin/sh", "/bin/zsh"}
+_TRUSTED_WINDOWS_EXEC_COMMAND_SHELLS = {"bash", "cmd", "powershell", "pwsh", "sh"}
+_EXEC_COMMAND_ALLOWED_FIELDS = frozenset(
+    "cmd command justification login max_output_tokens sandbox_permissions shell tty "
+    "workdir yield_time_ms".split()
+)
+_CONSTRAINED_CLONE_BOOLEAN_OPTIONS = frozenset(
+    "--no-checkout --no-tags --progress --quiet --single-branch".split()
+)
+_CONSTRAINED_CLONE_SENSITIVE_COMPONENTS = frozenset(
+    ".aws|.codex|.config|.git|.gnupg|.kube|.local|.ssh|$recycle.bin|program files|"
+    "program files (x86)|programdata|system volume information|windows".split("|")
+)
+_CONSTRAINED_CLONE_POSIX_SYSTEM_ROOTS = tuple(
+    "/Applications /Library /System /bin /cores /dev /etc /opt /private/etc "
+    "/private/var/audit /private/var/backups /private/var/db /private/var/log "
+    "/private/var/networkd /private/var/protected /private/var/root /private/var/run "
+    "/private/var/vm /proc /sbin /usr".split()
+)
+_CONSTRAINED_CLONE_POSIX_BROAD_ROOTS = {"/", "/Users", "/private", "/private/var"}
+_CONSTRAINED_CLONE_DESTINATION_META = frozenset("*?[]{}()!")
 _PACKAGE_VALUE_OPTIONS = {
     "--prefix",
     "--workspace",
@@ -445,6 +561,7 @@ _COMMAND_EXECUTABLES = {
     "flatpak",
     "ftp",
     "gcloud",
+    "gh",
     "gsutil",
     "git",
     "icacls",
@@ -584,6 +701,131 @@ def _strip_token_quotes(token: str) -> str:
     if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
         return token[1:-1]
     return token
+
+
+def _executable_name(token: str) -> str:
+    executable = ntpath.basename(_strip_token_quotes(token).replace("/", "\\")).casefold()
+    for suffix in (".exe", ".cmd", ".bat", ".com", ".ps1"):
+        if executable.endswith(suffix):
+            executable = executable[: -len(suffix)]
+            break
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+        return "python"
+    if re.fullmatch(r"pythonw(?:\d+(?:\.\d+)*)?", executable):
+        return "pythonw"
+    if re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", executable):
+        return "pip"
+    return executable
+
+
+def _trusted_executable_token(token: str, expected: str) -> bool:
+    raw = _strip_token_quotes(token)
+    if _executable_name(raw) != expected.casefold():
+        return False
+    resolved = shutil.which(raw) if not any(separator in raw for separator in ("/", "\\")) else (
+        shutil.which(expected) or (shutil.which(f"{expected}.exe") if os.name == "nt" else None)
+    )
+    if not resolved:
+        return False
+    if any(separator in raw for separator in ("/", "\\")) and not os.path.isabs(raw):
+        return False
+    candidate = resolved if not any(separator in raw for separator in ("/", "\\")) else raw
+    return bool(
+        os.path.normcase(os.path.realpath(candidate))
+        == os.path.normcase(os.path.realpath(resolved))
+    )
+
+
+def _trusted_exec_command_shell(shell: str) -> bool:
+    if shell in _TRUSTED_EXEC_COMMAND_SHELLS:
+        return True
+    if os.name != "nt" or _executable_name(shell) not in _TRUSTED_WINDOWS_EXEC_COMMAND_SHELLS:
+        return False
+    if not any(separator in shell for separator in ("/", "\\")):
+        return True
+    resolved = shutil.which(_executable_name(shell)) or shutil.which(
+        f"{_executable_name(shell)}.exe"
+    )
+    return bool(
+        resolved
+        and os.path.normcase(os.path.realpath(shell))
+        == os.path.normcase(os.path.realpath(resolved))
+    )
+
+
+def _tool_family(tool_name: str) -> str:
+    lowered = tool_name.casefold()
+    if lowered == "bash":
+        return "bash"
+    if lowered == "exec_command" or lowered.endswith("__exec_command"):
+        return "exec_command"
+    return lowered
+
+
+def _is_exec_command_tool(tool_name: str) -> bool:
+    lowered = tool_name.casefold()
+    return lowered == "exec_command" or lowered.endswith("__exec_command")
+
+
+def _exec_command_validation_error(tool_name: str, tool_input: Any) -> str:
+    if not _is_exec_command_tool(tool_name):
+        return ""
+    if not isinstance(tool_input, dict):
+        return "exec_command input must be an object"
+    if "prefix_rule" in tool_input:
+        return "exec_command prefix_rule is not accepted by the hook"
+    unknown = sorted(set(tool_input) - _EXEC_COMMAND_ALLOWED_FIELDS)
+    if unknown:
+        return "exec_command contains unknown fields: " + ", ".join(unknown)
+    command_fields = [key for key in ("cmd", "command") if key in tool_input]
+    if len(command_fields) != 1 or not isinstance(tool_input.get(command_fields[0]), str):
+        return "exec_command requires exactly one string command field"
+    if "shell" in tool_input:
+        shell = tool_input.get("shell")
+        if not isinstance(shell, str) or not _trusted_exec_command_shell(shell):
+            return "exec_command shell override is not trusted"
+    if "login" in tool_input and not isinstance(tool_input.get("login"), bool):
+        return "exec_command login must be boolean"
+    if "tty" in tool_input and not isinstance(tool_input.get("tty"), bool):
+        return "exec_command tty must be boolean"
+    if "workdir" in tool_input and (
+        not isinstance(tool_input.get("workdir"), str) or not tool_input.get("workdir")
+    ):
+        return "exec_command workdir must be a nonempty string"
+    if "justification" in tool_input and not isinstance(tool_input.get("justification"), str):
+        return "exec_command justification must be a string"
+    for key in ("max_output_tokens", "yield_time_ms"):
+        if key in tool_input and (
+            not isinstance(tool_input.get(key), int)
+            or isinstance(tool_input.get(key), bool)
+            or int(tool_input[key]) < 0
+        ):
+            return f"exec_command {key} must be a nonnegative integer"
+    sandbox = tool_input.get("sandbox_permissions", "use_default")
+    if sandbox not in {"use_default", "require_escalated"}:
+        return "exec_command sandbox_permissions is invalid"
+    return ""
+
+
+def _execution_options_digest(tool_name: str, tool_input: Any) -> str:
+    if not _is_exec_command_tool(tool_name):
+        return hashlib.sha256(b"{}").hexdigest()
+    if not isinstance(tool_input, dict):
+        return ""
+    options = {
+        "login_present": "login" in tool_input,
+        "login": tool_input.get("login", True),
+        "sandbox_permissions_present": "sandbox_permissions" in tool_input,
+        "sandbox_permissions": tool_input.get("sandbox_permissions", "use_default"),
+        "shell_present": "shell" in tool_input,
+        "shell": tool_input.get("shell") or "",
+        "tty_present": "tty" in tool_input,
+        "tty": tool_input.get("tty", False),
+        "workdir_present": "workdir" in tool_input,
+        "workdir": _normalized_cwd(str(tool_input.get("workdir") or ".")),
+    }
+    encoded = json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _is_literal_powershell_script_target(token: str) -> bool:
@@ -729,7 +971,20 @@ def _powershell_launcher_findings(args: list[str], *, depth: int) -> list[dict[s
 def _shell_tokens(command: str) -> list[str]:
     try:
         windows_style = _looks_like_windows_command(command)
-        lexer = shlex.shlex(command, posix=not windows_style, punctuation_chars=";&|<>")
+        token_source = (
+            _WINDOWS_INLINE_GIT_GLOBAL_VALUE_RE.sub(
+                lambda match: (
+                    f"{match.group('quote')}{match.group('option')}="
+                    f"{match.group('value')}{match.group('quote')}"
+                ),
+                command,
+            )
+            if windows_style
+            else command
+        )
+        lexer = shlex.shlex(
+            token_source, posix=not windows_style, punctuation_chars=";&|<>"
+        )
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
@@ -780,6 +1035,28 @@ def _has_shell_indirection(command: str) -> bool:
         ):
             return True
         if char == "$" and (next_char in {"(", "{"} or next_char.isalnum() or next_char in "_@*#?$!-"):
+            return True
+    return False
+
+
+def _has_unquoted_shell_comment(command: str) -> bool:
+    quote = ""
+    escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'" and not _looks_like_windows_command(command):
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == "#" and (index == 0 or command[index - 1].isspace()):
             return True
     return False
 
@@ -839,17 +1116,7 @@ def _unwrap_command(tokens: list[str]) -> tuple[str, list[str], set[str]]:
                 wrappers.add("sensitive_environment")
             remaining = remaining[1:]
             continue
-        executable = ntpath.basename(remaining[0].replace("/", "\\")).casefold()
-        for suffix in (".exe", ".cmd", ".bat", ".com", ".ps1"):
-            if executable.endswith(suffix):
-                executable = executable[: -len(suffix)]
-                break
-        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
-            executable = "python"
-        elif re.fullmatch(r"pythonw(?:\d+(?:\.\d+)*)?", executable):
-            executable = "pythonw"
-        elif re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", executable):
-            executable = "pip"
+        executable = _executable_name(remaining[0])
         if executable == "env":
             wrappers.add(executable)
             remaining = remaining[1:]
@@ -943,10 +1210,15 @@ def _git_command(args: list[str]) -> tuple[str, list[str], bool]:
             index += 1
             continue
         if token in _GIT_GLOBAL_VALUE_FLAGS:
-            dynamic_config = dynamic_config or token == "-c"
+            dynamic_config = dynamic_config or token in {"-c", "--config-env"}
             index += 2
             continue
-        if any(token.startswith(prefix + "=") for prefix in _GIT_GLOBAL_VALUE_FLAGS if prefix.startswith("--")):
+        if any(
+            token.startswith(prefix + "=")
+            for prefix in _GIT_GLOBAL_VALUE_FLAGS
+            if prefix.startswith("--")
+        ):
+            dynamic_config = dynamic_config or token.startswith("--config-env=")
             index += 1
             continue
         if token.startswith("-c") and token != "-C":
@@ -1146,6 +1418,16 @@ def _segment_findings(tokens: list[str], depth: int = 0) -> list[dict[str, str]]
             if force and destructive:
                 findings.append(_finding("git_clean_force"))
 
+    if executable == "gh" and len(args) >= 2:
+        if args[:2] == ["repo", "create"]:
+            findings.append(_finding("github_network", "medium"))
+            findings.append(_finding("github_repo_create", "medium"))
+            if "--public" in args or "--internal" in args:
+                findings.append(_finding("github_non_private_repo", "high"))
+        elif args[:2] == ["repo", "clone"]:
+            findings.append(_finding("github_network", "medium"))
+            findings.append(_finding("git_non_read_only", "medium"))
+
     eval_flags = _INTERPRETER_EVAL_FLAGS.get(executable, set())
     if eval_flags and (
         not args
@@ -1299,6 +1581,146 @@ def _fallback_scan_text(text: str) -> list[dict[str, str]]:
     ]
 
 
+def _python_source_path(value: str, cwd: str) -> Path | None:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    try:
+        info = path.lstat()
+        if (
+            path.is_symlink()
+            or _is_reparse_info(info)
+            or path.suffix.casefold() not in _PYTHON_SOURCE_SUFFIXES
+            or not stat.S_ISREG(info.st_mode)
+        ):
+            return None
+        return path.resolve(strict=True)
+    except OSError:
+        return None
+
+
+def _source_reader_operands(executable: str, args: list[str]) -> list[str] | None:
+    if executable == "nl":
+        operands = args[1:] if args[:1] == ["-ba"] else args
+        return operands if len(operands) == 1 and not operands[0].startswith("-") else None
+    if executable in {"sed", "rg"}:
+        flags = {"-n", "--quiet", "--silent"} if executable == "sed" else {"-n", "--line-number"}
+        operands = args[1:] if args[:1] and args[0] in flags else args
+        return operands[1:] if len(operands) == 2 and not operands[0].startswith("-") else None
+    return None
+
+
+def _local_python_source_read_path(event: dict[str, Any]) -> Path | None:
+    tool_name = str(event.get("tool_name") or "")
+    tool_input = event.get("tool_input") or {}
+    cwd = (
+        str(tool_input.get("workdir") or event.get("cwd") or ".")
+        if isinstance(tool_input, dict)
+        else str(event.get("cwd") or ".")
+    )
+    if tool_name == "Read" and isinstance(tool_input, dict):
+        path = str(tool_input.get("file_path") or tool_input.get("path") or "")
+        return _python_source_path(path, cwd) if path else None
+    if _tool_family(tool_name) not in {"bash", "exec_command"} or not isinstance(tool_input, dict):
+        return None
+    command = str(tool_input.get("command") or tool_input.get("cmd") or "")
+    commands, operators = _split_shell_commands(
+        _shell_tokens(command), windows_style=_looks_like_windows_command(command)
+    )
+    if len(commands) != 1 or operators:
+        return None
+    executable, args, wrappers = _unwrap_command(commands[0])
+    if wrappers or executable not in _LOCAL_SOURCE_READ_EXECUTABLES:
+        return None
+    operands = _source_reader_operands(executable, args)
+    if operands is None or len(operands) != 1:
+        return None
+    return _python_source_path(operands[0], cwd)
+
+
+def _python_callable_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _python_callable_name(node.value)
+        return f"{parent}.{node.attr}" if parent else ""
+    return ""
+
+
+def _source_contains_call_line(source_path: Path, source_line: str) -> bool:
+    try:
+        with source_path.open("r", encoding="utf-8", errors="replace") as handle:
+            return any(source_line in line for line in handle)
+    except OSError:
+        return False
+
+
+def _credential_assignment_is_code_call(
+    text: str,
+    match: re.Match[str],
+    source_path: Path,
+) -> bool:
+    detail = _CREDENTIAL_ASSIGNMENT_DETAIL_RE.search(match.group(0))
+    if (
+        not detail
+        or detail.group("separator") != "="
+        or detail.group("quote")
+        or not detail.group("label").islower()
+    ):
+        return False
+    value = detail.group("value")
+    callable_identifier = re.fullmatch(
+        r"_?[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?:\._?[a-z][a-z0-9]*(?:_[a-z0-9]+)+)*",
+        value,
+    )
+    tail = text[match.end() : match.end() + 16]
+    if not callable_identifier or not re.match(r"[ \t]*\(", tail):
+        return False
+    line_end = text.find("\n", match.end())
+    source_line = text[match.start() : len(text) if line_end < 0 else line_end].strip()
+    if not _source_contains_call_line(source_path, source_line):
+        return False
+    try:
+        parsed = ast.parse(source_line)
+    except SyntaxError:
+        return False
+    for statement in parsed.body:
+        if not isinstance(statement, ast.Assign) or not isinstance(statement.value, ast.Call):
+            continue
+        if any(
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, (str, bytes))
+            and len(node.value) >= 16
+            for node in ast.walk(statement.value)
+        ):
+            continue
+        targets = [target.id for target in statement.targets if isinstance(target, ast.Name)]
+        if detail.group("label") in targets and _python_callable_name(statement.value.func) == value:
+            return True
+    return False
+
+
+def _scan_tool_output(
+    event: dict[str, Any], text: str, *, source: str
+) -> list[dict[str, str]]:
+    """Suppress generic assignment noise only for AST-proven local Python call sites."""
+    source_path = _local_python_source_read_path(event)
+    if source_path is None:
+        return _scan_text(text, source=source)
+    generic_pattern = dict(_SECRET_PATTERNS)["credential_assignment"]
+
+    def mask_code_call(match: re.Match[str]) -> str:
+        if not _credential_assignment_is_code_call(text, match, source_path):
+            return match.group(0)
+        detail = _CREDENTIAL_ASSIGNMENT_DETAIL_RE.search(match.group(0))
+        if detail is None:
+            return match.group(0)
+        start, end = detail.span("label")
+        return match.group(0)[:start] + (" " * (end - start)) + match.group(0)[end:]
+
+    return _scan_text(generic_pattern.sub(mask_code_call, text), source=source)
+
+
 def _fallback_scan_command(command: str) -> list[dict[str, str]]:
     findings = _fallback_scan_text(command)
     findings.extend(_structured_command_findings(command))
@@ -1381,6 +1803,8 @@ def _empty_policy() -> dict[str, Any]:
         "durable_markers": [],
         "enable_natural_language_approvals": False,
         "enable_sensitive_disclosure_approvals": False,
+        "enable_scoped_git_transactions": False,
+        "enable_constrained_github_clone": False,
     }
 
 
@@ -1413,6 +1837,8 @@ def _policy() -> dict[str, Any]:
         "durable_markers": _policy_values(raw, "durable_destination_markers"),
         "enable_natural_language_approvals": raw.get("enable_natural_language_approvals") is True,
         "enable_sensitive_disclosure_approvals": raw.get("enable_sensitive_disclosure_approvals") is True,
+        "enable_scoped_git_transactions": raw.get("enable_scoped_git_transactions") is True,
+        "enable_constrained_github_clone": raw.get("enable_constrained_github_clone") is True,
     }
 
 
@@ -1516,7 +1942,7 @@ def _load_state_file(path: Path, session_id: str) -> dict[str, Any]:
         or isinstance(updated_at, bool)
     ):
         raise RuntimeError("state file metadata is invalid")
-    if schema_version not in {1, STATE_SCHEMA_VERSION}:
+    if schema_version not in {1, 2, STATE_SCHEMA_VERSION}:
         raise RuntimeError("state file schema is unsupported")
     if updated_at <= 0:
         raise RuntimeError("state file timestamp is invalid")
@@ -1573,6 +1999,14 @@ def _validate_state_fields(state: dict[str, Any]) -> None:
     ):
         raise RuntimeError("state field has invalid type: pending_permission_authorizations")
 
+    for key in ("pending_constrained_clones", "untrusted_clone_roots"):
+        records = state.get(key, {})
+        if not isinstance(records, dict) or not all(
+            isinstance(record_id, str) and isinstance(metadata, dict)
+            for record_id, metadata in records.items()
+        ):
+            raise RuntimeError(f"state field has invalid type: {key}")
+
     for key in ("sensitive_disclosure_grant", "local_git_grant", "pending_local_git"):
         if key in state and state[key] is not None and not isinstance(state[key], dict):
             raise RuntimeError(f"state field has invalid type: {key}")
@@ -1597,6 +2031,8 @@ def _default_state(session_id: str) -> dict[str, Any]:
         "pending_permission_authorizations": {},
         "local_git_grant": None,
         "pending_local_git": None,
+        "pending_constrained_clones": {},
+        "untrusted_clone_roots": {},
         "compaction_count": 0,
         "updated_at": int(time.time()),
     }
@@ -1756,15 +2192,44 @@ def _dangerous_codes(findings: list[dict[str, str]]) -> set[str]:
 
 
 def _command_hash(command: str, cwd: str) -> str:
+    if _has_unquoted_shell_comment(command):
+        return ""
     tokens = _shell_tokens(command)
     if not tokens:
         return ""
     normalized_cwd = _normalized_cwd(cwd)
     executable, args, wrappers = _unwrap_command(tokens)
-    if executable == "git" and not wrappers:
-        normalized_cwd, args = _git_scope_and_args(args, normalized_cwd)
-        tokens = ["git", *args]
     canonical = normalized_cwd + "\0" + "\0".join(tokens)
+    if executable == "git":
+        scope, canonical_args = _git_scope_and_args(args, normalized_cwd)
+        subcommand, git_args, dynamic_config = _git_command(canonical_args)
+        if subcommand == "push":
+            if wrappers or dynamic_config or not _trusted_executable_token(tokens[0], "git"):
+                return ""
+            push_remote = _exact_push_remote(git_args)
+            if push_remote is None:
+                return ""
+            _, exact_git_args, _ = _git_command(args)
+            global_arg_count = len(args) - len(exact_git_args) - 1
+            if global_arg_count < 0:
+                return ""
+            exact_global_args = [
+                _normalize_git_global_arg(token)
+                for token in args[:global_arg_count]
+            ]
+            if any(
+                token == "--exec-path" or token.startswith("--exec-path=")
+                for token in exact_global_args
+            ):
+                return ""
+            remote_identities = _git_remote_identities(
+                normalized_cwd,
+                push_remote,
+                exact_global_args=exact_global_args,
+            )
+            if len(remote_identities) != 1:
+                return ""
+            canonical += "\0push-target\0" + remote_identities[0]
     return hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -1773,8 +2238,22 @@ def _normalized_cwd(cwd: str) -> str:
     return os.path.normcase(resolved)
 
 
-def _scope_hash(cwd: str) -> str:
-    return hashlib.sha256(_normalized_cwd(cwd).encode("utf-8", errors="replace")).hexdigest()
+def _git_repo_root(cwd: str) -> str:
+    normalized = Path(_normalized_cwd(cwd))
+    start = normalized.parent if normalized.is_file() else normalized
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return _normalized_cwd(str(candidate))
+    return _normalized_cwd(str(start))
+
+
+def _scope_identity(cwd: str, *, exact: bool = False) -> str:
+    return _normalized_cwd(cwd) if exact else _git_repo_root(cwd)
+
+
+def _scope_hash(cwd: str, *, exact: bool = False) -> str:
+    identity = _scope_identity(cwd, exact=exact)
+    return hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _git_scope_and_args(args: list[str], cwd: str) -> tuple[str, list[str]]:
@@ -1809,22 +2288,705 @@ def _git_scope_and_args(args: list[str], cwd: str) -> tuple[str, list[str]]:
     return scope, canonical
 
 
-def _ordinary_local_git_candidate(command: str, cwd: str, dangerous: set[str]) -> dict[str, Any] | None:
-    if dangerous != {"git_non_read_only"} or _SHELL_CONTROL_RE.search(command) or _has_shell_indirection(command):
+def _normalize_git_global_arg(token: str) -> str:
+    for option in _GIT_GLOBAL_VALUE_FLAGS:
+        if not option.startswith("--"):
+            continue
+        prefix = option + "="
+        if not token.startswith(prefix):
+            continue
+        value = token[len(prefix) :]
+        return prefix + _strip_token_quotes(value)
+    return token
+
+
+def _safe_branch_name(refspec: str) -> str:
+    if refspec.startswith("refs/") and not refspec.startswith("refs/heads/"):
+        return ""
+    branch = refspec.removeprefix("refs/heads/")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch):
+        return ""
+    if any(item in branch for item in ("..", "//", "@{", "\\", "~", "^", ":", "?", "*", "[")):
+        return ""
+    if branch.endswith(("/", ".", ".lock")):
+        return ""
+    return branch
+
+
+def _safe_clone_branch(refspec: str) -> str:
+    branch = _safe_branch_name(refspec)
+    if not branch:
+        return ""
+    components = branch.split("/")
+    if any(component.startswith(".") or component.endswith(".lock") for component in components):
+        return ""
+    return branch
+
+
+def _github_https_clone_target(source: str) -> str:
+    if (
+        not source
+        or not source.isascii()
+        or "%" in source
+        or "\\" in source
+        or any(ord(char) < 0x21 or ord(char) == 0x7F for char in source)
+    ):
+        return ""
+    try:
+        parsed = urlsplit(source)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.netloc.casefold() != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return ""
+    path_parts = parsed.path.split("/")
+    if len(path_parts) != 3 or path_parts[0]:
+        return ""
+    owner, repo = path_parts[1:]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    owner_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+    repo_pattern = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+    if not re.fullmatch(owner_pattern, owner) or not re.fullmatch(repo_pattern, repo):
+        return ""
+    return f"{owner}/{repo}"
+
+
+def _path_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((path, root)) == root
+    except ValueError:
+        return False
+
+
+def _clone_path_has_sensitive_component(path: str) -> bool:
+    return any(
+        part.casefold() in _CONSTRAINED_CLONE_SENSITIVE_COMPONENTS
+        for part in Path(path).parts
+    )
+
+
+def _clone_path_is_system_sensitive(path: str) -> bool:
+    normalized = _normalized_cwd(path)
+    if os.name == "nt":
+        anchor = _normalized_cwd(str(Path(normalized).anchor))
+        return normalized == anchor or _clone_path_has_sensitive_component(normalized)
+    broad_roots = {_normalized_cwd(item) for item in _CONSTRAINED_CLONE_POSIX_BROAD_ROOTS}
+    system_roots = tuple(_normalized_cwd(item) for item in _CONSTRAINED_CLONE_POSIX_SYSTEM_ROOTS)
+    return normalized in broad_roots or any(
+        normalized == root or _path_within(normalized, root) for root in system_roots
+    )
+
+
+def _clone_workspace_root(cwd: str) -> str:
+    root = _normalized_cwd(cwd)
+    if not os.path.isdir(root) or _clone_path_has_sensitive_component(root):
+        return ""
+    try:
+        info = Path(root).lstat()
+    except OSError:
+        return ""
+    if Path(root).is_symlink() or _is_reparse_info(info):
+        return ""
+    home = _normalized_cwd(str(Path.home()))
+    if root == home or _clone_path_is_system_sensitive(root):
+        return ""
+    return root
+
+
+def _clone_destination_allowed(destination: str, workspace_cwd: str) -> bool:
+    if (
+        not destination
+        or not os.path.isabs(destination)
+        or "\x00" in destination
+        or any(char in _CONSTRAINED_CLONE_DESTINATION_META for char in destination)
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in destination)
+    ):
+        return False
+    lexical_parts = Path(destination).parts
+    if any(part in {".", ".."} for part in lexical_parts):
+        return False
+    if _clone_path_has_sensitive_component(destination) or os.path.lexists(destination):
+        return False
+
+    lexical_parent = Path(os.path.abspath(os.path.expanduser(destination))).parent
+    while not os.path.lexists(lexical_parent):
+        if lexical_parent.parent == lexical_parent:
+            return False
+        lexical_parent = lexical_parent.parent
+    try:
+        lexical_info = lexical_parent.lstat()
+    except OSError:
+        return False
+    if lexical_parent.is_symlink() or _is_reparse_info(lexical_info):
+        return False
+
+    resolved = _normalized_cwd(destination)
+    if _clone_path_has_sensitive_component(resolved) or _clone_path_is_system_sensitive(resolved):
+        return False
+    workspace_root = _clone_workspace_root(workspace_cwd)
+    if not workspace_root or resolved == workspace_root or not _path_within(
+        resolved, workspace_root
+    ):
+        return False
+    return (
+        lexical_parent.is_dir()
+        and stat.S_ISDIR(lexical_info.st_mode)
+        and os.access(lexical_parent, os.W_OK | os.X_OK)
+    )
+
+
+def _constrained_github_clone_candidate(
+    command: str,
+    *,
+    effective_cwd: str,
+    workspace_cwd: str,
+) -> dict[str, str] | None:
+    workspace_root = _clone_workspace_root(workspace_cwd)
+    normalized_effective_cwd = _normalized_cwd(effective_cwd)
+    if (
+        not workspace_root
+        or not (
+            normalized_effective_cwd == workspace_root
+            or _path_within(normalized_effective_cwd, workspace_root)
+        )
+        or not command.strip()
+        or "$" in command
+        or _SHELL_CONTROL_RE.search(command)
+        or _has_shell_indirection(command)
+        or _has_unquoted_shell_comment(command)
+    ):
+        return None
+    tokens = _shell_tokens(command)
+    if not tokens or any(token in _CONTROL_TOKENS for token in tokens):
+        return None
+    executable, args, wrappers = _unwrap_command(tokens)
+    if (
+        executable != "git"
+        or wrappers
+        or not _trusted_executable_token(tokens[0], "git")
+        or not args
+        or args[0] != "clone"
+    ):
+        return None
+
+    clone_args = args[1:]
+    seen_options: set[str] = set()
+    index = 0
+    while index < len(clone_args):
+        token = clone_args[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-"):
+            break
+        if token in _CONSTRAINED_CLONE_BOOLEAN_OPTIONS:
+            option = token
+            value = ""
+            index += 1
+        elif token in {"--depth", "--branch"}:
+            option = token
+            if index + 1 >= len(clone_args):
+                return None
+            value = clone_args[index + 1]
+            index += 2
+        elif token.startswith("--depth=") or token.startswith("--branch="):
+            option, value = token.split("=", 1)
+            index += 1
+        else:
+            return None
+        if option in seen_options:
+            return None
+        seen_options.add(option)
+        if option == "--depth" and value != "1":
+            return None
+        if option == "--branch" and not _safe_clone_branch(value):
+            return None
+
+    positionals = clone_args[index:]
+    if not {"--depth", "--no-checkout"}.issubset(seen_options) or len(positionals) != 2:
+        return None
+    source, destination = positionals
+    target = _github_https_clone_target(source)
+    if not target or not _clone_destination_allowed(destination, workspace_cwd):
+        return None
+    return {
+        "source": source,
+        "target": target,
+        "destination": _normalized_cwd(destination),
+    }
+
+
+def _clone_reservation_metadata(
+    candidate: dict[str, str],
+    *,
+    session_hash: str,
+    turn_id: str,
+    tool_name: str,
+    tool_use_id: str,
+    digest: str,
+    base_event_cwd: str,
+    effective_cwd: str,
+    execution_options_digest: str,
+) -> dict[str, Any]:
+    return {
+        **candidate,
+        "session_hash": session_hash,
+        "turn_id": turn_id,
+        "tool_name": tool_name,
+        "tool_use_id": tool_use_id,
+        "digest": digest,
+        "base_event_cwd": _normalized_cwd(base_event_cwd),
+        "effective_cwd": _normalized_cwd(effective_cwd),
+        "execution_options_digest": execution_options_digest,
+    }
+
+
+def _clone_reservation_matches(record: Any, expected: dict[str, Any]) -> bool:
+    return bool(
+        isinstance(record, dict)
+        and set(record) == set(expected) | {"created_at"}
+        and all(record.get(key) == value for key, value in expected.items())
+    )
+
+
+def _reserve_clone(state: dict[str, Any], tool_use_id: str, metadata: dict[str, Any]) -> bool:
+    pending = state.get("pending_constrained_clones")
+    if not isinstance(pending, dict):
+        pending = {}
+    existing = pending.get(tool_use_id)
+    if existing is not None:
+        return _clone_reservation_matches(existing, metadata)
+    pending[tool_use_id] = {**metadata, "created_at": time.time()}
+    state["pending_constrained_clones"] = pending
+    return True
+
+
+def _contains_clone_invocation(command: str, *, depth: int = 0) -> bool:
+    tokens = _shell_tokens(command)
+    commands, _ = _split_shell_commands(
+        tokens, windows_style=_looks_like_windows_command(command)
+    )
+    for segment in commands:
+        executable, args, _ = _unwrap_command(segment)
+        if executable == "git":
+            _, args = _git_scope_and_args(args, ".")
+            subcommand, _, dynamic_config = _git_command(args)
+            if subcommand == "clone" or dynamic_config:
+                return True
+        if executable == "gh" and args[:2] == ["repo", "clone"]:
+            return True
+        if executable in _SHELL_EVAL and depth < 4:
+            for index, token in enumerate(args):
+                if _is_shell_eval_flag(token) and index + 1 < len(args):
+                    if _contains_clone_invocation(
+                        args[index + 1], depth=depth + 1
+                    ):
+                        return True
+                    break
+        if executable in {"powershell", "pwsh"} and depth < 4:
+            for index, token in enumerate(args):
+                name, inline_value = _powershell_option(token)
+                if name in {"c", "command"}:
+                    payload = ([inline_value] if inline_value is not None else []) + args[
+                        index + 1 :
+                    ]
+                    if payload and _contains_clone_invocation(" ".join(payload), depth=depth + 1):
+                        return True
+                    break
+        if executable == "cmd" and depth < 4:
+            for index, token in enumerate(args):
+                lowered = token.casefold()
+                if lowered in {"/c", "-c"} and index + 1 < len(args):
+                    if _contains_clone_invocation(
+                        " ".join(args[index + 1 :]), depth=depth + 1
+                    ):
+                        return True
+                    break
+    return False
+
+
+def _looks_like_git_clone(destination: str) -> bool:
+    root = Path(destination)
+    return bool(
+        root.is_dir()
+        and (
+            (root / ".git").exists()
+            or (
+                (root / "HEAD").is_file()
+                and (root / "objects").is_dir()
+                and (root / "refs").is_dir()
+            )
+        )
+    )
+
+
+def _tracked_clone_roots(state: dict[str, Any]) -> tuple[str, ...]:
+    roots = state.get("untrusted_clone_roots")
+    paths = list(roots) if isinstance(roots, dict) else []
+    pending = state.get("pending_constrained_clones")
+    if isinstance(pending, dict):
+        for item in pending.values():
+            if not isinstance(item, dict):
+                continue
+            destination = str(item.get("destination") or "")
+            if destination and _looks_like_git_clone(destination):
+                paths.append(destination)
+    return tuple(
+        _normalized_cwd(path)
+        for path in _ordered_unique(paths)
+        if isinstance(path, str) and os.path.isabs(path)
+    )
+
+
+def _command_path_candidates(command: str, cwd: str) -> tuple[str, ...]:
+    paths: list[str] = []
+    for token in _shell_tokens(command):
+        values = [token]
+        if token.startswith("-") and "=" in token:
+            values.append(token.split("=", 1)[1])
+        for value in values:
+            if (
+                not value
+                or value.startswith("-")
+                or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value)
+                or value.startswith("git@")
+                or not (
+                    os.path.isabs(value)
+                    or value.startswith((".", "~"))
+                    or "/" in value
+                    or "\\" in value
+                )
+            ):
+                continue
+            expanded = os.path.expanduser(value)
+            candidate = expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded)
+            paths.append(_normalized_cwd(candidate))
+    return tuple(_ordered_unique(paths))
+
+
+def _command_uses_untrusted_clone(command: str, cwd: str, roots: tuple[str, ...]) -> bool:
+    if not roots or _is_strictly_read_only_command(command):
+        return False
+    normalized_cwd = _normalized_cwd(cwd)
+    if any(_path_within(normalized_cwd, root) for root in roots):
+        return True
+    return any(
+        _path_within(path, root)
+        for path in _command_path_candidates(command, normalized_cwd)
+        for root in roots
+    )
+
+
+def _safe_push_target(git_args: list[str]) -> tuple[str, str] | None:
+    ignored = {"-u", "--set-upstream", "--porcelain", "-q", "--quiet", "-v", "--verbose", "--"}
+    positionals = [token for token in git_args if token not in ignored]
+    if any(token.startswith("-") for token in positionals):
+        return None
+    if len(positionals) != 2:
+        return None
+    remote, refspec = positionals
+    if remote != "origin":
+        return None
+    branch = _safe_branch_name(refspec)
+    return (remote, branch) if branch else None
+
+
+def _exact_push_remote(git_args: list[str]) -> str | None:
+    positionals: list[str] = []
+    options_done = False
+    index = 0
+    while index < len(git_args):
+        token = git_args[index]
+        if options_done:
+            positionals.append(token)
+            index += 1
+            continue
+        if token == "--":
+            options_done = True
+            index += 1
+            continue
+        if token in _EXACT_PUSH_BOOLEAN_OPTIONS:
+            index += 1
+            continue
+        if re.fullmatch(r"-[46fnquv]+", token):
+            index += 1
+            continue
+        if token.startswith("-o") and token != "-o":
+            index += 1
+            continue
+        if token in _EXACT_PUSH_VALUE_OPTIONS:
+            if index + 1 >= len(git_args):
+                return None
+            index += 2
+            continue
+        if token.startswith(_EXACT_PUSH_VALUE_PREFIXES):
+            index += 1
+            continue
+        if token.startswith(_EXACT_PUSH_OPTIONAL_VALUE_PREFIXES):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        positionals.append(token)
+        index += 1
+
+    if len(positionals) != 2:
+        return None
+    remote, refspec = positionals
+    if remote != "origin" or not _safe_branch_name(refspec):
+        return None
+    return remote
+
+
+def _github_target_from_remote(url: str) -> str:
+    patterns = (
+        r"git@github\.com:(?P<target>[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(?:\.git)?/?$",
+        r"ssh://git@github\.com/(?P<target>[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(?:\.git)?/?$",
+        r"https://github\.com/(?P<target>[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9][A-Za-z0-9._-]*)(?:\.git)?/?$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, url.strip(), re.IGNORECASE)
+        if match:
+            return match.group("target").removesuffix(".git")
+    return ""
+
+
+def _git_remote_urls(
+    scope: str,
+    remote: str,
+    *,
+    exact_global_args: list[str] | None = None,
+) -> tuple[str, ...]:
+    if not remote or remote.startswith("-"):
+        return ()
+    if exact_global_args is None:
+        command = ["git", "-C", scope, "remote", "get-url", "--push", "--all", remote]
+        run_cwd = None
+    else:
+        command = [
+            "git",
+            *exact_global_args,
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            remote,
+        ]
+        run_cwd = scope
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=run_cwd,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if completed.returncode != 0:
+        return ()
+    return tuple(
+        line.strip() for line in completed.stdout.splitlines() if line.strip()
+    )
+
+
+def _git_remote_targets(
+    scope: str,
+    remote: str,
+    *,
+    exact_global_args: list[str] | None = None,
+) -> tuple[str, ...]:
+    if remote != "origin":
+        return ()
+    urls = _git_remote_urls(
+        scope,
+        remote,
+        exact_global_args=exact_global_args,
+    )
+    targets = tuple(_github_target_from_remote(url) for url in urls)
+    return targets if targets and all(targets) else ()
+
+
+def _git_config_values(
+    scope: str,
+    key: str,
+    *,
+    exact_global_args: list[str] | None = None,
+) -> tuple[str, ...] | None:
+    if exact_global_args is None:
+        command = ["git", "-C", scope, "config", "--get-all", key]
+        run_cwd = None
+    else:
+        command = ["git", *exact_global_args, "config", "--get-all", key]
+        run_cwd = scope
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=run_cwd,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode == 1:
+        return ()
+    if completed.returncode != 0:
+        return None
+    return tuple(
+        line.strip() for line in completed.stdout.splitlines() if line.strip()
+    )
+
+
+def _safe_git_push_url(url: str) -> str:
+    value = url.strip()
+    if not value or any(character.isspace() or ord(character) < 32 for character in value):
+        return ""
+    scp_match = re.fullmatch(
+        r"[A-Za-z0-9._-]+@(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:]+\]):(?P<path>.+)",
+        value,
+    )
+    if scp_match:
+        path = scp_match.group("path")
+        return value if path and not path.startswith("-") else ""
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"https", "ssh"} or not parsed.hostname:
+        return ""
+    if parsed.query or parsed.fragment or not parsed.path or parsed.path == "/":
+        return ""
+    if parsed.password is not None:
+        return ""
+    if scheme == "https" and parsed.username is not None:
+        return ""
+    if scheme == "ssh" and parsed.username and not re.fullmatch(
+        r"[A-Za-z0-9._-]+", parsed.username
+    ):
+        return ""
+    return value
+
+
+def _git_remote_identities(
+    scope: str,
+    remote: str,
+    *,
+    exact_global_args: list[str] | None = None,
+) -> tuple[str, ...]:
+    if remote != "origin":
+        return ()
+    for key in (
+        f"remote.{remote}.vcs",
+        f"remote.{remote}.receivepack",
+    ):
+        values = _git_config_values(
+            scope,
+            key,
+            exact_global_args=exact_global_args,
+        )
+        if values is None or values:
+            return ()
+    recurse_values = _git_config_values(
+        scope,
+        "push.recurseSubmodules",
+        exact_global_args=exact_global_args,
+    )
+    if recurse_values is None or any(
+        value.casefold() not in {"0", "false", "no", "off"}
+        for value in recurse_values
+    ):
+        return ()
+    urls = _git_remote_urls(
+        scope,
+        remote,
+        exact_global_args=exact_global_args,
+    )
+    safe_urls = tuple(_safe_git_push_url(url) for url in urls)
+    if not safe_urls or not all(safe_urls):
+        return ()
+    if any(url.startswith("ssh://") or re.match(r"^[^@]+@[^:]+:", url) for url in safe_urls):
+        ssh_command = _git_config_values(
+            scope,
+            "core.sshCommand",
+            exact_global_args=exact_global_args,
+        )
+        if ssh_command is None or ssh_command or os.environ.get("GIT_SSH") or os.environ.get("GIT_SSH_COMMAND"):
+            return ()
+    return tuple(
+        hashlib.sha256(
+            ("git-push-url\0" + url).encode("utf-8", errors="replace")
+        ).hexdigest()
+        for url in safe_urls
+    )
+
+
+def _scoped_git_candidate(
+    command: str, cwd: str, dangerous: set[str]
+) -> dict[str, Any] | None:
+    if _SHELL_CONTROL_RE.search(command) or _has_shell_indirection(command):
         return None
     tokens = _shell_tokens(command)
     executable, args, wrappers = _unwrap_command(tokens)
-    if executable != "git" or wrappers:
+    if (
+        executable != "git"
+        or wrappers
+        or not tokens
+        or not _trusted_executable_token(tokens[0], "git")
+    ):
         return None
     scope, canonical_args = _git_scope_and_args(args, cwd)
-    subcommand, git_args, dynamic_config = _git_command(canonical_args)
-    if dynamic_config or subcommand not in {"add", "commit"}:
+    if "--bare" in canonical_args or any(
+        token in _GIT_SCOPE_FLAGS
+        or any(token.startswith(flag + "=") for flag in _GIT_SCOPE_FLAGS)
+        for token in canonical_args
+    ):
         return None
-    if subcommand == "add":
+    subcommand, git_args, dynamic_config = _git_command(canonical_args)
+    if dynamic_config or subcommand not in _SCOPED_GIT_OPERATIONS:
+        return None
+    branch = ""
+    push_target: tuple[str, str] | None = None
+    if subcommand == "init":
+        if dangerous != {"git_non_read_only"}:
+            return None
+        index = 0
+        while index < len(git_args):
+            token = git_args[index]
+            if token in {"-b", "--initial-branch"}:
+                if index + 1 >= len(git_args):
+                    return None
+                branch = git_args[index + 1]
+                index += 2
+                continue
+            if token.startswith("--initial-branch="):
+                branch = token.split("=", 1)[1]
+                index += 1
+                continue
+            return None
+        branch = _safe_branch_name(branch)
+        if not branch:
+            return None
+    elif subcommand == "add":
+        if dangerous != {"git_non_read_only"}:
+            return None
         pathspecs = [token for token in git_args if token != "--"]
         if not pathspecs or any(token.startswith("-") for token in pathspecs):
             return None
-    else:
+    elif subcommand == "commit":
+        if dangerous != {"git_non_read_only"}:
+            return None
         has_message = False
         index = 0
         while index < len(git_args):
@@ -1842,55 +3004,562 @@ def _ordinary_local_git_candidate(command: str, cwd: str, dangerous: set[str]) -
             return None
         if not has_message:
             return None
-    return {
+    else:
+        if dangerous != {"git_non_read_only", "git_network", "git_push"}:
+            return None
+        push_target = _safe_push_target(git_args)
+        if push_target is None:
+            return None
+    scope = _scope_identity(scope, exact=subcommand == "init")
+    candidate: dict[str, Any] = {
         "digest": _command_hash(command, cwd),
         "operation": subcommand,
-        "scope_hash": _scope_hash(scope),
+        "scope": scope,
+        "scope_hash": _scope_hash(scope, exact=True),
         "codes": sorted(dangerous),
+    }
+    if subcommand == "push" and push_target is not None:
+        candidate["remote"], candidate["refspec"] = push_target
+        candidate["remote_targets"] = list(
+            _git_remote_targets(scope, candidate["remote"])
+        )
+    elif subcommand == "init":
+        candidate["branch"] = branch
+    return candidate
+
+
+def _parse_github_create_candidate(
+    command: str, cwd: str, dangerous: set[str]
+) -> tuple[dict[str, Any], str] | None:
+    if (
+        dangerous != {"github_network", "github_repo_create"}
+        or _SHELL_CONTROL_RE.search(command)
+        or _has_shell_indirection(command)
+    ):
+        return None
+    tokens = _shell_tokens(command)
+    executable, args, wrappers = _unwrap_command(tokens)
+    if (
+        executable != "gh"
+        or wrappers
+        or not tokens
+        or len(args) < 3
+        or args[:2] != ["repo", "create"]
+    ):
+        return None
+    target = args[2]
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9.-]*/[A-Za-z0-9][A-Za-z0-9._-]*", target
+    ):
+        return None
+    source = ""
+    remote = ""
+    private = False
+    index = 3
+    while index < len(args):
+        token = args[index]
+        if token == "--private":
+            private = True
+            index += 1
+            continue
+        if token in {"--source", "--remote", "--description"}:
+            if index + 1 >= len(args):
+                return None
+            value = args[index + 1]
+            if token == "--source":
+                source = value
+            elif token == "--remote":
+                remote = value
+            index += 2
+            continue
+        if token.startswith("--source="):
+            source = token.split("=", 1)[1]
+            index += 1
+            continue
+        if token.startswith("--remote="):
+            remote = token.split("=", 1)[1]
+            index += 1
+            continue
+        if token.startswith("--description="):
+            index += 1
+            continue
+        return None
+    if not private or not source or remote != "origin":
+        return None
+    source_path = source if os.path.isabs(source) else os.path.join(cwd, source)
+    scope = _git_repo_root(source_path)
+    return (
+        {
+            "digest": _command_hash(command, cwd),
+            "operation": "repo_create",
+            "scope": scope,
+            "scope_hash": _scope_hash(scope, exact=True),
+            "codes": sorted(dangerous),
+            "target": target,
+            "visibility": "private",
+            "remote": remote,
+        },
+        tokens[0],
+    )
+
+
+def _scoped_github_create_candidate(
+    command: str, cwd: str, dangerous: set[str]
+) -> dict[str, Any] | None:
+    parsed = _parse_github_create_candidate(command, cwd, dangerous)
+    if not parsed:
+        return None
+    candidate, executable_token = parsed
+    return candidate if _trusted_executable_token(executable_token, "gh") else None
+
+
+def _prompt_github_create_candidate(
+    command: str, cwd: str, dangerous: set[str]
+) -> dict[str, Any] | None:
+    parsed = _parse_github_create_candidate(command, cwd, dangerous)
+    if not parsed:
+        return None
+    candidate, executable_token = parsed
+    raw = _strip_token_quotes(executable_token)
+    if any(separator in raw for separator in ("/", "\\")):
+        return None
+    return candidate
+
+
+def _ordered_unique(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def _authorization_clauses(
+    prompt: str, approval_pattern: re.Pattern[str], *, git_continuations: bool = False
+) -> list[str]:
+    clauses: list[str] = []
+    active = False
+    for raw_clause in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        clause = raw_clause.strip()
+        if not clause:
+            active = False
+            continue
+        explicit = bool(approval_pattern.match(clause) and not _AUTH_NEGATED_RE.search(clause))
+        if explicit:
+            active = True
+        elif not active:
+            continue
+        elif _NEGATED_AUTH_COMMENT_RE.match(clause):
+            return []
+        elif not _pure_authorization_command_candidates(clause) and not (
+            git_continuations and _AUTH_GIT_CONTINUATION_RE.match(clause)
+        ):
+            active = False
+            continue
+        clauses.append(clause)
+    return clauses
+
+
+def _git_authorization_text(prompt: str) -> str:
+    return "\n".join(
+        _authorization_clauses(
+            prompt, _LOCAL_GIT_APPROVAL_RE, git_continuations=True
+        )
+    )
+
+
+def _prompt_absolute_paths(prompt: str) -> list[str]:
+    matches: list[tuple[int, int, str]] = []
+    occupied: list[tuple[int, int]] = []
+    for match in _QUOTED_ABSOLUTE_PATH_RE.finditer(prompt):
+        path = match.group("path").strip().rstrip(")]}>、")
+        matches.append((match.start(), match.end(), path))
+        occupied.append((match.start(), match.end()))
+    for pattern in (_ABSOLUTE_PATH_RE, _WINDOWS_ABSOLUTE_PATH_RE):
+        for match in pattern.finditer(prompt):
+            if any(start <= match.start() < end for start, end in occupied):
+                continue
+            path = match.group(1).strip("\"'").rstrip(")]}>、")
+            matches.append((match.start(), match.end(), path))
+    return _ordered_unique([_normalized_cwd(item[2]) for item in sorted(matches)])
+
+
+def _prompt_command_scopes(
+    prompt: str, cwd: str, *, include_implicit_cwd: bool = False
+) -> list[str]:
+    scopes: list[str] = []
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            tokens = _shell_tokens(command)
+            executable, args, wrappers = _unwrap_command(tokens)
+            if (
+                executable == "git"
+                and not wrappers
+                and tokens
+                and _trusted_executable_token(tokens[0], "git")
+            ):
+                if "-C" not in args and not include_implicit_cwd:
+                    continue
+                scope, canonical_args = _git_scope_and_args(args, cwd)
+                subcommand, _, dynamic_config = _git_command(canonical_args)
+                if not dynamic_config and subcommand in _SCOPED_GIT_OPERATIONS:
+                    scopes.append(_scope_identity(scope, exact=subcommand == "init"))
+                continue
+            candidate = _prompt_github_create_candidate(
+                command, cwd, {"github_network", "github_repo_create"}
+            )
+            if candidate:
+                scopes.append(str(candidate["scope"]))
+    return _ordered_unique(scopes)
+
+
+def _pending_git_usable(pending: dict[str, Any] | None) -> bool:
+    if not isinstance(pending, dict) or pending.get("ambiguous") or not pending.get("digest"):
+        return False
+    created_at = pending.get("created_at")
+    return isinstance(created_at, (int, float)) and (
+        0 <= time.time() - float(created_at) <= _PENDING_GIT_TTL_SECONDS
+    )
+
+
+def _prompt_git_scopes(
+    prompt: str,
+    cwd: str,
+    pending: dict[str, Any] | None,
+    operations: set[str],
+) -> list[str]:
+    command_scopes = _prompt_command_scopes(prompt, cwd)
+    if command_scopes:
+        return command_scopes
+    paths = _prompt_absolute_paths(prompt)
+    if paths:
+        return [_scope_identity(paths[0], exact="init" in operations)]
+    if _CURRENT_REPO_RE.search(prompt):
+        return [_scope_identity(cwd, exact="init" in operations)]
+    if _PENDING_COMMAND_REFERENCE_RE.search(prompt) and _pending_git_usable(pending):
+        scope = str(pending.get("scope") or "")
+        if scope:
+            return [
+                _scope_identity(scope, exact=str(pending.get("operation") or "") == "init")
+            ]
+    return []
+
+
+def _prompt_push_target(
+    prompt: str, cwd: str, pending: dict[str, Any] | None
+) -> tuple[str, str] | None:
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            candidate = _scoped_git_candidate(
+                command, cwd, {"git_network", "git_non_read_only", "git_push"}
+            )
+            if candidate and candidate.get("operation") == "push":
+                return str(candidate["remote"]), str(candidate["refspec"])
+    for clause in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        match = re.search(
+            r"(?i)(?:推送|(?<![A-Za-z0-9_])push\b)\s+"
+            r"(?P<arguments>\S+(?:\s+\S+)?)\s*$",
+            clause.strip(),
+        )
+        if not match:
+            continue
+        arguments = match.group("arguments").split()
+        if len(arguments) == 1:
+            if arguments[0].casefold() == "origin":
+                return None
+            refspec = arguments[0]
+        elif len(arguments) == 2 and arguments[0].casefold() == "origin":
+            refspec = arguments[1]
+        else:
+            return None
+        branch = _safe_branch_name(refspec)
+        return ("origin", branch) if branch else None
+    if (
+        _PENDING_COMMAND_REFERENCE_RE.search(prompt)
+        and _pending_git_usable(pending)
+        and str(pending.get("operation") or "") == "push"
+    ):
+        remote = str(pending.get("remote") or "")
+        refspec = str(pending.get("refspec") or "")
+        if remote and refspec:
+            return remote, refspec
+    return None
+
+
+def _prompt_init_branch(prompt: str, cwd: str, pending: dict[str, Any] | None) -> str:
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            candidate = _scoped_git_candidate(command, cwd, {"git_non_read_only"})
+            if candidate and candidate.get("operation") == "init":
+                return str(candidate.get("branch") or "")
+    if (
+        _PENDING_COMMAND_REFERENCE_RE.search(prompt)
+        and _pending_git_usable(pending)
+        and str(pending.get("operation") or "") == "init"
+    ):
+        return str(pending.get("branch") or "")
+    return ""
+
+
+def _prompt_github_targets(prompt: str) -> list[str]:
+    targets = [match.group("target") for match in _GITHUB_CREATE_COMMAND_RE.finditer(prompt)]
+    owner_match = _GITHUB_OWNER_CONTEXT_RE.search(prompt)
+    if owner_match and _GITHUB_CREATE_INTENT_RE.search(prompt):
+        owner = owner_match.group("owner")
+        intent_match = re.search(
+            r"(?is)(?:创建|create)(?P<body>.{0,500}?)(?:private\s+"
+            r"(?:repositories|repository|repos?|repo)|私有仓库)",
+            prompt,
+        )
+        body = intent_match.group("body") if intent_match else ""
+        for name in _GITHUB_REPO_NAME_RE.findall(body):
+            if name != owner:
+                targets.append(f"{owner}/{name}")
+    return _ordered_unique(targets)
+
+
+def _prompt_github_mappings(prompt: str, cwd: str) -> dict[str, str]:
+    mappings: dict[str, str] = {}
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            candidate = _prompt_github_create_candidate(
+                command, cwd, {"github_network", "github_repo_create"}
+            )
+            if candidate:
+                mappings[str(candidate["scope_hash"])] = str(candidate["target"])
+    return mappings
+
+
+def _authorization_prose(text: str) -> str:
+    prose = re.sub(r"`[^`\r\n]*`", " ", text)
+    prose = re.sub(r"(?P<quote>['\"])[^'\"\r\n]*?(?P=quote)", " ", prose)
+    return _QUOTED_ABSOLUTE_PATH_RE.sub(" ", prose)
+
+
+def _explicit_git_operation_list(text: str) -> set[str]:
+    candidate = text.strip()
+    match = _GIT_OPERATION_LIST_RE.search(candidate)
+    if (
+        not match
+        or match.start() != 0
+        or candidate[match.end() :].strip(" `。；.!?")
+    ):
+        return set()
+    return {
+        item.casefold()
+        for item in re.findall(
+            r"(?i)(?:init|add|commit|push)", match.group("operations")
+        )
     }
 
 
-def _prompt_scope_hash(prompt: str, cwd: str, pending: dict[str, Any] | None) -> str:
-    matches = [
-        match
-        for pattern in (_ABSOLUTE_PATH_RE, _WINDOWS_ABSOLUTE_PATH_RE)
-        if (match := pattern.search(prompt))
-    ]
-    match = min(matches, key=lambda item: item.start()) if matches else None
-    if match:
-        path = match.group(1).strip("\"'").rstrip(")]}>、")
-        return _scope_hash(path)
-    if pending and _PENDING_COMMAND_REFERENCE_RE.search(prompt):
-        return str(pending.get("scope_hash") or "")
-    if _CURRENT_REPO_RE.search(prompt):
-        return _scope_hash(cwd)
-    return ""
+def _prompt_git_operations(prompt: str, cwd: str) -> set[str]:
+    operations: set[str] = set()
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        commands = _authorization_command_candidates(segment)
+        if commands:
+            for command in commands:
+                tokens = _shell_tokens(command)
+                executable, args, wrappers = _unwrap_command(tokens)
+                if (
+                    executable != "git"
+                    or wrappers
+                    or not tokens
+                    or not _trusted_executable_token(tokens[0], "git")
+                ):
+                    continue
+                _, canonical_args = _git_scope_and_args(args, cwd)
+                subcommand, _, dynamic_config = _git_command(canonical_args)
+                if not dynamic_config and subcommand in _SCOPED_GIT_OPERATIONS:
+                    operations.add(subcommand)
+                if not dynamic_config:
+                    operations.update(
+                        _explicit_git_operation_list(
+                            "git " + " ".join(canonical_args)
+                        )
+                    )
+            continue
+        for match in _GIT_OPERATION_LIST_RE.finditer(_authorization_prose(segment)):
+            operations.update(
+                item.casefold()
+                for item in re.findall(
+                    r"(?i)(?:init|add|commit|push)", match.group("operations")
+                )
+            )
+
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        if _authorization_command_candidates(segment):
+            continue
+        for match in _CHINESE_GIT_OPERATION_LIST_RE.finditer(
+            _authorization_prose(segment)
+        ):
+            operations.update(
+                _CHINESE_GIT_OPERATION_MAP[item]
+                for item in re.findall(
+                    r"初始化|暂存|提交|推送", match.group("operations")
+                )
+            )
+    return operations
 
 
 def _local_git_grant_from_prompt(
     prompt: str, cwd: str, turn_id: str, pending: dict[str, Any] | None
 ) -> dict[str, Any] | None:
-    if (
-        not _policy()["enable_natural_language_approvals"]
-        or not _LOCAL_GIT_APPROVAL_RE.search(prompt)
-        or _AUTH_NEGATED_RE.search(prompt)
+    policy = _policy()
+    if not (
+        policy["enable_natural_language_approvals"]
+        and policy["enable_scoped_git_transactions"]
     ):
         return None
-    operations = {item.lower() for item in _LOCAL_GIT_OPERATION_RE.findall(prompt)}
-    if not operations and pending and _PENDING_COMMAND_REFERENCE_RE.search(prompt):
-        operation = str(pending.get("operation") or "")
-        if operation in {"add", "commit"}:
-            operations.add(operation)
-    scope = _prompt_scope_hash(prompt, cwd, pending)
-    if not operations or not scope:
+    authorization_text = _git_authorization_text(prompt)
+    if (
+        not authorization_text
+        or _AUTH_NEGATED_RE.search(prompt)
+        or _NEGATED_GIT_OPERATION_RE.search(prompt)
+    ):
         return None
-    return {"turn_id": turn_id, "scope_hash": scope, "remaining_operations": sorted(operations)}
+    operations = _prompt_git_operations(authorization_text, cwd)
+    parsed_push_target = _prompt_push_target(authorization_text, cwd, pending)
+    if parsed_push_target is not None:
+        operations.add("push")
+    github_targets = _prompt_github_targets(authorization_text)
+    if github_targets:
+        operations.add("repo_create")
+    pending_reference = bool(
+        _PENDING_COMMAND_REFERENCE_RE.search(authorization_text) and _pending_git_usable(pending)
+    )
+    if not operations and pending_reference:
+        operation = str(pending.get("operation") or "")
+        if operation in _SCOPED_TRANSACTION_OPERATIONS:
+            operations.add(operation)
+    if not github_targets and pending_reference:
+        pending_target = str(pending.get("target") or "")
+        if not pending_target and "push" in operations:
+            remote_targets = pending.get("remote_targets")
+            if isinstance(remote_targets, list) and len(remote_targets) == 1:
+                pending_target = str(remote_targets[0] or "")
+        if pending_target:
+            github_targets = [pending_target]
+    scopes = _prompt_git_scopes(authorization_text, cwd, pending, operations)
+    push_target = parsed_push_target if "push" in operations else None
+    if (
+        not operations
+        or not scopes
+        or ("push" in operations and (push_target is None or not github_targets))
+    ):
+        return None
+    init_branch = _prompt_init_branch(authorization_text, cwd, pending) or (
+        push_target[1] if push_target else ""
+    )
+    if "init" in operations and not init_branch:
+        return None
+    explicit_mappings = _prompt_github_mappings(authorization_text, cwd)
+    scope_hashes = {_scope_hash(scope, exact=True) for scope in scopes}
+    requires_explicit_mapping = len(scopes) > 1 or len(github_targets) > 1
+    if requires_explicit_mapping and (
+        set(explicit_mappings) != scope_hashes
+        or len(set(explicit_mappings.values())) != len(explicit_mappings)
+        or set(explicit_mappings.values()) != set(github_targets)
+    ):
+        return None
+    if github_targets and len(github_targets) != len(scopes):
+        return None
+    bindings: dict[str, dict[str, str]] = {}
+    for scope in scopes:
+        scope_hash = _scope_hash(scope, exact=True)
+        target = explicit_mappings.get(scope_hash, "")
+        if not target and len(scopes) == 1 and len(github_targets) == 1:
+            target = github_targets[0]
+        bindings[scope_hash] = {
+            "scope": scope,
+            "target": target,
+            "remote": push_target[0] if push_target else "",
+            "init_branch": init_branch,
+            "push_branch": push_target[1] if push_target else "",
+        }
+    if github_targets and {item["target"] for item in bindings.values()} != set(github_targets):
+        return None
+    if "push" in operations and any(not item["target"] for item in bindings.values()):
+        return None
+    pending_digest = ""
+    if (
+        pending_reference
+        and not _prompt_command_scopes(authorization_text, cwd)
+        and not _prompt_absolute_paths(authorization_text)
+        and not _CURRENT_REPO_RE.search(authorization_text)
+    ):
+        pending_digest = str(pending.get("digest") or "")
+    return {
+        "turn_id": turn_id,
+        "bindings": bindings,
+        "operations": sorted(operations),
+        "consumed_operations": {},
+        "pending_digest": pending_digest,
+    }
+
+
+def _git_grant_matches(
+    grant: dict[str, Any], candidate: dict[str, Any], event_turn: str
+) -> bool:
+    if str(grant.get("turn_id") or "") != event_turn:
+        return False
+    operation = str(candidate.get("operation") or "")
+    if operation not in set(grant.get("operations") or []):
+        return False
+    scope_hash = str(candidate.get("scope_hash") or "")
+    bindings = grant.get("bindings")
+    if not isinstance(bindings, dict) or not isinstance(bindings.get(scope_hash), dict):
+        return False
+    binding = bindings[scope_hash]
+    pending_digest = str(grant.get("pending_digest") or "")
+    if pending_digest and str(candidate.get("digest") or "") != pending_digest:
+        return False
+    consumed = grant.get("consumed_operations") or {}
+    if operation in set(consumed.get(scope_hash) or []):
+        return False
+    if operation == "init":
+        return bool(
+            binding.get("init_branch")
+            and candidate.get("branch") == binding.get("init_branch")
+        )
+    if operation == "push":
+        if not (
+            binding.get("remote") == "origin"
+            and candidate.get("remote") == "origin"
+            and binding.get("push_branch")
+            and candidate.get("refspec") == binding.get("push_branch")
+        ):
+            return False
+        target = str(binding.get("target") or "")
+        return bool(target and tuple(candidate.get("remote_targets") or ()) == (target,))
+    if operation == "repo_create":
+        return bool(
+            candidate.get("visibility") == "private"
+            and candidate.get("remote") == "origin"
+            and binding.get("target")
+            and candidate.get("target") == binding.get("target")
+        )
+    return True
+
+
+def _consume_git_grant(grant: dict[str, Any], candidate: dict[str, Any]) -> None:
+    scope_hash = str(candidate.get("scope_hash") or "")
+    consumed = grant.get("consumed_operations")
+    if not isinstance(consumed, dict):
+        consumed = {}
+    operations = set(consumed.get(scope_hash) or [])
+    operations.add(str(candidate.get("operation") or ""))
+    consumed[scope_hash] = sorted(operations)
+    grant["consumed_operations"] = consumed
 
 
 def _authorization_command_candidates(segment: str) -> list[str]:
     code_spans = [item.strip() for item in re.findall(r"`([^`\n]+)`", segment) if item.strip()]
     if code_spans:
-        return code_spans
+        return [
+            item
+            for item in code_spans
+            if (
+                ((match := _COMMAND_START_RE.search(item)) is not None and match.start(1) == 0)
+                or _QUOTED_WINDOWS_EXECUTABLE_RE.match(item) is not None
+            )
+        ]
 
     quoted_windows = _QUOTED_WINDOWS_EXECUTABLE_RE.search(segment)
     approval = _DANGEROUS_APPROVAL_RE.match(segment)
@@ -1932,18 +3601,99 @@ def _authorization_command_candidates(segment: str) -> list[str]:
     return [candidate]
 
 
-def _dangerous_authorization_hashes(prompt: str, cwd: str) -> dict[str, list[str]]:
-    if not _policy()["enable_natural_language_approvals"] or _AUTH_NEGATED_RE.search(prompt):
+def _pure_authorization_command_candidates(segment: str) -> list[str]:
+    stripped = segment.strip()
+    if not stripped or _COMMAND_NEGATION_RE.search(stripped):
+        return []
+    if stripped.startswith("`") and stripped.endswith("`") and not stripped.startswith("```"):
+        stripped = stripped[1:-1].strip()
+    match = _COMMAND_START_RE.search(stripped)
+    quoted_windows = _QUOTED_WINDOWS_EXECUTABLE_RE.match(stripped)
+    if (not match or match.start(1) != 0) and quoted_windows is None:
+        return []
+    return _authorization_command_candidates(stripped)
+
+
+def _transaction_operation_from_command(command: str, cwd: str) -> str:
+    tokens = _shell_tokens(command)
+    executable, args, wrappers = _unwrap_command(tokens)
+    if not tokens or wrappers:
+        return ""
+    if executable == "git" and _trusted_executable_token(tokens[0], "git"):
+        _, canonical_args = _git_scope_and_args(args, cwd)
+        subcommand, _, _ = _git_command(canonical_args)
+        return subcommand if subcommand in _SCOPED_GIT_OPERATIONS else ""
+    candidate = _prompt_github_create_candidate(
+        command,
+        cwd,
+        {"github_network", "github_repo_create"},
+    )
+    return "repo_create" if candidate else ""
+
+
+def _prompt_has_unresolved_git_scope_override(prompt: str, cwd: str) -> bool:
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            tokens = _shell_tokens(command)
+            executable, args, wrappers = _unwrap_command(tokens)
+            if (
+                executable != "git"
+                or wrappers
+                or not tokens
+                or not _trusted_executable_token(tokens[0], "git")
+            ):
+                continue
+            _, canonical_args = _git_scope_and_args(args, cwd)
+            subcommand, git_args, _ = _git_command(canonical_args)
+            if not subcommand:
+                continue
+            global_arg_count = len(canonical_args) - len(git_args) - 1
+            if global_arg_count < 0:
+                return True
+            global_args = canonical_args[:global_arg_count]
+            if "--bare" in global_args or any(
+                token in _GIT_SCOPE_FLAGS
+                or any(token.startswith(flag + "=") for flag in _GIT_SCOPE_FLAGS)
+                for token in global_args
+            ):
+                return True
+    return False
+
+
+def _dangerous_authorization_hashes(
+    prompt: str,
+    cwd: str,
+    untrusted_roots: tuple[str, ...] = (),
+    *,
+    skip_scoped_candidates: bool = False,
+) -> dict[str, list[str]]:
+    policy = _policy()
+    if (
+        not policy["enable_natural_language_approvals"]
+        or _AUTH_NEGATED_RE.search(prompt)
+    ):
         return {}
     authorized: dict[str, set[str]] = {}
-    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
-        if not _DANGEROUS_APPROVAL_RE.match(segment) or _AUTH_NEGATED_RE.search(segment):
-            continue
-        for candidate in _authorization_command_candidates(segment):
+    for clause in _authorization_clauses(prompt, _DANGEROUS_APPROVAL_RE):
+        candidates = (
+            _authorization_command_candidates(clause)
+            if _DANGEROUS_APPROVAL_RE.match(clause)
+            else _pure_authorization_command_candidates(clause)
+        )
+        for candidate in candidates:
             digest = _command_hash(candidate, cwd)
             if not digest:
                 continue
-            for code in _dangerous_codes(_structured_command_findings(candidate)):
+            dangerous = _dangerous_codes(_structured_command_findings(candidate))
+            if _command_uses_untrusted_clone(candidate, cwd, untrusted_roots):
+                dangerous.add("downloaded_code_execution")
+            if (
+                skip_scoped_candidates
+                and policy["enable_scoped_git_transactions"]
+                and _transaction_operation_from_command(candidate, cwd)
+            ):
+                continue
+            for code in dangerous:
                 authorized.setdefault(code, set()).add(digest)
     return {code: sorted(digests) for code, digests in sorted(authorized.items())}
 
@@ -2175,8 +3925,163 @@ def _sensitive_disclosure_grant(prompt: str, turn_id: str) -> dict[str, Any] | N
     return None
 
 
-def _is_continuation(prompt: str) -> bool:
-    return bool(_CONTINUATION_RE.search(prompt))
+def _sed_delimited_end(text: str, start: int, delimiter: str) -> int | None:
+    escaped = False
+    for index in range(start, len(text)):
+        character = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character == delimiter:
+            return index
+    return None
+
+
+def _sed_command_body(script: str) -> str | None:
+    text = script.strip()
+    if not text or any(separator in text for separator in (";", "\n", "\r")):
+        return None
+    position = 0
+    addresses = 0
+    while addresses < 2:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text):
+            return None
+        if text[position].isdigit():
+            while position < len(text) and text[position].isdigit():
+                position += 1
+        elif text[position] == "$":
+            position += 1
+        elif text[position] == "/":
+            end = _sed_delimited_end(text, position + 1, "/")
+            if end is None:
+                return None
+            position = end + 1
+        else:
+            break
+        addresses += 1
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position < len(text) and text[position] in {"+", "~"}:
+            position += 1
+            if position >= len(text) or not text[position].isdigit():
+                return None
+            while position < len(text) and text[position].isdigit():
+                position += 1
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if addresses == 1 and position < len(text) and text[position] == ",":
+            position += 1
+            continue
+        break
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position < len(text) and text[position] == "!":
+        position += 1
+    body = text[position:].lstrip()
+    return body or None
+
+
+def _sed_substitution_is_read_only(body: str) -> bool:
+    if len(body) < 4 or body[0] != "s":
+        return False
+    delimiter = body[1]
+    if delimiter.isalnum() or delimiter.isspace() or delimiter == "\\":
+        return False
+    pattern_end = _sed_delimited_end(body, 2, delimiter)
+    if pattern_end is None:
+        return False
+    replacement_end = _sed_delimited_end(body, pattern_end + 1, delimiter)
+    if replacement_end is None:
+        return False
+    flags = body[replacement_end + 1 :].strip()
+    return bool(re.fullmatch(r"(?:[gIpPmM]|[1-9][0-9]*)*", flags))
+
+
+def _sed_script_is_strictly_read_only(script: str) -> bool:
+    body = _sed_command_body(script)
+    if not body:
+        return False
+    if body[0] == "s":
+        return _sed_substitution_is_read_only(body)
+    if body[0] in {"p", "P", "d", "D", "l", "n", "N", "=", "x", "g", "G", "h", "H"}:
+        return not body[1:].strip()
+    if body[0] in {"q", "Q"}:
+        return not body[1:].strip() or bool(re.fullmatch(r"\s*[0-9]+", body[1:]))
+    return False
+
+
+def _sed_is_strictly_read_only(args: list[str]) -> bool:
+    scripts: list[str] = []
+    has_expression = False
+    positional_script_consumed = False
+    options_active = True
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if options_active and token == "--":
+            options_active = False
+            index += 1
+            continue
+        if options_active and token.startswith("--"):
+            if token in {"--file", "--in-place"} or token.startswith(
+                ("--file=", "--in-place=")
+            ):
+                return False
+            if token in {"--expression"}:
+                index += 1
+                if index >= len(args):
+                    return False
+                has_expression = True
+                scripts.append(args[index])
+            elif token.startswith("--expression="):
+                has_expression = True
+                scripts.append(token.split("=", 1)[1])
+            elif token not in {
+                "--quiet",
+                "--silent",
+                "--regexp-extended",
+                "--separate",
+                "--unbuffered",
+                "--null-data",
+                "--posix",
+                "--sandbox",
+            }:
+                return False
+            index += 1
+            continue
+        if options_active and token.startswith("-") and token != "-":
+            cluster = token[1:]
+            offset = 0
+            while offset < len(cluster):
+                option = cluster[offset]
+                if option in {"i", "f"}:
+                    return False
+                if option == "e":
+                    has_expression = True
+                    inline = cluster[offset + 1 :]
+                    if inline:
+                        scripts.append(inline)
+                    else:
+                        index += 1
+                        if index >= len(args):
+                            return False
+                        scripts.append(args[index])
+                    break
+                if option not in {"n", "E", "r", "s", "u", "z"}:
+                    return False
+                offset += 1
+            index += 1
+            continue
+        if not has_expression and not positional_script_consumed:
+            scripts.append(token)
+            positional_script_consumed = True
+        index += 1
+    return bool(scripts) and all(_sed_script_is_strictly_read_only(script) for script in scripts)
 
 
 def _is_strictly_read_only_command(command: str) -> bool:
@@ -2200,7 +4105,7 @@ def _is_strictly_read_only_command(command: str) -> bool:
         external_helper = any(token == "--exec-path" or token.startswith("--exec-path=") for token in args)
         return not scope_override and not external_helper and _git_is_read_only(subcommand, git_args, dynamic_config)
     if executable == "sed":
-        return not any(token == "-i" or token.startswith("-i") for token in args)
+        return _sed_is_strictly_read_only(args)
     return executable in _READ_ONLY_COMMANDS
 
 
@@ -2274,8 +4179,6 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
     nested = _nested_allowed(prompt)
     sensitive = _sensitive_context(prompt)
     disclosure_grant = _sensitive_disclosure_grant(prompt, turn_id)
-    authorization_hashes = _dangerous_authorization_hashes(prompt, cwd)
-
     def mutate(state: dict[str, Any]) -> None:
         pending = state.get("pending_local_git")
         grant = _local_git_grant_from_prompt(
@@ -2283,6 +4186,35 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
             cwd,
             turn_id,
             pending if isinstance(pending, dict) else None,
+        )
+        authorization_text = _git_authorization_text(prompt)
+        transaction_scopes = _ordered_unique(
+            _prompt_command_scopes(
+                authorization_text,
+                cwd,
+                include_implicit_cwd=True,
+            )
+            + _prompt_absolute_paths(authorization_text)
+        )
+        transaction_targets = _prompt_github_targets(authorization_text)
+        transaction_intent_requires_grant = bool(
+            transaction_targets
+            and (
+                len(transaction_scopes) > 1
+                or len(transaction_targets) > 1
+                or _prompt_has_unresolved_git_scope_override(
+                    authorization_text,
+                    cwd,
+                )
+            )
+        )
+        authorization_hashes = _dangerous_authorization_hashes(
+            prompt,
+            cwd,
+            _tracked_clone_roots(state),
+            skip_scoped_candidates=(
+                grant is not None or transaction_intent_requires_grant
+            ),
         )
         state["current_turn_id"] = turn_id
         state["explicit_expand"] = expand
@@ -2293,7 +4225,16 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
         state["dangerous_authorization_hashes"] = authorization_hashes
         state["pending_permission_authorizations"] = {}
         state["local_git_grant"] = grant
-        state["pending_local_git"] = None
+        if grant is not None:
+            state["pending_local_git"] = None
+        elif _AUTH_NEGATED_RE.search(prompt) or (
+            isinstance(pending, dict)
+            and (
+                not _pending_git_usable(pending)
+                or not _PENDING_COMMAND_REFERENCE_RE.search(prompt)
+            )
+        ):
+            state["pending_local_git"] = None
 
     _mutate_state(session_id, mutate)
 
@@ -2310,19 +4251,20 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
     event_name = str(event.get("hook_event_name") or "")
     tool_name = str(event.get("tool_name") or "")
     tool_input = event.get("tool_input") or {}
+    validation_error = _exec_command_validation_error(tool_name, tool_input)
+    if validation_error:
+        reason = "Execution tool input rejected: " + validation_error + "."
+        return _deny_pretool(reason) if event_name == "PreToolUse" else _deny_permission(reason)
     text = _flatten_text(tool_input)
     sensitive_text = _flatten_sensitive_fields(tool_input)
     command = ""
-    if isinstance(tool_input, dict) and (
-        tool_name == "Bash" or tool_name == "exec_command" or tool_name.endswith("__exec_command")
-    ):
+    if isinstance(tool_input, dict) and _tool_family(tool_name) in {"bash", "exec_command"}:
         command = str(tool_input.get("command") or tool_input.get("cmd") or "")
     findings = (
         _scan_command(command, source=f"{event_name}:{tool_name}")
         if command
         else _scan_text(text, source=f"{event_name}:{tool_name}")
     )
-
     removed_text, persisted_text = _local_redaction_surfaces(tool_name, tool_input)
     secret_redaction = bool(
         removed_text
@@ -2335,14 +4277,106 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         return _deny_pretool(reason) if event_name == "PreToolUse" else _deny_permission(reason)
 
     session_id = _session_id(event)
-    dangerous = _dangerous_codes(findings)
-    event_cwd = str(event.get("cwd") or ".")
-    if isinstance(tool_input, dict) and tool_input.get("workdir"):
-        event_cwd = str(tool_input["workdir"])
-    digest = _command_hash(command or text, event_cwd)
-    local_git = _ordinary_local_git_candidate(command, event_cwd, dangerous) if command else None
     event_turn = str(event.get("turn_id") or "")
     tool_use_id = str(event.get("tool_use_id") or "")
+    base_event_cwd = str(event.get("cwd") or ".")
+    event_cwd = base_event_cwd
+    if isinstance(tool_input, dict) and tool_input.get("workdir"):
+        event_cwd = str(tool_input["workdir"])
+    state_snapshot = _read_state(session_id)
+    policy = _policy()
+    clone_enabled = policy["enable_constrained_github_clone"]
+    transaction_enabled = policy["enable_scoped_git_transactions"]
+    execution_options_digest = _execution_options_digest(tool_name, tool_input)
+    clone_invocation = bool(command and _contains_clone_invocation(command))
+    sandbox = (
+        tool_input.get("sandbox_permissions", "use_default")
+        if isinstance(tool_input, dict)
+        else ""
+    )
+    parsed_clone_candidate = (
+        _constrained_github_clone_candidate(
+            command,
+            effective_cwd=event_cwd,
+            workspace_cwd=base_event_cwd,
+        )
+        if clone_enabled and command
+        else None
+    )
+    clone_candidate = (
+        parsed_clone_candidate
+        if (
+            parsed_clone_candidate
+            and tool_name == "exec_command"
+            and tool_use_id
+            and sandbox == "use_default"
+        )
+        else None
+    )
+    if parsed_clone_candidate and clone_candidate is None:
+        reason = (
+            "The constrained clone lane requires exact exec_command, a nonempty tool_use_id, "
+            "and the default sandbox."
+        )
+        return _deny_pretool(reason) if event_name == "PreToolUse" else _deny_permission(reason)
+    if clone_enabled and clone_invocation and clone_candidate is None:
+        reason = (
+            "Clone-capable Git commands, including dynamic Git configuration, must use a directly "
+            "parseable invocation with an explicit absolute destination so provenance can be "
+            "tracked. For a read-only GitHub audit, use: "
+            "git clone --depth 1 --no-checkout "
+            "https://github.com/OWNER/REPO.git /ABSOLUTE/NEW/DESTINATION."
+        )
+        return _deny_pretool(reason) if event_name == "PreToolUse" else _deny_permission(reason)
+    if clone_enabled and command and _command_uses_untrusted_clone(
+        command, event_cwd, _tracked_clone_roots(state_snapshot)
+    ):
+        findings.append(_finding("downloaded_code_execution", "medium"))
+    dangerous = _dangerous_codes(_dedupe_findings(findings))
+    digest = _command_hash(command or text, event_cwd)
+    clone_reservation = (
+        _clone_reservation_metadata(
+            clone_candidate,
+            session_hash=str(state_snapshot.get("session_hash") or ""),
+            turn_id=event_turn,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            digest=digest,
+            base_event_cwd=base_event_cwd,
+            effective_cwd=event_cwd,
+            execution_options_digest=execution_options_digest,
+        )
+        if clone_candidate
+        else None
+    )
+    if clone_reservation:
+        reservation_result = {"ready": False}
+
+        if event_name == "PreToolUse":
+            def reserve_clone(state: dict[str, Any]) -> None:
+                reservation_result["ready"] = _reserve_clone(
+                    state, tool_use_id, clone_reservation
+                )
+
+            state_snapshot = _mutate_state(session_id, reserve_clone)
+        else:
+            pending_clones = state_snapshot.get("pending_constrained_clones")
+            reservation_result["ready"] = bool(
+                isinstance(pending_clones, dict)
+                and _clone_reservation_matches(
+                    pending_clones.get(tool_use_id), clone_reservation
+                )
+            )
+        if not reservation_result["ready"]:
+            reason = "Constrained clone provenance reservation did not match exactly."
+            return _deny_pretool(reason) if event_name == "PreToolUse" else _deny_permission(reason)
+        # Native Codex policy remains responsible for network and filesystem approval.
+        dangerous -= {"git_network", "git_non_read_only"}
+    scoped_operation = None
+    if command:
+        scoped_operation = _scoped_git_candidate(command, event_cwd, dangerous)
+        if scoped_operation is None:
+            scoped_operation = _scoped_github_create_candidate(command, event_cwd, dangerous)
     authorization_result: dict[str, Any] = {
         "unauthorized": sorted(dangerous),
         "permission_accepted": False,
@@ -2360,11 +4394,21 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
             pending = pending_permissions.get(tool_use_id) if tool_use_id else None
             pending_matches = bool(
                 dangerous
+                and digest
+                and turn_matches
                 and isinstance(pending, dict)
+                and str(pending.get("session_hash") or "")
+                == str(state.get("session_hash") or "")
                 and str(pending.get("turn_id") or "") == event_turn
                 and str(pending.get("tool_use_id") or "") == tool_use_id
                 and str(pending.get("tool_name") or "") == tool_name
                 and str(pending.get("digest") or "") == digest
+                and str(pending.get("base_event_cwd") or "")
+                == _normalized_cwd(base_event_cwd)
+                and str(pending.get("effective_cwd") or "")
+                == _normalized_cwd(event_cwd)
+                and str(pending.get("execution_options_digest") or "")
+                == execution_options_digest
                 and set(pending.get("codes") or []) == dangerous
             )
             if pending_matches:
@@ -2377,11 +4421,21 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         pending = pending_permissions.get(tool_use_id) if tool_use_id else None
         pending_matches = bool(
             dangerous
+            and digest
+            and turn_matches
             and isinstance(pending, dict)
+            and str(pending.get("session_hash") or "")
+            == str(state.get("session_hash") or "")
             and str(pending.get("turn_id") or "") == event_turn
             and str(pending.get("tool_use_id") or "") == tool_use_id
             and str(pending.get("digest") or "") == digest
             and str(pending.get("tool_name") or "") == tool_name
+            and str(pending.get("base_event_cwd") or "")
+            == _normalized_cwd(base_event_cwd)
+            and str(pending.get("effective_cwd") or "")
+            == _normalized_cwd(event_cwd)
+            and str(pending.get("execution_options_digest") or "")
+            == execution_options_digest
             and set(pending.get("codes") or []) == dangerous
         )
         if pending_matches:
@@ -2394,14 +4448,14 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         }
         grant_codes: set[str] = set()
         grant = state.get("local_git_grant")
-        if local_git and isinstance(grant, dict) and turn_matches:
-            remaining = set(grant.get("remaining_operations") or [])
-            if (
-                str(grant.get("turn_id") or "") == event_turn
-                and str(grant.get("scope_hash") or "") == str(local_git.get("scope_hash") or "")
-                and str(local_git.get("operation") or "") in remaining
-            ):
-                grant_codes.add("git_non_read_only")
+        if (
+            transaction_enabled
+            and scoped_operation
+            and isinstance(grant, dict)
+            and turn_matches
+        ):
+            if _git_grant_matches(grant, scoped_operation, event_turn):
+                grant_codes.update(scoped_operation.get("codes") or [])
 
         allowed_codes = exact_codes | grant_codes
         unauthorized = sorted(code for code in dangerous if code not in allowed_codes)
@@ -2419,42 +4473,62 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
             state["dangerous_authorization_hashes"] = authorized
             state["dangerous_authorizations"] = sorted(authorized)
 
-            if grant_codes and isinstance(grant, dict) and local_git:
-                remaining = set(grant.get("remaining_operations") or [])
-                remaining.discard(str(local_git.get("operation") or ""))
-                grant["remaining_operations"] = sorted(remaining)
-                state["local_git_grant"] = grant if remaining else None
+            if grant_codes and isinstance(grant, dict) and scoped_operation:
+                _consume_git_grant(grant, scoped_operation)
+                state["local_git_grant"] = grant
 
             pending_permissions[tool_use_id] = {
+                "session_hash": str(state.get("session_hash") or ""),
                 "turn_id": event_turn,
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "digest": digest,
                 "codes": sorted(dangerous),
+                "base_event_cwd": _normalized_cwd(base_event_cwd),
+                "effective_cwd": _normalized_cwd(event_cwd),
+                "execution_options_digest": execution_options_digest,
             }
             state["pending_permission_authorizations"] = pending_permissions
 
-        if unauthorized and event_name == "PreToolUse" and local_git:
+        if unauthorized and event_name == "PreToolUse" and scoped_operation:
             pending = state.get("pending_local_git")
-            if not pending or pending.get("digest") == local_git.get("digest"):
-                state["pending_local_git"] = local_git
+            if not pending or pending.get("digest") == scoped_operation.get("digest"):
+                state["pending_local_git"] = {
+                    **scoped_operation,
+                    "created_at": time.time(),
+                    "source_turn_id": event_turn,
+                }
             else:
-                state["pending_local_git"] = {"ambiguous": True}
-        elif not unauthorized and local_git:
+                state["pending_local_git"] = {
+                    "ambiguous": True,
+                    "created_at": time.time(),
+                    "source_turn_id": event_turn,
+                }
+        elif not unauthorized and scoped_operation:
             pending = state.get("pending_local_git")
-            if isinstance(pending, dict) and pending.get("digest") == local_git.get("digest"):
+            if isinstance(pending, dict) and pending.get("digest") == scoped_operation.get("digest"):
                 state["pending_local_git"] = None
 
     state = _mutate_state(session_id, mutate_authorization)
     unauthorized = authorization_result["unauthorized"]
     if unauthorized:
-        if local_git and event_name == "PreToolUse":
+        if "downloaded_code_execution" in unauthorized:
             reason = (
-                "Local Git command is pending one-time approval for this repository: "
-                + str(local_git["operation"])
-                + ". Ask the user to approve the immediately preceding git command or explicitly approve git "
-                + str(local_git["operation"])
-                + " for the repository path. Blocked for: git_non_read_only."
+                "Execution or mutation inside a freshly cloned codebase requires one exact "
+                "current-turn authorization for this command. Read-only inspection with Read, "
+                "rg, cat, git show, git status, and git diff remains available. Blocked for: "
+                + ", ".join(unauthorized)
+                + "."
+            )
+        elif scoped_operation and event_name == "PreToolUse":
+            reason = (
+                "A scoped Git/GitHub operation is pending approval: "
+                + str(scoped_operation["operation"])
+                + ". One explicit transaction grant may cover all predeclared "
+                "init/add/commit/private repo create/push steps; do not request them "
+                "separately. Blocked for: "
+                + ", ".join(unauthorized)
+                + "."
             )
         else:
             reason = (
@@ -2540,17 +4614,94 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
 def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
     tool_name = str(event.get("tool_name") or "")
     session_id = _session_id(event)
+    event_turn = str(event.get("turn_id") or "")
     tool_use_id = str(event.get("tool_use_id") or "")
+    tool_input = event.get("tool_input") or {}
+    validation_error = _exec_command_validation_error(tool_name, tool_input)
+    command = ""
+    if isinstance(tool_input, dict) and _tool_family(tool_name) in {"bash", "exec_command"}:
+        command = str(tool_input.get("command") or tool_input.get("cmd") or "")
+    base_event_cwd = str(event.get("cwd") or ".")
+    event_cwd = base_event_cwd
+    if isinstance(tool_input, dict) and tool_input.get("workdir"):
+        event_cwd = str(tool_input["workdir"])
+    digest = _command_hash(command, event_cwd) if command else ""
+    execution_options_digest = _execution_options_digest(tool_name, tool_input)
+    clone_enabled = _policy()["enable_constrained_github_clone"]
 
     def clear_pending(state: dict[str, Any]) -> None:
         pending = state.get("pending_permission_authorizations")
-        if isinstance(pending, dict) and tool_use_id:
+        permission = pending.get(tool_use_id) if isinstance(pending, dict) else None
+        permission_matches = bool(
+            isinstance(permission, dict)
+            and not validation_error
+            and digest
+            and str(permission.get("session_hash") or "")
+            == str(state.get("session_hash") or "")
+            and str(permission.get("turn_id") or "") == event_turn
+            and str(permission.get("tool_use_id") or "") == tool_use_id
+            and str(permission.get("tool_name") or "") == tool_name
+            and str(permission.get("digest") or "") == digest
+            and str(permission.get("base_event_cwd") or "")
+            == _normalized_cwd(base_event_cwd)
+            and str(permission.get("effective_cwd") or "")
+            == _normalized_cwd(event_cwd)
+            and str(permission.get("execution_options_digest") or "")
+            == execution_options_digest
+        )
+        if isinstance(pending, dict) and permission_matches:
             pending.pop(tool_use_id, None)
             state["pending_permission_authorizations"] = pending
+        pending_clones = state.get("pending_constrained_clones")
+        if not isinstance(pending_clones, dict):
+            pending_clones = {}
+        clone = pending_clones.get(tool_use_id) if tool_use_id else None
+        clone_matches = False
+        if (
+            isinstance(clone, dict)
+            and not validation_error
+            and tool_name == "exec_command"
+            and digest
+        ):
+            expected = _clone_reservation_metadata(
+                {
+                    "source": str(clone.get("source") or ""),
+                    "target": str(clone.get("target") or ""),
+                    "destination": str(clone.get("destination") or ""),
+                },
+                session_hash=str(state.get("session_hash") or ""),
+                turn_id=event_turn,
+                tool_name=tool_name,
+                tool_use_id=tool_use_id,
+                digest=digest,
+                base_event_cwd=base_event_cwd,
+                effective_cwd=event_cwd,
+                execution_options_digest=execution_options_digest,
+            )
+            clone_matches = _clone_reservation_matches(clone, expected)
+        clone = pending_clones.pop(tool_use_id, None) if clone_matches else None
+        state["pending_constrained_clones"] = pending_clones
+        if not clone_enabled or not isinstance(clone, dict):
+            return
+        raw_destination = str(clone.get("destination") or "")
+        if not raw_destination:
+            return
+        destination = _normalized_cwd(raw_destination)
+        if not _looks_like_git_clone(destination):
+            return
+        roots = state.get("untrusted_clone_roots")
+        if not isinstance(roots, dict):
+            roots = {}
+        roots[destination] = {
+            "source": str(clone.get("source") or ""),
+            "target": str(clone.get("target") or ""),
+            "created_at": int(time.time()),
+        }
+        state["untrusted_clone_roots"] = roots
 
     state = _mutate_state(session_id, clear_pending)
     response_text = _flatten_sensitive_fields(event.get("tool_response"))
-    findings = _scan_text(response_text, source=f"PostToolUse:{tool_name}")
+    findings = _scan_tool_output(event, response_text, source=f"PostToolUse:{tool_name}")
     if _secret_found(findings):
         return {
             "decision": "block",

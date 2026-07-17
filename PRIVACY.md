@@ -8,7 +8,7 @@ Release code does not initiate network connections and includes no telemetry. In
 
 ## Data persisted
 
-The Hook stores local session state in the host-provided plugin-data directory or the documented fallback. Stored state is limited to hashes and workflow metadata required for one-shot approvals, sensitive-context handling, and Agent lifecycle reconciliation.
+The Hook stores local session state in the host-provided plugin-data directory or the documented fallback. Stored state is limited to hashes and workflow metadata required for one-shot approvals, sensitive-context handling, Agent lifecycle reconciliation, and opt-in clone provenance. Clone provenance can include the local checkout path, canonical GitHub repository target, source URL, and timestamps.
 
 The implementation does not intentionally persist raw prompts, commands, credentials, configured marker strings, tool payloads, or tool output. Session JSON older than seven days is logically reinitialized on next access and is removed after a successful Stop event. A hashed per-session lock sentinel can remain to preserve cross-process ordering.
 

@@ -15,7 +15,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|exec_command|apply_patch|Edit|Write|mcp__.*",
+        "matcher": "Bash|exec_command|.*__exec_command|apply_patch|Edit|Write|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -29,7 +29,7 @@
     ],
     "PermissionRequest": [
       {
-        "matcher": "Bash|exec_command|apply_patch|Edit|Write|mcp__.*",
+        "matcher": "Bash|exec_command|.*__exec_command|apply_patch|Edit|Write|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -43,7 +43,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|exec_command|apply_patch|Edit|Write|mcp__.*",
+        "matcher": "Bash|exec_command|.*__exec_command|Read|apply_patch|Edit|Write|mcp__.*",
         "hooks": [
           {
             "type": "command",
