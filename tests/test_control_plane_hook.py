@@ -3028,12 +3028,22 @@ class HookProtocolTests(unittest.TestCase):
             f"gh repo create {target} --private --source '{repo}' --remote origin",
             f"git -C '{repo}' push -u origin main",
         )
-        for command in commands:
-            with self.subTest(command=command.split()[0]):
-                result = self.bash(command, cwd=str(root))
-                self.assertNotEqual(
-                    "deny", result["hookSpecificOutput"].get("permissionDecision"), msg=result
-                )
+        fixture_gh = root / ("gh.exe" if os.name == "nt" else "gh")
+        fixture_gh.touch()
+        real_which = module.shutil.which
+
+        def with_fixture_gh(command: str) -> str | None:
+            return str(fixture_gh) if module._executable_name(command) == "gh" else real_which(command)
+
+        with mock.patch.object(module.shutil, "which", side_effect=with_fixture_gh):
+            for command in commands:
+                with self.subTest(command=command.split()[0]):
+                    result = self.bash(command, cwd=str(root))
+                    self.assertNotEqual(
+                        "deny",
+                        result["hookSpecificOutput"].get("permissionDecision"),
+                        msg=result,
+                    )
         replay = self.bash(f"git -C '{repo}' push -u origin main", cwd=str(root))
         self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
 
