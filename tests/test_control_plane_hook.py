@@ -2684,6 +2684,151 @@ class HookProtocolTests(unittest.TestCase):
         result = self.bash(push, cwd=self.data_dir)
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
 
+    def test_exact_push_git_dir_binding_tracks_override_repo(self) -> None:
+        module = __import__("control_plane_hook")
+        for quoted in (
+            "--git-dir='C:\\repo\\.git'",
+            '--git-dir="C:\\repo\\.git"',
+        ):
+            with self.subTest(quoted_global_arg=quoted):
+                self.assertEqual(
+                    "--git-dir=C:\\repo\\.git",
+                    module._normalize_git_global_arg(quoted),
+                )
+        windows_space_command = (
+            "git --git-dir='C:\\Program Files\\repo\\.git' "
+            "--work-tree='C:\\Program Files\\repo' push origin main"
+        )
+        self.assertEqual(
+            [
+                "git",
+                "--git-dir=C:\\Program Files\\repo\\.git",
+                "--work-tree=C:\\Program Files\\repo",
+                "push",
+                "origin",
+                "main",
+            ],
+            module._shell_tokens(windows_space_command),
+        )
+
+        cwd_repo = Path(self.data_dir) / "git dir cwd"
+        target_repo = Path(self.data_dir) / "git dir target"
+        for repo, target in (
+            (cwd_repo, "sample-owner/cwd-target"),
+            (target_repo, "sample-owner/override-target"),
+        ):
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", str(repo)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "add",
+                    "origin",
+                    f"https://github.com/{target}.git",
+                ],
+                check=True,
+            )
+
+        commands = (
+            (
+                f"git --git-dir='{target_repo / '.git'}' "
+                f"--work-tree='{target_repo}' push origin main"
+            ),
+            (
+                f"git --git-dir '{target_repo / '.git'}' "
+                f"--work-tree '{target_repo}' push origin main"
+            ),
+        )
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(target_repo),
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/sample-owner/override-target.git",
+                    ],
+                    check=True,
+                )
+                self.turn = f"git-dir-target-drift-{index}"
+                self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(cwd_repo))
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(target_repo),
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/sample-owner/changed-target.git",
+                    ],
+                    check=True,
+                )
+                result = self.bash(command, cwd=str(cwd_repo))
+                self.assertEqual(
+                    "deny", result["hookSpecificOutput"]["permissionDecision"]
+                )
+
+    def test_exact_push_git_dir_binding_ignores_cwd_remote_drift(self) -> None:
+        cwd_repo = Path(self.data_dir) / "git dir cwd drift"
+        target_repo = Path(self.data_dir) / "git dir stable target"
+        for repo, target in (
+            (cwd_repo, "sample-owner/cwd-original"),
+            (target_repo, "sample-owner/target-stable"),
+        ):
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", str(repo)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "remote",
+                    "add",
+                    "origin",
+                    f"https://github.com/{target}.git",
+                ],
+                check=True,
+            )
+
+        command = (
+            f"git --git-dir='{target_repo / '.git'}' "
+            f"--work-tree='{target_repo}' push origin main"
+        )
+        self.prompt(f"本轮明确授权执行 `{command}`。", cwd=str(cwd_repo))
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(cwd_repo),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/sample-owner/cwd-changed.git",
+            ],
+            check=True,
+        )
+        result = self.bash(command, cwd=str(cwd_repo))
+        self.assertNotEqual(
+            "deny", result["hookSpecificOutput"].get("permissionDecision"), msg=result
+        )
+
     @unittest.skipIf(os.name == "nt", "POSIX symlink retarget semantics")
     def test_repo_scope_resolves_symlinks_before_authorization(self) -> None:
         root = Path(self.data_dir)
@@ -2886,6 +3031,52 @@ class HookProtocolTests(unittest.TestCase):
         self.assertNotEqual("deny", commit["hookSpecificOutput"].get("permissionDecision"))
         self.assertNotEqual("deny", run["hookSpecificOutput"].get("permissionDecision"))
 
+    def test_git_operation_parser_uses_verbs_not_paths_or_messages(self) -> None:
+        module = __import__("control_plane_hook")
+        repo = Path(self.data_dir) / "commit-service"
+        repo.mkdir()
+        cases = {
+            f"批准在 {repo} 执行 git add。": {"add"},
+            (
+                "批准执行 `gh repo create sample-owner/commit-service --private "
+                f"--source '{repo}' --remote origin`。"
+            ): set(),
+            "批准在当前仓库执行 `git add commit-service.py`。": {"add"},
+            "批准在当前仓库执行 `git commit -m 'add docs'`。": {"commit"},
+            "批准在当前仓库执行 `git commit -m '允许推送'`。": {"commit"},
+            "批准在当前仓库执行 `git commit -m 'git push origin main'`。": {
+                "commit"
+            },
+            "批准在当前仓库执行 git init/add/commit，并推送 main。": {
+                "init",
+                "add",
+                "commit",
+                "push",
+            },
+            "批准初始化/暂存/提交，并推送 main。": {
+                "init",
+                "add",
+                "commit",
+                "push",
+            },
+        }
+        for prompt, expected in cases.items():
+            with self.subTest(prompt=prompt):
+                authorization = module._git_authorization_text(prompt)
+                self.assertEqual(
+                    expected,
+                    module._prompt_git_operations(authorization, str(repo)),
+                )
+
+        self.prompt(f"批准在 {repo} 执行 git add。", cwd=str(repo))
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        grant = json.loads(state_path.read_text(encoding="utf-8"))["local_git_grant"]
+        self.assertEqual({"add"}, set(grant["operations"]))
+        blocked = self.bash("git commit -m checkpoint", cwd=str(repo))
+        self.assertEqual(
+            "deny", blocked["hookSpecificOutput"]["permissionDecision"]
+        )
+
     def test_scoped_git_transaction_binds_operation_branch_and_replay(self) -> None:
         repo_path = Path(self.data_dir) / "transaction-repo"
         repo_path.mkdir()
@@ -3030,12 +3221,30 @@ class HookProtocolTests(unittest.TestCase):
         )
         fixture_gh = root / ("gh.exe" if os.name == "nt" else "gh")
         fixture_gh.touch()
-        real_which = module.shutil.which
+        if os.name != "nt":
+            fixture_gh.chmod(0o700)
 
-        def with_fixture_gh(command: str) -> str | None:
-            return str(fixture_gh) if module._executable_name(command) == "gh" else real_which(command)
+        original_path = os.environ.get("PATH", "")
+        fixture_env = {
+            "PATH": (
+                f"{root}{os.pathsep}{original_path}" if original_path else str(root)
+            )
+        }
+        if os.name == "nt":
+            original_pathext = os.environ.get("PATHEXT", "")
+            fixture_env["PATHEXT"] = (
+                f".EXE{os.pathsep}{original_pathext}"
+                if original_pathext
+                else ".EXE"
+            )
 
-        with mock.patch.object(module.shutil, "which", side_effect=with_fixture_gh):
+        with mock.patch.dict(os.environ, fixture_env, clear=False):
+            resolved_gh = module.shutil.which("gh")
+            self.assertIsNotNone(resolved_gh)
+            self.assertEqual(
+                os.path.normcase(os.path.realpath(fixture_gh)),
+                os.path.normcase(os.path.realpath(resolved_gh or "")),
+            )
             for command in commands:
                 with self.subTest(command=command.split()[0]):
                     result = self.bash(command, cwd=str(root))
@@ -3133,6 +3342,47 @@ class HookProtocolTests(unittest.TestCase):
             with self.subTest(executable_context=command):
                 self.assertTrue(module._contains_clone_invocation(command))
 
+        dynamic_clone_contexts = (
+            "git -c protocol.version=2 clone https://github.com/example/a.git /tmp/a",
+            "git -cprotocol.version=2 clone https://github.com/example/a.git /tmp/a",
+            "git -C /tmp -c protocol.version=2 clone "
+            "https://github.com/example/a.git /tmp/a",
+            "git -c alias.audit=clone audit --depth 1 --no-checkout "
+            "https://github.com/example/a.git /tmp/a",
+            "git --config-env=alias.audit=GIT_ALIAS audit --depth 1 --no-checkout "
+            "https://github.com/example/a.git /tmp/a",
+            "git --config-env protocol.version=GIT_PROTOCOL clone "
+            "https://github.com/example/a.git /tmp/a",
+        )
+        for command in dynamic_clone_contexts:
+            with self.subTest(dynamic_clone=command):
+                self.assertTrue(module._contains_clone_invocation(command))
+
+    def test_sed_read_only_classifier_rejects_execution_and_writes(self) -> None:
+        module = __import__("control_plane_hook")
+        safe = (
+            "sed -n '1,20p' README.md",
+            "sed -n '/release/p' README.md",
+            "sed -e 's/error/warning/g' README.md",
+            "sed -n -e '1,5p' -e '/release/p' README.md",
+        )
+        unsafe = (
+            "sed '1e id' README.md",
+            "sed 's/.*/id/e' README.md",
+            "sed '1w out' README.md",
+            "sed 's/x/y/w out' README.md",
+            "sed -f commands.sed README.md",
+            "sed --in-place 's/x/y/' README.md",
+            "sed 'p' README.md -ni",
+            "sed 'p' README.md -e '1e id'",
+        )
+        for command in safe:
+            with self.subTest(safe=command):
+                self.assertTrue(module._is_strictly_read_only_command(command))
+        for command in unsafe:
+            with self.subTest(unsafe=command):
+                self.assertFalse(module._is_strictly_read_only_command(command))
+
     def test_clone_provenance_gates_execution_and_mutation_but_allows_reads(self) -> None:
         workspace = Path(self.data_dir) / "tracked-clone-workspace"
         workspace.mkdir()
@@ -3169,6 +3419,14 @@ class HookProtocolTests(unittest.TestCase):
             ("python3 setup.py", str(destination)),
             (f"cp '{setup}' '{workspace / 'copy.py'}'", str(workspace)),
             (f"git -C '{destination}' checkout main", str(workspace)),
+            ("sed '1e id' setup.py", str(destination)),
+            ("sed 's/.*/id/e' setup.py", str(destination)),
+            ("sed '1w out' setup.py", str(destination)),
+            ("sed 's/x/y/w out' setup.py", str(destination)),
+            ("sed -f commands.sed setup.py", str(destination)),
+            ("sed --in-place 's/x/y/' setup.py", str(destination)),
+            ("sed 'p' setup.py -ni", str(destination)),
+            ("sed 'p' setup.py -e '1e id'", str(destination)),
         )
         for blocked_command, cwd in blocked:
             with self.subTest(command=blocked_command):
@@ -3200,6 +3458,22 @@ class HookProtocolTests(unittest.TestCase):
             "gh repo clone example-owner/example-repo",
             "gh repo clone example-owner/example-repo relative-clone",
             "sh -c 'git clone https://github.com/example-owner/example-repo.git nested'",
+            (
+                "git -c protocol.version=2 clone "
+                f"https://github.com/example-owner/example-repo.git {workspace / 'dynamic'}"
+            ),
+            (
+                "git -cprotocol.version=2 clone "
+                f"https://github.com/example-owner/example-repo.git {workspace / 'compact'}"
+            ),
+            (
+                "git -c alias.audit=clone audit --depth 1 --no-checkout "
+                f"https://github.com/example-owner/example-repo.git {workspace / 'alias'}"
+            ),
+            (
+                "git --config-env=alias.audit=GIT_ALIAS audit --depth 1 --no-checkout "
+                f"https://github.com/example-owner/example-repo.git {workspace / 'config-env'}"
+            ),
         )
         for index, command in enumerate(commands):
             with self.subTest(index=index):
