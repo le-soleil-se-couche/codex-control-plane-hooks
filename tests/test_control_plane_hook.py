@@ -3581,6 +3581,7 @@ class HookProtocolTests(unittest.TestCase):
         executable_contexts = (
             "env git clone https://github.com/example/a.git /tmp/a",
             "sh -c 'git clone https://github.com/example/a.git /tmp/a'",
+            "sh -c 'sh -c \"git clone https://github.com/example/a.git /tmp/a\"'",
             'pwsh -Command "git clone https://github.com/example/a.git C:\\Temp\\a"',
             'cmd /c "git clone https://github.com/example/a.git C:\\Temp\\a"',
         )
@@ -3704,6 +3705,10 @@ class HookProtocolTests(unittest.TestCase):
             "gh repo clone example-owner/example-repo",
             "gh repo clone example-owner/example-repo relative-clone",
             "sh -c 'git clone https://github.com/example-owner/example-repo.git nested'",
+            (
+                "sh -c 'sh -c \"git clone "
+                "https://github.com/example-owner/example-repo.git nested\"'"
+            ),
             (
                 "git -c protocol.version=2 clone "
                 f"https://github.com/example-owner/example-repo.git {workspace / 'dynamic'}"
