@@ -54,7 +54,11 @@ def child_environment(codex_home: Path) -> dict[str, str]:
             environment.pop(name)
     environment.pop("CODEX_SANDBOX", None)
     environment.pop("CODEX_SANDBOX_NETWORK_DISABLED", None)
-    environment.update(CODEX_HOME=str(codex_home), NO_COLOR="1")
+    environment.update(
+        CODEX_HOME=str(codex_home),
+        PLUGIN_DATA=str(codex_home / "plugin-data"),
+        NO_COLOR="1",
+    )
     leaked = [name for name in environment if CREDENTIAL_NAME.search(name.upper())]
     require(not leaked, f"credential-like environment names reached Codex: {leaked}")
     return environment
@@ -263,8 +267,8 @@ def verify_discovery_and_trust(
 
 
 class MockState:
-    def __init__(self, command: str, call_id: str) -> None:
-        self.command, self.call_id = command, call_id
+    def __init__(self, commands: list[tuple[str, str]]) -> None:
+        self.commands = commands
         self.requests: list[dict[str, Any]] = []
         self.errors: list[str] = []
         self.lock = threading.Lock()
@@ -277,8 +281,11 @@ USAGE = {
 
 
 def response_events(state: MockState, index: int, body: dict[str, Any]) -> list[dict[str, Any]]:
+    step = index // 2
+    require(step < len(state.commands), "Codex made more Responses requests than expected")
+    command, call_id = state.commands[step]
     response_id = f"resp-host-smoke-{index + 1}"
-    if index == 0:
+    if index % 2 == 0:
         tools = body.get("tools")
         require(isinstance(tools, list), "Responses request has no tools array")
         names = {
@@ -288,22 +295,20 @@ def response_events(state: MockState, index: int, body: dict[str, Any]) -> list[
         }
         if "shell" in names or "shell_command" in names:
             tool_name = "shell" if "shell" in names else "shell_command"
-            arguments = {"command": state.command}
+            arguments = {"command": command}
         elif "exec_command" in names:
-            tool_name, arguments = "exec_command", {"cmd": state.command, "yield_time_ms": 10000}
+            tool_name, arguments = "exec_command", {"cmd": command, "yield_time_ms": 10000}
         else:
             raise RuntimeError(f"Codex exposed no supported shell tool: {sorted(names)}")
         item = {
-            "type": "function_call", "call_id": state.call_id, "name": tool_name,
+            "type": "function_call", "call_id": call_id, "name": tool_name,
             "arguments": json.dumps(arguments, separators=(",", ":")),
         }
-    elif index == 1:
+    else:
         item = {
-            "type": "message", "role": "assistant", "id": f"message-{state.call_id}",
+            "type": "message", "role": "assistant", "id": f"message-{call_id}",
             "content": [{"type": "output_text", "text": "host smoke complete"}],
         }
-    else:
-        raise RuntimeError("Codex made more than two Responses requests")
     return [
         {"type": "response.created", "response": {"id": response_id}},
         {"type": "response.output_item.done", "item": item},
@@ -357,8 +362,8 @@ class ResponsesHandler(http.server.BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def responses_server(command: str, call_id: str) -> Iterator[tuple[str, MockState]]:
-    state = MockState(command, call_id)
+def responses_server(commands: list[tuple[str, str]]) -> Iterator[tuple[str, MockState]]:
+    state = MockState(commands)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ResponsesHandler)
     server.daemon_threads = True
     server.state = state  # type: ignore[attr-defined]
@@ -373,7 +378,7 @@ def responses_server(command: str, call_id: str) -> Iterator[tuple[str, MockStat
         thread.join(timeout=5)
 
 
-def validate_jsonl(output: str) -> None:
+def validate_jsonl(output: str) -> list[dict[str, Any]]:
     lines = [line for line in output.splitlines() if line.strip()]
     require(bool(lines), "codex exec --json emitted no events")
     try:
@@ -381,30 +386,79 @@ def validate_jsonl(output: str) -> None:
     except json.JSONDecodeError as exc:
         raise RuntimeError("codex exec emitted non-JSON stdout") from exc
     require(all(isinstance(event, dict) for event in events), "codex exec JSONL event is not an object")
+    return events
 
 
-def function_output(state: MockState) -> str:
+def started_thread_id(output: str) -> str:
+    for event in validate_jsonl(output):
+        if event.get("type") == "thread.started" and isinstance(event.get("thread_id"), str):
+            return str(event["thread_id"])
+    raise RuntimeError("codex exec JSONL did not include a thread.started event")
+
+
+def function_output(
+    state: MockState,
+    *,
+    call_id: str,
+    request_index: int,
+    expected_requests: int,
+) -> str:
     with state.lock:
         errors, requests = list(state.errors), list(state.requests)
     require(not errors, f"loopback Responses errors: {errors}")
-    require(len(requests) == 2, f"expected two Responses requests, got {len(requests)}")
-    second_input = requests[1].get("input")
+    require(
+        len(requests) == expected_requests,
+        f"expected {expected_requests} Responses requests, got {len(requests)}",
+    )
+    second_input = requests[request_index].get("input")
     require(isinstance(second_input, list), "second Responses request has no input array")
     outputs = [
         item
         for item in second_input
         if isinstance(item, dict)
         and item.get("type") == "function_call_output"
-        and item.get("call_id") == state.call_id
+        and item.get("call_id") == call_id
     ]
     require(len(outputs) == 1, "second Responses request has no matching function output")
     output = outputs[0].get("output")
     return output if isinstance(output, str) else json.dumps(output, sort_keys=True)
 
 
+def grant_debug(codex_home: Path) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for path in codex_home.rglob("session-*.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        grant = state.get("local_git_grant")
+        snapshots.append(
+            {
+                "path": path.relative_to(codex_home).as_posix(),
+                "session_id": state.get("session_id"),
+                "turn_id": state.get("turn_id"),
+                "grant": {
+                    key: grant.get(key)
+                    for key in (
+                        "transaction_id",
+                        "turn_id",
+                        "issued_turn_id",
+                        "session_hash",
+                        "authorization_cwd",
+                        "operations",
+                        "consumed_operations",
+                    )
+                }
+                if isinstance(grant, dict)
+                else None,
+            }
+        )
+    return snapshots
+
+
 def runtime_case(codex: Path, environment: dict[str, str], cwd: Path, name: str, command: str) -> str:
     call_id = f"host-smoke-{name}"
-    with responses_server(command, call_id) as (base_url, state):
+    with responses_server([(command, call_id)]) as (base_url, state):
         provider = (
             f'model_providers.{PROVIDER}={{ name = "Host Smoke", base_url = "{base_url}", '
             'wire_api = "responses", requires_openai_auth = false }'
@@ -427,10 +481,156 @@ def runtime_case(codex: Path, environment: dict[str, str], cwd: Path, name: str,
             cwd,
         )
         validate_jsonl(completed.stdout)
-        return function_output(state)
+        return function_output(
+            state,
+            call_id=call_id,
+            request_index=1,
+            expected_requests=2,
+        )
 
 
-def verify_runtime(codex: Path, environment: dict[str, str], cwd: Path) -> None:
+def verify_transaction_resume(
+    codex: Path,
+    environment: dict[str, str],
+    codex_home: Path,
+    cwd: Path,
+) -> None:
+    repo = cwd / "transaction-resume"
+    repo.mkdir()
+    marker = repo / "marker.txt"
+    marker.write_text("cross-platform transaction smoke\n", encoding="utf-8")
+    target = "example-owner/codex-host-smoke"
+    for arguments in (
+        ["git", "init", "-q", "-b", "main", str(repo)],
+        ["git", "-C", str(repo), "config", "user.name", "Codex Host Smoke"],
+        ["git", "-C", str(repo), "config", "user.email", "host-smoke@example.invalid"],
+        ["git", "-C", str(repo), "remote", "add", "origin", f"https://github.com/{target}.git"],
+    ):
+        subprocess.run(arguments, check=True, capture_output=True, text=True)
+
+    plugin_data = Path(environment["PLUGIN_DATA"])
+    plugin_data.mkdir(parents=True, exist_ok=True)
+    policy_path = (
+        plugin_data / "policy.json"
+        if os.name == "nt"
+        else codex_home / "transaction-policy.json"
+    )
+    policy_path.write_text(
+        json.dumps(
+            {
+                "enable_natural_language_approvals": True,
+                "enable_scoped_git_transactions": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        policy_path.chmod(0o600)
+    transaction_environment = dict(environment)
+    if os.name != "nt":
+        transaction_environment["CONTROL_PLANE_POLICY"] = str(policy_path)
+    add_call = "host-smoke-transaction-add"
+    commit_call = "host-smoke-transaction-commit"
+    commands = [
+        ("git add -- marker.txt", add_call),
+        ("git commit -m host-smoke-transaction", commit_call),
+    ]
+    with responses_server(commands) as (base_url, state):
+        provider = (
+            f'model_providers.{PROVIDER}={{ name = "Host Smoke", base_url = "{base_url}", '
+            'wire_api = "responses", requires_openai_auth = false }'
+        )
+        shared = [
+            *CLI_BASE,
+            "--disable", "enable_request_compression",
+            "-c", provider,
+            "-c", f'model_provider="{PROVIDER}"',
+            "-c", "analytics.enabled=false",
+            "--ask-for-approval", "never",
+            "--sandbox", "danger-full-access",
+        ]
+        first = run_codex(
+            codex,
+            [
+                *shared,
+                "exec", "--strict-config", "--json", "--ignore-rules",
+                "--skip-git-repo-check", "--color", "never", "--model", MODEL,
+                "--cd", str(repo),
+                f"允许在 `{repo}` 执行 git add/commit，并在 example-owner 下创建 "
+                "codex-host-smoke private repository，推送 origin main。请执行第一步。",
+            ],
+            transaction_environment,
+            repo,
+        )
+        thread_id = started_thread_id(first.stdout)
+        add_output = function_output(
+            state,
+            call_id=add_call,
+            request_index=1,
+            expected_requests=2,
+        )
+        require(
+            not add_output.startswith("Command blocked by PreToolUse hook:"),
+            f"transaction add was denied: {add_output}",
+        )
+        staged = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        require(
+            staged == ["marker.txt"],
+            f"transaction add staged unexpected paths: {staged}; output: {add_output}",
+        )
+
+        resumed = run_codex(
+            codex,
+            [
+                *shared,
+                "exec", "resume", "--strict-config", "--json", "--ignore-rules",
+                "--skip-git-repo-check", "--model", MODEL, thread_id,
+                "本轮明确授权执行：随后继续执行上一条已授权的发布事务。请执行下一步。",
+            ],
+            transaction_environment,
+            repo,
+        )
+        validate_jsonl(resumed.stdout)
+        commit_output = function_output(
+            state,
+            call_id=commit_call,
+            request_index=3,
+            expected_requests=4,
+        )
+        require(
+            not commit_output.startswith("Command blocked by PreToolUse hook:"),
+            f"transaction commit was denied: {commit_output}; state: {grant_debug(codex_home)}",
+        )
+
+    commit_count = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    require(commit_count == "1", f"transaction resume created {commit_count!r} commits")
+    require(
+        not subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout,
+        "transaction resume repository is dirty",
+    )
+
+
+def verify_runtime(
+    codex: Path,
+    environment: dict[str, str],
+    codex_home: Path,
+    cwd: Path,
+) -> None:
     safe = runtime_case(codex, environment, cwd, "safe", f'python -c "print(\'{SAFE_SENTINEL}\')"')
     require(SAFE_SENTINEL in safe, "safe runtime command did not execute")
     dangerous = runtime_case(
@@ -442,6 +642,7 @@ def verify_runtime(codex: Path, environment: dict[str, str], cwd: Path) -> None:
         dangerous.startswith("Command blocked by PreToolUse hook:"),
         f"dangerous command did not return a Hook denial: {dangerous}",
     )
+    verify_transaction_resume(codex, environment, codex_home, cwd)
 
 
 def verify_no_auth(codex_home: Path) -> None:
@@ -487,11 +688,12 @@ def main() -> int:
         runtime_cwd = codex_home / "runtime-workspace"
         runtime_cwd.mkdir()
         verify_discovery_and_trust(codex, environment, codex_home, runtime_cwd)
-        verify_runtime(codex, environment, runtime_cwd)
+        verify_runtime(codex, environment, codex_home, runtime_cwd)
         verify_no_auth(codex_home)
     print(
         f"Codex CLI host smoke passed: {args.expected_version}; "
-        "clean home; checkout install; hooks/list untrusted->trusted; safe allow; dangerous deny"
+        "clean home; checkout install; hooks/list untrusted->trusted; safe allow; dangerous deny; "
+        "cross-turn publication transaction resume"
     )
     return 0
 

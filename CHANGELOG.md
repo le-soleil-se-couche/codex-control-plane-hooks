@@ -4,6 +4,12 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+- Added explicit continuation for an unfinished scoped Git/GitHub publication transaction across prompt turns. Continuation rebinds only the active turn while preserving the original session, authorization cwd, issue time, repository mappings, operations, and append-only consumption ledger.
+- Kept the original 10-minute transaction TTL, exact one-shot repository-local identity correction, and strict amend path; generic continuation, replay, scope or target drift, branch changes, public or internal visibility, and force-push expansion fail closed.
+- Preserved an unfinished transaction or pending scoped Git operation through the host `Stop` event so the next-turn approval path works in a real Codex session; completed and expired state still cleans up.
+- Allowed a narrow read-only `git config` query grammar for publication preflight while keeping mutations, alternate config files, and malformed queries behind the Git gate.
+- Added a Windows launcher that prefers `python.exe` and falls back to `py.exe -3`, plus a real Codex host smoke for cross-turn `add` to transaction resume to `commit` on Ubuntu and Windows CI.
+
 ## [0.2.4] - 2026-07-17
 
 - Unwrapped ordinary `pwsh` and `powershell.exe` launchers instead of classifying the launcher itself as dynamic evaluation, while continuing to classify dangerous `-Command` payloads recursively.

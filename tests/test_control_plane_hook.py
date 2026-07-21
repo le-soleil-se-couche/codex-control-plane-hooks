@@ -104,6 +104,34 @@ class HookProtocolTests(unittest.TestCase):
         policy.update(updates)
         path.write_text(json.dumps(policy), encoding="utf-8")
 
+    def prepare_publication_grant(
+        self, name: str
+    ) -> tuple[Path, Path, str, Path]:
+        root = Path(self.data_dir) / f"publication-{name}"
+        repo = root / name
+        repo.mkdir(parents=True)
+        target = f"fixture-owner/{name}"
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", f"https://github.com/{target}.git"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.prompt(
+            f"允许在 {repo} 执行 git init/add/commit，并在 fixture-owner 下创建 "
+            f"{name} private repository，推送 main。",
+            cwd=str(root),
+        )
+        digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
+        state_path = Path(self.data_dir) / f"session-{digest}.json"
+        return root, repo, target, state_path
+
     def bash(self, command: str, *, cwd: str = DEFAULT_CWD) -> dict:
         return self.run_hook(
             {
@@ -607,7 +635,7 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual({}, self.bash("pwd"))
 
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(3, state["schema_version"])
+        self.assertEqual(4, state["schema_version"])
         self.assertIn("pending_permission_authorizations", state)
 
     def test_malformed_state_fails_closed_without_replacement(self) -> None:
@@ -876,6 +904,11 @@ class HookProtocolTests(unittest.TestCase):
                     check=False,
                 )
                 if created.returncode != 0:
+                    if os.environ.get("GITHUB_ACTIONS") == "true":
+                        self.fail(
+                            "Windows CI could not create the junction fixture: "
+                            + created.stderr.strip()
+                        )
                     self.skipTest("Windows junction creation is unavailable")
             else:
                 link.symlink_to(real, target_is_directory=True)
@@ -892,6 +925,20 @@ class HookProtocolTests(unittest.TestCase):
                 if os.name == "nt" and link.exists():
                     os.rmdir(link)
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_windows_reparse_attribute_detection_has_no_privilege_dependency(self) -> None:
+        module = __import__("control_plane_hook")
+        marker = 0x400
+        with mock.patch.object(
+            module.stat,
+            "FILE_ATTRIBUTE_REPARSE_POINT",
+            marker,
+            create=True,
+        ):
+            self.assertTrue(
+                module._is_reparse_info(mock.Mock(st_file_attributes=marker))
+            )
+            self.assertFalse(module._is_reparse_info(mock.Mock(st_file_attributes=0)))
 
     def test_successful_stop_removes_session_state(self) -> None:
         self.prompt("Inspect the project.")
@@ -2459,6 +2506,35 @@ class HookProtocolTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual({}, self.bash(command))
 
+    def test_git_config_queries_are_read_only(self) -> None:
+        for command in [
+            "git config --local --get user.name",
+            "git config --local --get user.email",
+            "git config --global --get-all credential.helper",
+            "git config --get-regexp '^remote\\..*\\.url$'",
+            "git config --get-urlmatch http.https://example.invalid.proxy https://example.invalid",
+            "git config --local --list",
+            "git config -l",
+        ]:
+            with self.subTest(command=command):
+                self.assertEqual({}, self.bash(command))
+
+    def test_git_config_mutations_and_ambiguous_queries_are_denied(self) -> None:
+        for command in [
+            "git config --local user.name 'Release Bot'",
+            "git config --local --add user.name 'Release Bot'",
+            "git config --local --unset user.name",
+            "git config --local --get",
+            "git config --file /tmp/config --get user.name",
+            "git config --local --list unexpected",
+        ]:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+                self.assertIn(
+                    "git_non_read_only", result["hookSpecificOutput"]["permissionDecisionReason"]
+                )
+
     def test_git_branch_metadata_mutations_are_denied(self) -> None:
         for command in [
             "git branch -u origin/main",
@@ -3096,6 +3172,16 @@ class HookProtocolTests(unittest.TestCase):
         self.prompt("Prepare the local checkpoint.")
         blocked = self.bash("git add src/app.py", cwd="/tmp/repo-a")
         self.assertEqual("deny", blocked["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual(
+            {},
+            self.run_hook(
+                {
+                    "hook_event_name": "Stop",
+                    "stop_hook_active": False,
+                    "cwd": "/tmp",
+                }
+            ),
+        )
         self.run_hook(
             {
                 "hook_event_name": "UserPromptSubmit",
@@ -3501,6 +3587,250 @@ class HookProtocolTests(unittest.TestCase):
                     )
         replay = self.bash(f"git -C '{repo}' push -u origin main", cwd=str(root))
         self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+    def test_publication_transaction_continues_after_exact_local_correction(self) -> None:
+        root, repo, target, state_path = self.prepare_publication_grant(
+            "resume-workbench"
+        )
+        initial_grant = json.loads(state_path.read_text(encoding="utf-8"))[
+            "local_git_grant"
+        ]
+        for command in (
+            f"git -C '{repo}' init -b main",
+            f"git -C '{repo}' add -- .",
+            f"git -C '{repo}' commit -m 'feat: publish workbench'",
+        ):
+            result = self.bash(command, cwd=str(root))
+            self.assertNotEqual(
+                "deny",
+                result["hookSpecificOutput"].get("permissionDecision"),
+                msg=(command, result),
+            )
+
+        self.assertEqual(
+            {},
+            self.run_hook(
+                {
+                    "hook_event_name": "Stop",
+                    "stop_hook_active": False,
+                    "cwd": str(root),
+                }
+            ),
+        )
+
+        self.turn = "publication-resume-correction"
+        config_command = f"git -C '{repo}' config --local user.name 'Release Bot'"
+        amend_command = (
+            f"git -C '{repo}' commit --amend --no-edit --reset-author"
+        )
+        self.prompt(
+            "本轮明确授权执行：\n"
+            f"{config_command}\n"
+            f"{amend_command}\n"
+            "随后继续执行上一条已授权的发布事务。",
+            cwd=str(root),
+        )
+        continued_grant = json.loads(state_path.read_text(encoding="utf-8"))[
+            "local_git_grant"
+        ]
+        for key in (
+            "transaction_id",
+            "issued_at",
+            "issued_turn_id",
+            "session_hash",
+            "authorization_cwd",
+            "operations",
+            "bindings",
+        ):
+            self.assertEqual(initial_grant[key], continued_grant[key], msg=key)
+        self.assertEqual(self.turn, continued_grant["turn_id"])
+
+        for command in (config_command, amend_command):
+            result = self.bash(command, cwd=str(root))
+            self.assertNotEqual(
+                "deny",
+                result["hookSpecificOutput"].get("permissionDecision"),
+                msg=(command, result),
+            )
+        replayed_amend = self.bash(amend_command, cwd=str(root))
+        replayed_add = self.bash(f"git -C '{repo}' add -- .", cwd=str(root))
+        self.assertEqual(
+            "deny", replayed_amend["hookSpecificOutput"]["permissionDecision"]
+        )
+        self.assertEqual(
+            "deny", replayed_add["hookSpecificOutput"]["permissionDecision"]
+        )
+
+        fixture_gh = root / ("gh.exe" if os.name == "nt" else "gh")
+        fixture_gh.touch()
+        if os.name != "nt":
+            fixture_gh.chmod(0o700)
+        original_path = os.environ.get("PATH", "")
+        fixture_env = {
+            "PATH": (
+                f"{root}{os.pathsep}{original_path}"
+                if original_path
+                else str(root)
+            )
+        }
+        if os.name == "nt":
+            fixture_env["PATHEXT"] = ".EXE" + os.pathsep + os.environ.get(
+                "PATHEXT", ""
+            )
+        with mock.patch.dict(os.environ, fixture_env, clear=False):
+            create = self.bash(
+                f"gh repo create {target} --private --source '{repo}' --remote origin",
+                cwd=str(root),
+            )
+        self.assertNotEqual(
+            "deny", create["hookSpecificOutput"].get("permissionDecision"), msg=create
+        )
+        push = self.bash(f"git -C '{repo}' push -u origin main", cwd=str(root))
+        completed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        replay = self.bash(f"git -C '{repo}' push -u origin main", cwd=str(root))
+        self.assertNotEqual(
+            "deny", push["hookSpecificOutput"].get("permissionDecision"), msg=push
+        )
+        self.assertIsNone(completed_state["local_git_grant"])
+        self.assertEqual("deny", replay["hookSpecificOutput"]["permissionDecision"])
+
+    def test_publication_transaction_resume_rejects_expired_generic_and_policy_disabled(self) -> None:
+        cases = ("expired", "legacy", "generic", "policy-disabled")
+        for index, label in enumerate(cases):
+            with self.subTest(label=label):
+                self.session = f"resume-boundary-session-{index}"
+                self.turn = f"resume-boundary-initial-{index}"
+                root, repo, _, state_path = self.prepare_publication_grant(
+                    f"resume-boundary-{index}"
+                )
+                if label == "expired":
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["local_git_grant"]["issued_at"] = 0
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                elif label == "legacy":
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["local_git_grant"].pop("transaction_id")
+                    state["local_git_grant"].pop("issued_at")
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                elif label == "policy-disabled":
+                    self.update_policy(enable_scoped_git_transactions=False)
+
+                self.turn = f"resume-boundary-next-{index}"
+                prompt = (
+                    "我批准你继续。"
+                    if label == "generic"
+                    else (
+                        "本轮明确授权执行：\n"
+                        f"git -C '{repo}' commit --amend --no-edit --reset-author\n"
+                        "随后继续执行上一条已授权的发布事务。"
+                    )
+                )
+                self.prompt(prompt, cwd=str(root))
+                denied = self.bash(
+                    f"git -C '{repo}' push origin main", cwd=str(root)
+                )
+                self.assertEqual(
+                    "deny", denied["hookSpecificOutput"]["permissionDecision"]
+                )
+                if label == "policy-disabled":
+                    self.update_policy(enable_scoped_git_transactions=True)
+
+    def test_publication_transaction_resume_rejects_session_and_cwd_drift(self) -> None:
+        for index, label in enumerate(("session", "cwd")):
+            with self.subTest(label=label):
+                self.session = f"resume-context-session-{index}"
+                self.turn = f"resume-context-initial-{index}"
+                root, repo, _, _ = self.prepare_publication_grant(
+                    f"resume-context-{index}"
+                )
+                continuation_cwd = root
+                if label == "session":
+                    self.session = f"resume-context-other-session-{index}"
+                else:
+                    continuation_cwd = root / "other-cwd"
+                    continuation_cwd.mkdir()
+                self.turn = f"resume-context-next-{index}"
+                self.prompt(
+                    "本轮明确授权执行：\n"
+                    f"git -C '{repo}' commit --amend --no-edit --reset-author\n"
+                    "随后继续执行上一条已授权的发布事务。",
+                    cwd=str(continuation_cwd),
+                )
+                denied = self.bash(
+                    f"git -C '{repo}' push origin main",
+                    cwd=str(continuation_cwd),
+                )
+                self.assertEqual(
+                    "deny", denied["hookSpecificOutput"]["permissionDecision"]
+                )
+
+    def test_publication_transaction_resume_rejects_scope_target_branch_and_risk_drift(self) -> None:
+        cases = (
+            "scope",
+            "target",
+            "branch",
+            "visibility",
+            "force",
+            "global-config",
+            "hooks-path",
+            "credential-helper",
+            "ssh-command",
+            "remote-rewrite",
+            "unsafe-amend",
+        )
+        for index, label in enumerate(cases):
+            with self.subTest(label=label):
+                self.session = f"resume-drift-session-{index}"
+                self.turn = f"resume-drift-initial-{index}"
+                root, repo, target, _ = self.prepare_publication_grant(
+                    f"resume-drift-{index}"
+                )
+                other = root / "other-repo"
+                other.mkdir()
+                commands = {
+                    "scope": f"git -C '{other}' commit --amend --no-edit --reset-author",
+                    "target": (
+                        f"gh repo create fixture-owner/other-workbench --private "
+                        f"--source '{repo}' --remote origin"
+                    ),
+                    "branch": f"git -C '{repo}' push origin other-branch",
+                    "visibility": (
+                        f"gh repo create {target} --public --source '{repo}' --remote origin"
+                    ),
+                    "force": f"git -C '{repo}' push --force origin main",
+                    "global-config": (
+                        f"git -C '{repo}' config --global user.name 'Wrong Scope'"
+                    ),
+                    "hooks-path": (
+                        f"git -C '{repo}' config --local core.hooksPath /tmp/hooks"
+                    ),
+                    "credential-helper": (
+                        f"git -C '{repo}' config --local credential.helper store"
+                    ),
+                    "ssh-command": (
+                        f"git -C '{repo}' config --local core.sshCommand 'ssh -i /tmp/key'"
+                    ),
+                    "remote-rewrite": (
+                        f"git -C '{repo}' remote set-url origin "
+                        "https://github.com/fixture-owner/other.git"
+                    ),
+                    "unsafe-amend": (
+                        f"git -C '{repo}' commit --amend --no-edit"
+                    ),
+                }
+                self.turn = f"resume-drift-next-{index}"
+                self.prompt(
+                    "本轮明确授权执行：\n"
+                    f"{commands[label]}\n"
+                    "随后继续执行上一条已授权的发布事务。",
+                    cwd=str(root),
+                )
+                denied = self.bash(
+                    f"git -C '{repo}' push origin main", cwd=str(root)
+                )
+                self.assertEqual(
+                    "deny", denied["hookSpecificOutput"]["permissionDecision"]
+                )
 
     def test_publication_transaction_rejects_visibility_target_force_and_fake_tools(self) -> None:
         root = Path(self.data_dir) / "publication-attacks"
@@ -4269,6 +4599,22 @@ class HookProtocolTests(unittest.TestCase):
             },
             mappings,
         )
+        initial_transaction_id = grant["transaction_id"]
+        initial_bindings = grant["bindings"]
+        initial_issued_at = grant["issued_at"]
+        self.turn = "multi-repo-resume-turn"
+        self.prompt(
+            "本轮明确授权执行：\n"
+            f"git -C '{repo_a}' config --local user.name 'Release Bot'\n"
+            "随后继续执行上一条已授权的发布事务。",
+            cwd=self.data_dir,
+        )
+        continued = json.loads(state_path.read_text(encoding="utf-8"))[
+            "local_git_grant"
+        ]
+        self.assertEqual(initial_transaction_id, continued["transaction_id"])
+        self.assertEqual(initial_bindings, continued["bindings"])
+        self.assertEqual(initial_issued_at, continued["issued_at"])
 
     def test_prompt_github_mapping_does_not_require_gh_on_path(self) -> None:
         module = __import__("control_plane_hook")
