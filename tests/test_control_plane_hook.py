@@ -1020,6 +1020,10 @@ class HookProtocolTests(unittest.TestCase):
         self.assertIn('$env:PYTHON_MANAGER_AUTOMATIC_INSTALL = "0"', powershell_launcher)
         self.assertIn("exit [int] $LASTEXITCODE", powershell_launcher)
         self.assertIn('set "ERRORLEVEL="', cmd_shim)
+        self.assertIn(
+            r'%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe',
+            cmd_shim,
+        )
         self.assertIn("run_control_plane_hook.ps1", cmd_shim)
         commands = [
             hook["commandWindows"]
