@@ -79,9 +79,12 @@ class ReleaseLayoutTests(unittest.TestCase):
     def test_ci_runs_pinned_linux_and_windows_codex_host_smoke(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("host-smoke:", workflow)
-        self.assertIn("os: [ubuntu-24.04, windows-2022]", workflow)
+        self.assertIn("os: [ubuntu-24.04, macos-14, windows-2022]", workflow)
         self.assertIn("@openai/codex@0.144.4", workflow)
         self.assertIn("scripts/smoke_codex_host.py", workflow)
+        host_smoke = (ROOT / "scripts" / "smoke_codex_host.py").read_text(encoding="utf-8")
+        self.assertIn('"exec", "resume"', host_smoke)
+        self.assertIn('"enable_scoped_git_transactions": True', host_smoke)
 
     def test_every_command_hook_has_a_windows_override(self) -> None:
         hooks = json.loads(
@@ -104,6 +107,26 @@ class ReleaseLayoutTests(unittest.TestCase):
         for handler in commands:
             self.assertIn("$PLUGIN_ROOT", handler["command"])
             self.assertIn("$env:PLUGIN_ROOT", handler["commandWindows"])
+            self.assertIn("run_control_plane_hook.ps1", handler["commandWindows"])
+        powershell_launcher = (
+            ROOT
+            / "plugins"
+            / "codex-control-plane-hooks"
+            / "scripts"
+            / "run_control_plane_hook.ps1"
+        ).read_text(encoding="utf-8")
+        cmd_shim = (
+            ROOT
+            / "plugins"
+            / "codex-control-plane-hooks"
+            / "scripts"
+            / "run_control_plane_hook.cmd"
+        ).read_text(encoding="utf-8")
+        self.assertIn('-Name "py.exe"', powershell_launcher)
+        self.assertIn('-Name "python.exe"', powershell_launcher)
+        self.assertIn("run_control_plane_hook.ps1", cmd_shim)
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("*.cmd text eol=crlf", attributes)
 
     def test_manifest_covers_nested_exec_and_posttool_reads(self) -> None:
         hooks = json.loads(
