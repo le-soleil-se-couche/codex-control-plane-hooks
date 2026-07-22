@@ -7,12 +7,13 @@ All notable changes are documented here. The project follows Semantic Versioning
 ## [0.2.5] - 2026-07-22
 
 - Added explicit continuation for an unfinished scoped Git/GitHub publication transaction across prompt turns. Continuation rebinds only the active turn while preserving the original session, authorization cwd, issue time, repository mappings, operations, and append-only consumption ledger.
-- Extended the transaction TTL to 30 minutes and moved operation consumption from `PreToolUse` to matching successful `PostToolUse`; `PermissionRequest`, `Stop`, and cross-turn continuation retain the same reservation without requesting the grant again.
+- Extended the transaction TTL to 30 minutes and moved operation consumption from `PreToolUse` to matching successful `PostToolUse`; a one-time private runner now records the real child exit code, so string or output-only tool responses cannot turn partial Git execution into authorization success. Nonzero, missing, replayed, malformed, or mismatched receipts revoke the transaction and its pending reservations.
+- Bound each exact Git operation to its repository-specific command digest, rejected unsupported exact commands that cannot produce a digest, and retired heterogeneous multi-repository grants from each scope's effective operation set instead of a global cross-product.
 - Parsed safety exclusions outside the positive authorization capsule independently, so phrases such as `禁止 force push` and `其余 Git 操作均未授权` constrain the grant without revoking its exact commands.
 - Added exact-command binding for declared `add`, `commit`, and `push` operations, inferred a single canonical existing `origin`, and bound its target plus push-URL identity while retaining scope, branch, target, visibility, replay, and remote-drift checks.
 - Added a preauthorized full GitHub HTTPS clone lane: one exact capsule can bind `clone` and later mutations in the fresh checkout while provenance tracking and exact downloaded-code command hashes remain enforced.
 - Allowed a narrow read-only `git config` query grammar for publication preflight while keeping mutations, alternate config files, and malformed queries behind the Git gate.
-- Added a Windows launcher that prefers `python.exe` and falls back to `py.exe -3`, plus a real Codex host smoke for cross-turn `add` to transaction resume to `commit` on Ubuntu, macOS, and Windows CI.
+- Added a PowerShell 5.1/7 Windows launcher that disables Python Manager automatic installation, applies a two-second ceiling to each Python 3.9+ probe, accepts only exact zero, preserves the child exit code, and retains the `.cmd` entrypoint as a compatibility shim; real Codex host smoke covers cross-turn `add` to transaction resume to `commit` on Ubuntu, macOS, and Windows CI.
 
 ## [0.2.4] - 2026-07-17
 

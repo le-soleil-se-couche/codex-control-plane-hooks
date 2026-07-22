@@ -339,6 +339,8 @@ _COMMAND_NEGATION_RE = re.compile(
 )
 _PENDING_GIT_TTL_SECONDS = 600
 _SCOPED_GIT_TRANSACTION_TTL_SECONDS = 30 * 60
+_GIT_RUNNER_TTL_SECONDS = 5 * 60
+_GIT_RUNNER_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SENSITIVE_ENV_NAMES = {
     "BASH_ENV",
@@ -2119,6 +2121,302 @@ def _unlink_owned_regular(candidate: Path) -> None:
         candidate.unlink()
 
 
+def _git_runner_path(kind: str, token: str) -> Path:
+    if kind not in {"request", "running", "status"} or not _GIT_RUNNER_TOKEN_RE.fullmatch(token):
+        raise ValueError("invalid Git runner path")
+    return _data_dir() / f".git-runner-{kind}-{token}.json"
+
+
+def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with _open_private(temp, os.O_RDWR | os.O_CREAT | os.O_EXCL) as stream:
+            stream.write(
+                json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+                + "\n"
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        _unlink_owned_regular(temp)
+
+
+def _read_private_json(path: Path) -> dict[str, Any]:
+    info = os.stat(path, follow_symlinks=False)
+    if _is_reparse_info(info) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError("Git runner record must be a regular non-reparse file")
+    if info.st_size <= 0 or info.st_size > MAX_POLICY_BYTES:
+        raise RuntimeError("Git runner record has an invalid size")
+    with _open_private(path, os.O_RDONLY) as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Git runner record must contain an object")
+    return payload
+
+
+def _cleanup_stale_git_runner_records() -> None:
+    cutoff = time.time() - _GIT_RUNNER_TTL_SECONDS
+    for pattern in (".git-runner-request-*.json", ".git-runner-running-*.json", ".git-runner-status-*.json"):
+        for candidate in _data_dir().glob(pattern):
+            try:
+                info = os.stat(candidate, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if info.st_mtime < cutoff:
+                _unlink_owned_regular(candidate)
+
+
+def _powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _git_runner_command(token: str) -> str:
+    if not _GIT_RUNNER_TOKEN_RE.fullmatch(token):
+        raise ValueError("invalid Git runner token")
+    argv = [
+        str(Path(sys.executable).resolve()),
+        "-I",
+        "-S",
+        str(Path(__file__).resolve()),
+        "--run-approved-git",
+        token,
+    ]
+    if os.name == "nt":
+        return "& " + " ".join(_powershell_quote(item) for item in argv)
+    return shlex.join(argv)
+
+
+def _matching_git_runner_permission(
+    state: dict[str, Any],
+    *,
+    tool_use_id: str,
+    tool_name: str,
+    turn_id: str,
+    command_digest: str,
+    base_event_cwd: str,
+    effective_cwd: str,
+    execution_options_digest: str,
+) -> dict[str, Any] | None:
+    pending = state.get("pending_permission_authorizations")
+    permission = pending.get(tool_use_id) if isinstance(pending, dict) else None
+    if not isinstance(permission, dict) or not permission.get("transaction_id"):
+        return None
+    token = str(permission.get("runner_token") or "")
+    accepted_digests = {
+        str(permission.get("digest") or ""),
+        str(permission.get("original_digest") or ""),
+    }
+    return permission if (
+        _GIT_RUNNER_TOKEN_RE.fullmatch(token)
+        and command_digest in accepted_digests
+        and str(permission.get("session_hash") or "") == str(state.get("session_hash") or "")
+        and str(permission.get("turn_id") or "") == turn_id
+        and str(permission.get("tool_use_id") or "") == tool_use_id
+        and str(permission.get("tool_name") or "") == tool_name
+        and str(permission.get("base_event_cwd") or "") == _normalized_cwd(base_event_cwd)
+        and str(permission.get("effective_cwd") or "") == _normalized_cwd(effective_cwd)
+        and str(permission.get("execution_options_digest") or "") == execution_options_digest
+    ) else None
+
+
+def _prepare_git_runner(
+    session_id: str,
+    *,
+    tool_use_id: str,
+    original_command: str,
+    original_digest: str,
+    effective_cwd: str,
+) -> str:
+    _cleanup_stale_git_runner_records()
+    state = _read_state(session_id)
+    pending = state.get("pending_permission_authorizations")
+    permission = pending.get(tool_use_id) if isinstance(pending, dict) else None
+    if not isinstance(permission, dict) or not permission.get("transaction_id"):
+        raise RuntimeError("Git runner requires a reserved transaction operation")
+    if str(permission.get("digest") or "") != original_digest:
+        raise RuntimeError("Git runner reservation digest changed")
+
+    existing_token = str(permission.get("runner_token") or "")
+    if existing_token:
+        command = str(permission.get("runner_command") or "")
+        if (
+            _GIT_RUNNER_TOKEN_RE.fullmatch(existing_token)
+            and command
+            and _git_runner_path("request", existing_token).exists()
+        ):
+            return command
+        raise RuntimeError("Git runner reservation is no longer reusable")
+
+    argv = _shell_tokens(original_command)
+    executable, _, wrappers = _unwrap_command(argv)
+    operation = str(permission.get("operation") or "")
+    if (
+        wrappers
+        or executable not in {"git", "gh"}
+        or operation not in _SCOPED_TRANSACTION_OPERATIONS
+    ):
+        raise RuntimeError("Git runner received an unsupported command")
+
+    token = os.urandom(16).hex()
+    runner_command = _git_runner_command(token)
+    runner_digest = _command_hash(runner_command, effective_cwd)
+    request = {
+        "argv": argv,
+        "created_at": time.time(),
+        "effective_cwd": _normalized_cwd(effective_cwd),
+        "execution_options_digest": str(permission.get("execution_options_digest") or ""),
+        "operation": operation,
+        "original_digest": original_digest,
+        "scope_hash": str(permission.get("scope_hash") or ""),
+        "session_hash": str(permission.get("session_hash") or ""),
+        "tool_use_id": tool_use_id,
+        "transaction_id": str(permission.get("transaction_id") or ""),
+        "turn_id": str(permission.get("turn_id") or ""),
+    }
+    request_path = _git_runner_path("request", token)
+    _write_private_json(request_path, request)
+
+    def bind_runner(current: dict[str, Any]) -> None:
+        current_pending = current.get("pending_permission_authorizations")
+        current_permission = (
+            current_pending.get(tool_use_id) if isinstance(current_pending, dict) else None
+        )
+        if (
+            not isinstance(current_permission, dict)
+            or str(current_permission.get("digest") or "") != original_digest
+            or str(current_permission.get("transaction_id") or "") != request["transaction_id"]
+        ):
+            raise RuntimeError("Git runner reservation changed before binding")
+        current_permission.update(
+            {
+                "digest": runner_digest,
+                "original_digest": original_digest,
+                "runner_command": runner_command,
+                "runner_token": token,
+            }
+        )
+
+    try:
+        _mutate_state(session_id, bind_runner)
+    except Exception:
+        _unlink_owned_regular(request_path)
+        raise
+    return runner_command
+
+
+def _validate_git_runner_request(request: dict[str, Any]) -> tuple[list[str], str]:
+    argv = request.get("argv")
+    cwd = str(request.get("effective_cwd") or "")
+    created_at = request.get("created_at")
+    operation = str(request.get("operation") or "")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or len(argv) > 200
+        or not all(isinstance(item, str) and item and "\x00" not in item for item in argv)
+        or not os.path.isabs(cwd)
+        or not isinstance(created_at, (int, float))
+        or isinstance(created_at, bool)
+        or not 0 <= time.time() - float(created_at) <= _GIT_RUNNER_TTL_SECONDS
+        or operation not in _SCOPED_TRANSACTION_OPERATIONS
+    ):
+        raise RuntimeError("Git runner request validation failed")
+    executable, _, wrappers = _unwrap_command(argv)
+    if wrappers or executable not in {"git", "gh"}:
+        raise RuntimeError("Git runner executable validation failed")
+    command = shlex.join(argv)
+    dangerous = _dangerous_codes(_structured_command_findings(command))
+    candidate = _scoped_git_candidate(command, cwd, dangerous)
+    if candidate is None:
+        candidate = _scoped_github_create_candidate(command, cwd, dangerous)
+    if (
+        not isinstance(candidate, dict)
+        or str(candidate.get("operation") or "") != operation
+        or str(candidate.get("scope_hash") or "") != str(request.get("scope_hash") or "")
+    ):
+        raise RuntimeError("Git runner candidate validation failed")
+    return argv, cwd
+
+
+def _run_approved_git(token: str) -> int:
+    if not _GIT_RUNNER_TOKEN_RE.fullmatch(token):
+        return 126
+    _cleanup_stale_git_runner_records()
+    request_path = _git_runner_path("request", token)
+    running_path = _git_runner_path("running", token)
+    status_path = _git_runner_path("status", token)
+    try:
+        os.replace(request_path, running_path)
+        request = _read_private_json(running_path)
+        argv, cwd = _validate_git_runner_request(request)
+    except Exception:
+        _unlink_owned_regular(running_path)
+        return 126
+    _unlink_owned_regular(running_path)
+
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        completed = subprocess.run(argv, cwd=cwd, env=environment, check=False)
+        exit_code = int(completed.returncode)
+    except OSError:
+        exit_code = 126
+    status = {
+        "completed_at": time.time(),
+        "execution_options_digest": str(request.get("execution_options_digest") or ""),
+        "exit_code": exit_code,
+        "operation": str(request.get("operation") or ""),
+        "original_digest": str(request.get("original_digest") or ""),
+        "scope_hash": str(request.get("scope_hash") or ""),
+        "session_hash": str(request.get("session_hash") or ""),
+        "tool_use_id": str(request.get("tool_use_id") or ""),
+        "transaction_id": str(request.get("transaction_id") or ""),
+        "turn_id": str(request.get("turn_id") or ""),
+    }
+    try:
+        _write_private_json(status_path, status)
+    except Exception:
+        return 126 if exit_code == 0 else exit_code
+    return exit_code
+
+
+def _consume_git_runner_status(permission: dict[str, Any]) -> str:
+    token = str(permission.get("runner_token") or "")
+    if not _GIT_RUNNER_TOKEN_RE.fullmatch(token):
+        return "unknown"
+    status_path = _git_runner_path("status", token)
+    try:
+        status = _read_private_json(status_path)
+    except Exception:
+        return "unknown"
+    finally:
+        _unlink_owned_regular(status_path)
+    expected = {
+        "execution_options_digest": str(permission.get("execution_options_digest") or ""),
+        "operation": str(permission.get("operation") or ""),
+        "original_digest": str(permission.get("original_digest") or ""),
+        "scope_hash": str(permission.get("scope_hash") or ""),
+        "session_hash": str(permission.get("session_hash") or ""),
+        "tool_use_id": str(permission.get("tool_use_id") or ""),
+        "transaction_id": str(permission.get("transaction_id") or ""),
+        "turn_id": str(permission.get("turn_id") or ""),
+    }
+    if any(str(status.get(key) or "") != value for key, value in expected.items()):
+        return "unknown"
+    completed_at = status.get("completed_at")
+    exit_code = status.get("exit_code")
+    if (
+        not isinstance(completed_at, (int, float))
+        or isinstance(completed_at, bool)
+        or not 0 <= time.time() - float(completed_at) <= _GIT_RUNNER_TTL_SECONDS
+        or not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+    ):
+        return "unknown"
+    return "success" if exit_code == 0 else "failure"
+
+
 def _stop_state(session_id: str) -> int:
     path = _state_path(session_id)
     lock_path = path.with_suffix(".lock")
@@ -3126,7 +3424,9 @@ def _scoped_git_candidate(
         "scope_hash": _scope_hash(scope, exact=True),
         "codes": sorted(dangerous),
     }
-    if subcommand == "push" and push_target is not None:
+    if subcommand == "add":
+        candidate["pathspecs"] = pathspecs
+    elif subcommand == "push" and push_target is not None:
         candidate["remote"], candidate["refspec"] = push_target
         candidate["remote_targets"] = list(
             _git_remote_targets(scope, candidate["remote"])
@@ -3314,6 +3614,9 @@ def _prompt_git_operation_digests(
             dangerous = _dangerous_codes(_structured_command_findings(command))
             candidate = _scoped_git_candidate(command, cwd, dangerous)
             if not candidate:
+                operation = _transaction_operation_from_command(command, cwd)
+                if operation in _SCOPED_GIT_OPERATIONS:
+                    return None
                 continue
             scope_hash = str(candidate["scope_hash"])
             operation = str(candidate["operation"])
@@ -3836,6 +4139,46 @@ def _git_transaction_continuation_commands_safe(prompt: str, cwd: str) -> bool:
     return True
 
 
+def _git_grant_effective_operations(
+    grant: dict[str, Any], scope_hash: str
+) -> set[str]:
+    operations = {
+        str(item)
+        for item in grant.get("operations") or ()
+        if str(item) in _SCOPED_TRANSACTION_OPERATIONS
+    }
+    bindings = grant.get("bindings")
+    if not operations or not isinstance(bindings, dict):
+        return set()
+    binding = bindings.get(scope_hash)
+    if not isinstance(binding, dict):
+        return set()
+
+    exact_operations: set[str] = set()
+    local_exact_operations: set[str] = set()
+    for item_scope_hash, item in bindings.items():
+        if not isinstance(item, dict):
+            return set()
+        operation_digests = item.get("operation_digests")
+        if operation_digests is None:
+            operation_digests = {}
+        if not isinstance(operation_digests, dict):
+            return set()
+        for operation, digest in operation_digests.items():
+            operation = str(operation)
+            if operation not in operations:
+                continue
+            exact_operations.add(operation)
+            if (
+                item_scope_hash == scope_hash
+                and isinstance(digest, str)
+                and digest
+            ):
+                local_exact_operations.add(operation)
+
+    return (operations - exact_operations) | local_exact_operations
+
+
 def _git_grant_usable(
     grant: dict[str, Any] | None,
     expected_session_hash: str = "",
@@ -3854,13 +4197,14 @@ def _git_grant_usable(
         or (expected_session_hash and grant.get("session_hash") != expected_session_hash)
     ):
         return False
-    operations = set(grant.get("operations") or [])
     bindings = grant.get("bindings")
     consumed = grant.get("consumed_operations") or {}
-    if not operations or not isinstance(bindings, dict) or not bindings:
+    if not isinstance(bindings, dict) or not bindings:
         return False
     return any(
-        operations.difference(set(consumed.get(scope_hash) or []))
+        _git_grant_effective_operations(grant, scope_hash).difference(
+            set(consumed.get(scope_hash) or [])
+        )
         for scope_hash in bindings
     )
 
@@ -3968,13 +4312,13 @@ def _git_grant_matches(
     if str(grant.get("turn_id") or "") != event_turn:
         return False
     operation = str(candidate.get("operation") or "")
-    if operation not in set(grant.get("operations") or []):
-        return False
     scope_hash = str(candidate.get("scope_hash") or "")
     bindings = grant.get("bindings")
     if not isinstance(bindings, dict) or not isinstance(bindings.get(scope_hash), dict):
         return False
     binding = bindings[scope_hash]
+    if operation not in _git_grant_effective_operations(grant, scope_hash):
+        return False
     pending_digest = str(grant.get("pending_digest") or "")
     if pending_digest and str(candidate.get("digest") or "") != pending_digest:
         return False
@@ -3982,6 +4326,8 @@ def _git_grant_matches(
     if operation in set(consumed.get(scope_hash) or []):
         return False
     operation_digests = binding.get("operation_digests") or {}
+    if not isinstance(operation_digests, dict):
+        return False
     expected_digest = str(operation_digests.get(operation) or "")
     if expected_digest and str(candidate.get("digest") or "") != expected_digest:
         return False
@@ -4808,6 +5154,19 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
     clone_enabled = policy["enable_constrained_github_clone"]
     transaction_enabled = policy["enable_scoped_git_transactions"]
     execution_options_digest = _execution_options_digest(tool_name, tool_input)
+    command_digest = _command_hash(command or text, event_cwd)
+    runner_permission = _matching_git_runner_permission(
+        state_snapshot,
+        tool_use_id=tool_use_id,
+        tool_name=tool_name,
+        turn_id=event_turn,
+        command_digest=command_digest,
+        base_event_cwd=base_event_cwd,
+        effective_cwd=event_cwd,
+        execution_options_digest=execution_options_digest,
+    )
+    if runner_permission is not None:
+        return _allow_permission() if event_name == "PermissionRequest" else {}
     clone_invocation = bool(command and _contains_clone_invocation(command))
     sandbox = (
         tool_input.get("sandbox_permissions", "use_default")
@@ -4863,7 +5222,7 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
     ):
         findings.append(_finding("downloaded_code_execution", "medium"))
     dangerous = _dangerous_codes(_dedupe_findings(findings))
-    digest = _command_hash(command or text, event_cwd)
+    digest = command_digest
     clone_reservation = (
         _clone_reservation_metadata(
             clone_candidate,
@@ -5052,8 +5411,17 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
                         "transaction_id": str(grant.get("transaction_id") or ""),
                         "scope_hash": str(scoped_operation.get("scope_hash") or ""),
                         "operation": str(scoped_operation.get("operation") or ""),
+                        "scope": str(scoped_operation.get("scope") or ""),
                     }
                 )
+                for key in (
+                    "branch",
+                    "pathspecs",
+                    "refspec",
+                    "target",
+                ):
+                    if key in scoped_operation:
+                        permission_record[key] = scoped_operation[key]
             pending_permissions[tool_use_id] = permission_record
             state["pending_permission_authorizations"] = pending_permissions
 
@@ -5174,20 +5542,68 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
                 "Keep configured sensitive-business data aggregated or redacted; "
                 "do not disclose concrete values."
             )
-        return _context("PreToolUse", " ".join(notes))
+        output = _context("PreToolUse", " ".join(notes))
+        pending_permissions = state.get("pending_permission_authorizations")
+        permission = (
+            pending_permissions.get(tool_use_id)
+            if isinstance(pending_permissions, dict)
+            else None
+        )
+        if dangerous and isinstance(permission, dict) and permission.get("transaction_id"):
+            try:
+                runner_command = _prepare_git_runner(
+                    session_id,
+                    tool_use_id=tool_use_id,
+                    original_command=command,
+                    original_digest=digest,
+                    effective_cwd=event_cwd,
+                )
+            except Exception:
+                transaction_id = str(permission.get("transaction_id") or "")
+
+                def revoke_runner_transaction(current: dict[str, Any]) -> None:
+                    current_grant = current.get("local_git_grant")
+                    if (
+                        isinstance(current_grant, dict)
+                        and str(current_grant.get("transaction_id") or "") == transaction_id
+                    ):
+                        current["local_git_grant"] = None
+                    current_pending = current.get("pending_permission_authorizations")
+                    if isinstance(current_pending, dict):
+                        current["pending_permission_authorizations"] = {
+                            item_id: item
+                            for item_id, item in current_pending.items()
+                            if not (
+                                isinstance(item, dict)
+                                and str(item.get("transaction_id") or "") == transaction_id
+                            )
+                        }
+
+                _mutate_state(session_id, revoke_runner_transaction)
+                raise
+            output["hookSpecificOutput"].update(
+                {
+                    "permissionDecision": "allow",
+                    "updatedInput": {"command": runner_command},
+                }
+            )
+        return output
     return {}
 
 
-def _tool_response_failed(response: Any) -> bool:
+def _tool_response_status(response: Any) -> str:
     if not isinstance(response, dict):
-        return False
+        return "unknown"
     if response.get("isError") is True or response.get("is_error") is True:
-        return True
+        return "failure"
+    statuses: list[int] = []
     for key in ("exit_code", "returncode"):
         value = response.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value != 0:
-            return True
-    return False
+        if isinstance(value, int) and not isinstance(value, bool):
+            statuses.append(value)
+    if any(value != 0 for value in statuses):
+        return "failure"
+    return "success" if statuses else "unknown"
 
 
 def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
@@ -5207,7 +5623,7 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
     digest = _command_hash(command, event_cwd) if command else ""
     execution_options_digest = _execution_options_digest(tool_name, tool_input)
     clone_enabled = _policy()["enable_constrained_github_clone"]
-    tool_failed = _tool_response_failed(event.get("tool_response"))
+    tool_status = _tool_response_status(event.get("tool_response"))
 
     def clear_pending(state: dict[str, Any]) -> None:
         pending = state.get("pending_permission_authorizations")
@@ -5221,7 +5637,11 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
             and str(permission.get("turn_id") or "") == event_turn
             and str(permission.get("tool_use_id") or "") == tool_use_id
             and str(permission.get("tool_name") or "") == tool_name
-            and str(permission.get("digest") or "") == digest
+            and digest
+            in {
+                str(permission.get("digest") or ""),
+                str(permission.get("original_digest") or ""),
+            }
             and str(permission.get("base_event_cwd") or "")
             == _normalized_cwd(base_event_cwd)
             and str(permission.get("effective_cwd") or "")
@@ -5236,24 +5656,41 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
             grant = state.get("local_git_grant")
             if (
                 transaction_id
-                and not tool_failed
                 and isinstance(grant, dict)
                 and str(grant.get("transaction_id") or "") == transaction_id
             ):
-                _consume_git_grant(
-                    grant,
-                    {
-                        "scope_hash": str(permission.get("scope_hash") or ""),
-                        "operation": str(permission.get("operation") or ""),
-                    },
+                operation_succeeded = (
+                    _consume_git_runner_status(permission) == "success"
+                    if permission.get("runner_token")
+                    else tool_status == "success"
                 )
-                state["local_git_grant"] = (
-                    grant
-                    if _git_grant_usable(
-                        grant, str(state.get("session_hash") or "")
+                if operation_succeeded:
+                    _consume_git_grant(
+                        grant,
+                        {
+                            "scope_hash": str(permission.get("scope_hash") or ""),
+                            "operation": str(permission.get("operation") or ""),
+                        },
                     )
-                    else None
-                )
+                    state["local_git_grant"] = (
+                        grant
+                        if _git_grant_usable(
+                            grant, str(state.get("session_hash") or "")
+                        )
+                        else None
+                    )
+                else:
+                    state["local_git_grant"] = None
+                    pending = {
+                        item_id: item
+                        for item_id, item in pending.items()
+                        if not (
+                            isinstance(item, dict)
+                            and str(item.get("transaction_id") or "")
+                            == transaction_id
+                        )
+                    }
+                    state["pending_permission_authorizations"] = pending
         pending_clones = state.get("pending_constrained_clones")
         if not isinstance(pending_clones, dict):
             pending_clones = {}
@@ -5425,6 +5862,10 @@ def _internal_error_response(event: dict[str, Any], *, parse_error: bool = False
 
 
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--run-approved-git":
+        return _run_approved_git(sys.argv[2])
+    if len(sys.argv) != 1:
+        return 64
     event: dict[str, Any] = {}
     try:
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="strict"))
