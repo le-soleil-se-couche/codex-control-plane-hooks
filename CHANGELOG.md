@@ -4,6 +4,8 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-22
+
 - Added explicit continuation for an unfinished scoped Git/GitHub publication transaction across prompt turns. Continuation rebinds only the active turn while preserving the original session, authorization cwd, issue time, repository mappings, operations, and append-only consumption ledger.
 - Extended the transaction TTL to 30 minutes and moved operation consumption from `PreToolUse` to matching successful `PostToolUse`; `PermissionRequest`, `Stop`, and cross-turn continuation retain the same reservation without requesting the grant again.
 - Parsed safety exclusions outside the positive authorization capsule independently, so phrases such as `禁止 force push` and `其余 Git 操作均未授权` constrain the grant without revoking its exact commands.
