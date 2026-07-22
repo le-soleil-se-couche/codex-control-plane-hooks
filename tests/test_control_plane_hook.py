@@ -4685,12 +4685,23 @@ class HookProtocolTests(unittest.TestCase):
         source = "https://github.com/sample-owner/exact-clone.git"
         clone = f"git clone {source} {destination}"
         switch = f"git -C {destination} switch -c fix/authorization-flow"
-        self.prompt(
+        prompt_result = self.prompt(
             "本轮批准你依次执行以下字面命令：\n"
             f"`{clone}`\n`{switch}`\n"
             "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
             cwd=str(workspace),
         )
+        self.assertEqual({}, prompt_result)
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        prompt_state = json.loads(state_path.read_text(encoding="utf-8"))
+        clone_module = __import__("control_plane_hook")
+        clone_digest = clone_module._command_hash(clone, str(workspace))
+        self.assertEqual(self.turn, prompt_state.get("current_turn_id"))
+        for code in ("git_network", "git_non_read_only"):
+            self.assertIn(
+                clone_digest,
+                prompt_state.get("dangerous_authorization_hashes", {}).get(code, []),
+            )
         clone_event = {
             "tool_name": "exec_command",
             "tool_use_id": "exact-clone",
@@ -4700,9 +4711,7 @@ class HookProtocolTests(unittest.TestCase):
         clone_pretool = self.run_hook(
             {"hook_event_name": "PreToolUse", **clone_event}
         )
-        state_path = next(Path(self.data_dir).glob("session-*.json"))
         clone_state = json.loads(state_path.read_text(encoding="utf-8"))
-        clone_module = __import__("control_plane_hook")
         clone_permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **clone_event}
         )
@@ -4711,7 +4720,7 @@ class HookProtocolTests(unittest.TestCase):
             clone_pretool["hookSpecificOutput"].get("permissionDecision"),
             msg={
                 "result": clone_pretool,
-                "expected_digest": clone_module._command_hash(clone, str(workspace)),
+                "expected_digest": clone_digest,
                 "current_turn_id": clone_state.get("current_turn_id"),
                 "authorization_hashes": clone_state.get(
                     "dangerous_authorization_hashes"
@@ -4758,6 +4767,18 @@ class HookProtocolTests(unittest.TestCase):
             tool_use_id="altered-switch",
         )
         self.assertEqual("deny", altered["hookSpecificOutput"]["permissionDecision"])
+
+    def test_prompt_absolute_paths_ignores_uri_spans(self) -> None:
+        module = __import__("control_plane_hook")
+        local_path = str(Path(self.data_dir) / "fresh-checkout")
+        prompt = (
+            "git clone https://github.com/sample-owner/exact-clone.git "
+            f"{local_path}"
+        )
+        self.assertEqual(
+            [module._normalized_cwd(local_path)],
+            module._prompt_absolute_paths(prompt),
+        )
 
     def test_clone_parent_access_mode_matches_host_directory_semantics(self) -> None:
         module = __import__("control_plane_hook")

@@ -286,6 +286,9 @@ _QUOTED_ABSOLUTE_PATH_RE = re.compile(
     r"|(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^\n\r]*?"
     r")(?P=quote)"
 )
+_URI_SPAN_RE = re.compile(
+    r"(?i)\b[A-Z][A-Z0-9+.-]*://[^\s，。；;`\"']+"
+)
 _CURRENT_REPO_RE = re.compile(r"当前(?:仓库|repo)|这个(?:仓库|repo)|current\s+(?:repository|repo)", re.IGNORECASE)
 _GITHUB_OWNER_CONTEXT_RE = re.compile(
     r"(?i)(?:在|under)\s+(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9.-]{0,37}[A-Za-z0-9])?)\s*"
@@ -3325,13 +3328,19 @@ def _prompt_git_operation_digests(
 def _prompt_absolute_paths(prompt: str) -> list[str]:
     matches: list[tuple[int, int, str]] = []
     occupied: list[tuple[int, int]] = []
+    uri_spans = [(match.start(), match.end()) for match in _URI_SPAN_RE.finditer(prompt)]
     for match in _QUOTED_ABSOLUTE_PATH_RE.finditer(prompt):
+        if any(start <= match.start() < end for start, end in uri_spans):
+            continue
         path = match.group("path").strip().rstrip(")]}>、")
         matches.append((match.start(), match.end(), path))
         occupied.append((match.start(), match.end()))
     for pattern in (_ABSOLUTE_PATH_RE, _WINDOWS_ABSOLUTE_PATH_RE):
         for match in pattern.finditer(prompt):
-            if any(start <= match.start() < end for start, end in occupied):
+            if any(
+                start <= match.start() < end
+                for start, end in (*occupied, *uri_spans)
+            ):
                 continue
             path = match.group(1).strip("\"'").rstrip(")]}>、")
             matches.append((match.start(), match.end(), path))
