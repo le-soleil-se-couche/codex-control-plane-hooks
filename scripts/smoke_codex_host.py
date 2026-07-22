@@ -56,7 +56,6 @@ def child_environment(codex_home: Path) -> dict[str, str]:
     environment.pop("CODEX_SANDBOX_NETWORK_DISABLED", None)
     environment.update(
         CODEX_HOME=str(codex_home),
-        PLUGIN_DATA=str(codex_home / "plugin-data"),
         NO_COLOR="1",
     )
     leaked = [name for name in environment if CREDENTIAL_NAME.search(name.upper())]
@@ -508,7 +507,7 @@ def verify_transaction_resume(
     ):
         subprocess.run(arguments, check=True, capture_output=True, text=True)
 
-    plugin_data = Path(environment["PLUGIN_DATA"])
+    plugin_data = codex_home / "plugins" / "data" / PLUGIN
     plugin_data.mkdir(parents=True, exist_ok=True)
     policy_path = (
         plugin_data / "policy.json"

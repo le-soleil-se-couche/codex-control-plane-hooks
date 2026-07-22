@@ -270,6 +270,16 @@ class HookProtocolTests(unittest.TestCase):
                 else:
                     self.assertEqual({}, result)
 
+    def test_windows_quoted_caret_is_literal(self) -> None:
+        module = __import__("control_plane_hook")
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
+            self.assertFalse(
+                module._has_shell_indirection(
+                    "git config --get-regexp \'^remote\\\\..*\\\\.url$\'"
+                )
+            )
+            self.assertTrue(module._has_shell_indirection("echo ^& whoami"))
+
     def test_powershell_command_mode_allows_safe_content_and_scans_inner_command(self) -> None:
         safe_commands = [
             "pwsh -NoLogo -NoProfile -NonInteractive -Command Get-ChildItem",

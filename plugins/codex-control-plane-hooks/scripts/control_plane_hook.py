@@ -1030,7 +1030,7 @@ def _has_shell_indirection(command: str) -> bool:
         if escaped:
             escaped = False
             continue
-        if char == "^" and windows_style:
+        if char == "^" and windows_style and not quote:
             return True
         if char == "\\" and quote != "'" and not windows_style:
             escaped = True
