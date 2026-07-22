@@ -4704,7 +4704,9 @@ class HookProtocolTests(unittest.TestCase):
             {"hook_event_name": "PermissionRequest", **clone_event}
         )
         self.assertNotEqual(
-            "deny", clone_pretool["hookSpecificOutput"].get("permissionDecision")
+            "deny",
+            clone_pretool["hookSpecificOutput"].get("permissionDecision"),
+            msg=clone_pretool,
         )
         self.assertNotEqual(
             "deny",
