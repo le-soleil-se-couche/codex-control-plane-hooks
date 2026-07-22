@@ -174,7 +174,7 @@ class HookProtocolTests(unittest.TestCase):
         permission = state["pending_permission_authorizations"].get(tool_use_id)
         if not isinstance(permission, dict) or not permission.get("transaction_id"):
             return result
-        token = str(permission.get("runner_token") or "")
+        runner_id = str(permission.get("runner_token") or "")
         module = __import__("control_plane_hook")
 
         def complete_probe(current: dict) -> None:
@@ -200,9 +200,9 @@ class HookProtocolTests(unittest.TestCase):
             )
 
         module._mutate_state(self.session, complete_probe)
-        if token:
+        if runner_id:
             module._unlink_owned_regular(
-                Path(self.data_dir) / f".git-runner-request-{token}.json"
+                Path(self.data_dir) / f".git-runner-request-{runner_id}.json"
             )
         return result
 
@@ -1016,7 +1016,7 @@ class HookProtocolTests(unittest.TestCase):
         self.assertNotIn("ReadToEnd", powershell_launcher)
         self.assertIn("$process.ExitCode -eq 0", powershell_launcher)
         self.assertIn("$process.StandardInput.Close()", powershell_launcher)
-        self.assertIn("$process.Kill()", powershell_launcher)
+        self.assertIn("$Process.Kill()", powershell_launcher)
         self.assertIn('$env:PYTHON_MANAGER_AUTOMATIC_INSTALL = "0"', powershell_launcher)
         self.assertIn("exit [int] $LASTEXITCODE", powershell_launcher)
         self.assertIn('set "ERRORLEVEL="', cmd_shim)
