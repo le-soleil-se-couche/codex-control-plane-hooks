@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - unavailable on macOS/Linux.
 
 MAX_SCAN_CHARS = 500_000
 MAX_POLICY_BYTES = 64_000
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 STATE_TTL_SECONDS = 7 * 24 * 60 * 60
 SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 _PYTHON_SOURCE_SUFFIXES = {".py", ".pyi"}
@@ -261,6 +261,14 @@ _NEGATED_GIT_OPERATION_RE = re.compile(
     r"(?P<operation>init|add|commit|push|初始化|暂存|提交|推送|创建(?:仓库|repo(?:sitory)?)?)"
 )
 _PENDING_COMMAND_REFERENCE_RE = re.compile(r"上述|上面|刚才|前述|该命令|这个命令|previous\s+command", re.IGNORECASE)
+_AUTHORIZED_TRANSACTION_CONTINUATION_RE = re.compile(
+    r"(?is)(?:继续(?:执行|完成)?|随后(?:继续)?(?:执行|完成)?|接着(?:执行|完成)?).{0,160}"
+    r"(?:上一条|上次|前述|原(?:发布)?|previous).{0,80}"
+    r"(?:已授权|授权|approved|authorized).{0,80}(?:(?:git(?:hub)?|发布)\s*)?事务"
+    r"|(?:上一条|上次|前述|原(?:发布)?|previous).{0,80}"
+    r"(?:已授权|授权|approved|authorized).{0,80}(?:(?:git(?:hub)?|发布)\s*)?事务.{0,160}"
+    r"(?:继续|完成|执行)"
+)
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(/[^\s，。；;`\"']+)")
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_.-])("
@@ -290,10 +298,12 @@ _CURRENT_EXPANSION_RE = re.compile(
     r"(?i)(?:开|开启|启动|使用|派|创建)\s*(?:到|共|最多)?\s*(?:[4-9]|[1-9]\d+)\s*个?\s*(?:子\s*)?agent"
 )
 _CURRENT_EXPANSION_AUTH_RE = re.compile(
-    r"(?i)(?:本轮|这次|现在).{0,12}(?:明确)?(?:授权|允许).{0,24}(?:高并发|超过\s*3|扩大.*agent)"
+    r"(?i)(?:(?:本轮|这次|现在).{0,16})?(?:明确)?(?:授权|允许).{0,48}"
+    r"(?:高并发|超过\s*3|扩大.*agent|并发\s*(?:[4-9]|[1-9]\d+)\s*个?\s*(?:子\s*)?agent)"
 )
 _NESTED_AUTH_RE = re.compile(
-    r"(?i)(?:本轮|这次|现在).{0,12}(?:明确)?(?:授权|允许).{0,24}(?:二级\s*(?:子\s*)?agent|nested|子\s*agent\s*(?:继续|再)\s*(?:开|创建))"
+    r"(?i)(?:(?:本轮|这次|现在).{0,16})?(?:明确)?(?:授权|允许).{0,80}"
+    r"(?:二级\s*(?:嵌套|(?:子\s*)?agent)|nested|子\s*agent\s*(?:继续|再)\s*(?:开|创建))"
 )
 _EXPANSION_NEGATED_RE = re.compile(
     r"(?i)(?:不要|别|禁止|不许|无需|不用).{0,6}(?:开|开启|启动|使用|派|创建).{0,16}(?:子\s*)?agent"
@@ -310,7 +320,7 @@ _AUTH_GIT_CONTINUATION_RE = re.compile(
     r"(?!.*(?:文档|示例|日志|报告|说明|教程|文本|"
     r"(?<![A-Za-z0-9_-])(?:documentation|example|log|report)(?![A-Za-z0-9_-])))"
     r"(?:在\s+.{0,300}?\s*)?"
-    r"(?:执行|运行|创建|推送|初始化|暂存|提交|git\b|gh\b|push\b|create\b)"
+    r"(?:继续\s*)?(?:执行|完成|运行|创建|推送|初始化|暂存|提交|git\b|gh\b|push\b|create\b)"
 )
 _NEGATED_AUTH_COMMENT_RE = re.compile(
     r"(?i)^\s*#.*(?:不要|禁止|别|不许|不得|do\s+not|don't|never)"
@@ -320,6 +330,7 @@ _COMMAND_NEGATION_RE = re.compile(
     r"(?:git|gh|rm|sudo|python3?|node|bash|sh|zsh)\b"
 )
 _PENDING_GIT_TTL_SECONDS = 600
+_SCOPED_GIT_TRANSACTION_TTL_SECONDS = 30 * 60
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SENSITIVE_ENV_NAMES = {
     "BASH_ENV",
@@ -408,6 +419,7 @@ _POWERSHELL_ENVIRONMENT_OPTIONS = {
 _READ_ONLY_GIT_SUBCOMMANDS = {
     "blame",
     "branch",
+    "config",
     "diff",
     "grep",
     "log",
@@ -417,6 +429,15 @@ _READ_ONLY_GIT_SUBCOMMANDS = {
     "rev-parse",
     "show",
     "status",
+}
+_READ_ONLY_GIT_CONFIG_SCOPES = {"--global", "--local", "--system", "--worktree"}
+_READ_ONLY_GIT_CONFIG_QUERIES = {
+    "--get",
+    "--get-all",
+    "--get-regexp",
+    "--get-urlmatch",
+    "--list",
+    "-l",
 }
 _CONTROL_TOKENS = {";", "&&", "||", "|", "&"}
 _SHELL_EVAL = {"ash", "bash", "dash", "fish", "ksh", "sh", "zsh"}
@@ -1011,7 +1032,7 @@ def _has_shell_indirection(command: str) -> bool:
         if escaped:
             escaped = False
             continue
-        if char == "^" and windows_style:
+        if char == "^" and windows_style and not quote:
             return True
         if char == "\\" and quote != "'" and not windows_style:
             escaped = True
@@ -1264,6 +1285,20 @@ def _git_is_read_only(subcommand: str, args: list[str], dynamic_config: bool) ->
             return False
         positional = [token for token in args if not token.startswith("-")]
         return not positional or "--list" in args
+    if subcommand == "config":
+        config_args = list(args)
+        while config_args and config_args[0] in _READ_ONLY_GIT_CONFIG_SCOPES:
+            config_args.pop(0)
+        if not config_args or config_args[0] not in _READ_ONLY_GIT_CONFIG_QUERIES:
+            return False
+        query, values = config_args[0], config_args[1:]
+        if any(not value or value == "--" for value in values):
+            return False
+        if query in {"--list", "-l"}:
+            return not values
+        if query == "--get-urlmatch":
+            return len(values) == 2
+        return 1 <= len(values) <= 2
     if subcommand == "remote":
         action, remote_args = _git_remote_command(args)
         if not action:
@@ -1942,7 +1977,7 @@ def _load_state_file(path: Path, session_id: str) -> dict[str, Any]:
         or isinstance(updated_at, bool)
     ):
         raise RuntimeError("state file metadata is invalid")
-    if schema_version not in {1, 2, STATE_SCHEMA_VERSION}:
+    if schema_version not in {1, 2, 3, STATE_SCHEMA_VERSION}:
         raise RuntimeError("state file schema is unsupported")
     if updated_at <= 0:
         raise RuntimeError("state file timestamp is invalid")
@@ -2084,7 +2119,17 @@ def _stop_state(session_id: str) -> int:
         try:
             state = _load_state_file(path, session_id)
             active_count = len(state.get("active_agents") or {})
-            if not active_count:
+            resumable_git = _git_grant_usable(
+                state.get("local_git_grant"),
+                str(state.get("session_hash") or ""),
+            ) or _pending_git_usable(state.get("pending_local_git"))
+            pending_permissions = state.get("pending_permission_authorizations")
+            if isinstance(pending_permissions, dict):
+                resumable_git = resumable_git or any(
+                    isinstance(item, dict) and item.get("transaction_id")
+                    for item in pending_permissions.values()
+                )
+            if not active_count and not resumable_git:
                 _unlink_owned_regular(path)
             return active_count
         finally:
@@ -2523,6 +2568,51 @@ def _constrained_github_clone_candidate(
     }
 
 
+def _exact_github_clone_candidate(
+    command: str,
+    *,
+    effective_cwd: str,
+    workspace_cwd: str,
+) -> dict[str, str] | None:
+    """Parse a full GitHub clone that is eligible only for exact authorization."""
+    workspace_root = _clone_workspace_root(workspace_cwd)
+    normalized_effective_cwd = _normalized_cwd(effective_cwd)
+    if (
+        not workspace_root
+        or not (
+            normalized_effective_cwd == workspace_root
+            or _path_within(normalized_effective_cwd, workspace_root)
+        )
+        or not command.strip()
+        or "$" in command
+        or _SHELL_CONTROL_RE.search(command)
+        or _has_shell_indirection(command)
+        or _has_unquoted_shell_comment(command)
+    ):
+        return None
+    tokens = _shell_tokens(command)
+    if not tokens or any(token in _CONTROL_TOKENS for token in tokens):
+        return None
+    executable, args, wrappers = _unwrap_command(tokens)
+    if (
+        executable != "git"
+        or wrappers
+        or not _trusted_executable_token(tokens[0], "git")
+        or len(args) != 3
+        or args[0] != "clone"
+    ):
+        return None
+    source, destination = args[1:]
+    target = _github_https_clone_target(source)
+    if not target or not _clone_destination_allowed(destination, workspace_cwd):
+        return None
+    return {
+        "source": source,
+        "target": target,
+        "destination": _normalized_cwd(destination),
+    }
+
+
 def _clone_reservation_metadata(
     candidate: dict[str, str],
     *,
@@ -2879,6 +2969,15 @@ def _safe_git_push_url(url: str) -> str:
     return value
 
 
+def _git_push_url_identity(url: str) -> str:
+    safe_url = _safe_git_push_url(url)
+    if not safe_url:
+        return ""
+    return hashlib.sha256(
+        ("git-push-url\0" + safe_url).encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
 def _git_remote_identities(
     scope: str,
     remote: str,
@@ -2924,12 +3023,7 @@ def _git_remote_identities(
         )
         if ssh_command is None or ssh_command or os.environ.get("GIT_SSH") or os.environ.get("GIT_SSH_COMMAND"):
             return ()
-    return tuple(
-        hashlib.sha256(
-            ("git-push-url\0" + url).encode("utf-8", errors="replace")
-        ).hexdigest()
-        for url in safe_urls
-    )
+    return tuple(_git_push_url_identity(url) for url in safe_urls)
 
 
 def _scoped_git_candidate(
@@ -2958,8 +3052,9 @@ def _scoped_git_candidate(
         return None
     branch = ""
     push_target: tuple[str, str] | None = None
+    base_dangerous = dangerous - {"downloaded_code_execution"}
     if subcommand == "init":
-        if dangerous != {"git_non_read_only"}:
+        if base_dangerous != {"git_non_read_only"}:
             return None
         index = 0
         while index < len(git_args):
@@ -2979,13 +3074,13 @@ def _scoped_git_candidate(
         if not branch:
             return None
     elif subcommand == "add":
-        if dangerous != {"git_non_read_only"}:
+        if base_dangerous != {"git_non_read_only"}:
             return None
         pathspecs = [token for token in git_args if token != "--"]
         if not pathspecs or any(token.startswith("-") for token in pathspecs):
             return None
     elif subcommand == "commit":
-        if dangerous != {"git_non_read_only"}:
+        if base_dangerous != {"git_non_read_only"}:
             return None
         has_message = False
         index = 0
@@ -3005,7 +3100,7 @@ def _scoped_git_candidate(
         if not has_message:
             return None
     else:
-        if dangerous != {"git_non_read_only", "git_network", "git_push"}:
+        if base_dangerous != {"git_non_read_only", "git_network", "git_push"}:
             return None
         push_target = _safe_push_target(git_args)
         if push_target is None:
@@ -3022,6 +3117,9 @@ def _scoped_git_candidate(
         candidate["remote"], candidate["refspec"] = push_target
         candidate["remote_targets"] = list(
             _git_remote_targets(scope, candidate["remote"])
+        )
+        candidate["remote_identities"] = list(
+            _git_remote_identities(scope, candidate["remote"])
         )
     elif subcommand == "init":
         candidate["branch"] = branch
@@ -3162,6 +3260,50 @@ def _git_authorization_text(prompt: str) -> str:
             prompt, _LOCAL_GIT_APPROVAL_RE, git_continuations=True
         )
     )
+
+
+def _prompt_clone_candidates(prompt: str, cwd: str) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen_destinations: set[str] = set()
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            candidate = _exact_github_clone_candidate(
+                command,
+                effective_cwd=cwd,
+                workspace_cwd=cwd,
+            ) or _constrained_github_clone_candidate(
+                command,
+                effective_cwd=cwd,
+                workspace_cwd=cwd,
+            )
+            if not candidate:
+                continue
+            destination = candidate["destination"]
+            if destination in seen_destinations:
+                continue
+            seen_destinations.add(destination)
+            candidates.append(candidate)
+    return candidates
+
+
+def _prompt_git_operation_digests(
+    prompt: str, cwd: str
+) -> dict[str, dict[str, str]] | None:
+    bindings: dict[str, dict[str, str]] = {}
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            dangerous = _dangerous_codes(_structured_command_findings(command))
+            candidate = _scoped_git_candidate(command, cwd, dangerous)
+            if not candidate:
+                continue
+            scope_hash = str(candidate["scope_hash"])
+            operation = str(candidate["operation"])
+            digest = str(candidate["digest"])
+            existing = bindings.setdefault(scope_hash, {}).get(operation)
+            if existing and existing != digest:
+                return None
+            bindings[scope_hash][operation] = digest
+    return bindings
 
 
 def _prompt_absolute_paths(prompt: str) -> list[str]:
@@ -3399,7 +3541,11 @@ def _prompt_git_operations(prompt: str, cwd: str) -> set[str]:
 
 
 def _local_git_grant_from_prompt(
-    prompt: str, cwd: str, turn_id: str, pending: dict[str, Any] | None
+    prompt: str,
+    cwd: str,
+    turn_id: str,
+    pending: dict[str, Any] | None,
+    session_id: str = "",
 ) -> dict[str, Any] | None:
     policy = _policy()
     if not (
@@ -3410,11 +3556,14 @@ def _local_git_grant_from_prompt(
     authorization_text = _git_authorization_text(prompt)
     if (
         not authorization_text
-        or _AUTH_NEGATED_RE.search(prompt)
-        or _NEGATED_GIT_OPERATION_RE.search(prompt)
+        or _AUTH_NEGATED_RE.search(authorization_text)
+        or _NEGATED_GIT_OPERATION_RE.search(authorization_text)
     ):
         return None
     operations = _prompt_git_operations(authorization_text, cwd)
+    operation_digests = _prompt_git_operation_digests(authorization_text, cwd)
+    if operation_digests is None:
+        return None
     parsed_push_target = _prompt_push_target(authorization_text, cwd, pending)
     if parsed_push_target is not None:
         operations.add("push")
@@ -3438,6 +3587,20 @@ def _local_git_grant_from_prompt(
             github_targets = [pending_target]
     scopes = _prompt_git_scopes(authorization_text, cwd, pending, operations)
     push_target = parsed_push_target if "push" in operations else None
+    clone_candidates = _prompt_clone_candidates(authorization_text, cwd)
+    clone_bindings = {
+        _scope_hash(candidate["destination"], exact=True): candidate
+        for candidate in clone_candidates
+    }
+    if "push" in operations and not github_targets and len(scopes) == 1:
+        scope_hash = _scope_hash(scopes[0], exact=True)
+        clone_binding = clone_bindings.get(scope_hash)
+        if clone_binding:
+            github_targets = [clone_binding["target"]]
+        elif push_target and push_target[0] == "origin":
+            remote_targets = _git_remote_targets(scopes[0], "origin")
+            if len(remote_targets) == 1:
+                github_targets = [remote_targets[0]]
     if (
         not operations
         or not scopes
@@ -3460,18 +3623,31 @@ def _local_git_grant_from_prompt(
         return None
     if github_targets and len(github_targets) != len(scopes):
         return None
-    bindings: dict[str, dict[str, str]] = {}
+    bindings: dict[str, dict[str, Any]] = {}
     for scope in scopes:
         scope_hash = _scope_hash(scope, exact=True)
         target = explicit_mappings.get(scope_hash, "")
         if not target and len(scopes) == 1 and len(github_targets) == 1:
             target = github_targets[0]
+        remote_identity = ""
+        if push_target:
+            clone_binding = clone_bindings.get(scope_hash)
+            if clone_binding and clone_binding.get("target") == target:
+                remote_identity = _git_push_url_identity(clone_binding["source"])
+            else:
+                remote_identities = _git_remote_identities(scope, push_target[0])
+                if len(remote_identities) > 1:
+                    return None
+                if remote_identities:
+                    remote_identity = remote_identities[0]
         bindings[scope_hash] = {
             "scope": scope,
             "target": target,
             "remote": push_target[0] if push_target else "",
+            "remote_identity": remote_identity,
             "init_branch": init_branch,
             "push_branch": push_target[1] if push_target else "",
+            "operation_digests": dict(operation_digests.get(scope_hash) or {}),
         }
     if github_targets and {item["target"] for item in bindings.values()} != set(github_targets):
         return None
@@ -3485,18 +3661,283 @@ def _local_git_grant_from_prompt(
         and not _CURRENT_REPO_RE.search(authorization_text)
     ):
         pending_digest = str(pending.get("digest") or "")
-    return {
+    session_hash = hashlib.sha256(
+        session_id.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    authorization_cwd = _normalized_cwd(cwd)
+    issued_at = time.time()
+    grant = {
         "turn_id": turn_id,
+        "issued_turn_id": turn_id,
+        "session_hash": session_hash,
+        "authorization_cwd": authorization_cwd,
         "bindings": bindings,
         "operations": sorted(operations),
         "consumed_operations": {},
         "pending_digest": pending_digest,
+        "issued_at": issued_at,
+    }
+    transaction_material = json.dumps(
+        {
+            "issued_turn_id": turn_id,
+            "session_hash": session_hash,
+            "authorization_cwd": authorization_cwd,
+            "bindings": bindings,
+            "operations": grant["operations"],
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    grant["transaction_id"] = hashlib.sha256(
+        transaction_material.encode("utf-8")
+    ).hexdigest()[:16]
+    return grant
+
+
+def _git_transaction_resume_requested(prompt: str) -> bool:
+    policy = _policy()
+    authorization_text = _git_authorization_text(prompt)
+    return bool(
+        policy["enable_natural_language_approvals"]
+        and policy["enable_scoped_git_transactions"]
+        and authorization_text
+        and _AUTHORIZED_TRANSACTION_CONTINUATION_RE.search(authorization_text)
+        and not _AUTH_NEGATED_RE.search(authorization_text)
+        and not _NEGATED_GIT_OPERATION_RE.search(authorization_text)
+    )
+
+
+def _authorized_git_command_scopes(prompt: str, cwd: str) -> list[str]:
+    scopes: list[str] = []
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            tokens = _shell_tokens(command)
+            executable, args, wrappers = _unwrap_command(tokens)
+            if (
+                executable != "git"
+                or wrappers
+                or not tokens
+                or not _trusted_executable_token(tokens[0], "git")
+            ):
+                continue
+            scope, _ = _git_scope_and_args(args, cwd)
+            scopes.append(_scope_identity(scope, exact=True))
+    return _ordered_unique(scopes)
+
+
+def _is_repository_identity_config_command(command: str, cwd: str) -> bool:
+    tokens = _shell_tokens(command)
+    executable, args, wrappers = _unwrap_command(tokens)
+    if (
+        not tokens
+        or wrappers
+        or executable != "git"
+        or not _trusted_executable_token(tokens[0], "git")
+    ):
+        return False
+    _, canonical_args = _git_scope_and_args(args, cwd)
+    subcommand, git_args, dynamic_config = _git_command(canonical_args)
+    global_arg_count = len(canonical_args) - len(git_args) - 1
+    return bool(
+        not dynamic_config
+        and subcommand == "config"
+        and global_arg_count == 0
+        and len(git_args) == 3
+        and git_args[0] == "--local"
+        and git_args[1] in {"user.name", "user.email"}
+        and git_args[2]
+    )
+
+
+def _is_strict_identity_amend_command(command: str, cwd: str) -> bool:
+    tokens = _shell_tokens(command)
+    executable, args, wrappers = _unwrap_command(tokens)
+    if (
+        not tokens
+        or wrappers
+        or executable != "git"
+        or not _trusted_executable_token(tokens[0], "git")
+    ):
+        return False
+    _, canonical_args = _git_scope_and_args(args, cwd)
+    subcommand, git_args, dynamic_config = _git_command(canonical_args)
+    global_arg_count = len(canonical_args) - len(git_args) - 1
+    return bool(
+        not dynamic_config
+        and subcommand == "commit"
+        and global_arg_count == 0
+        and len(git_args) == 3
+        and set(git_args) == {"--amend", "--no-edit", "--reset-author"}
+    )
+
+
+def _git_transaction_continuation_commands_safe(prompt: str, cwd: str) -> bool:
+    for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
+        for command in _authorization_command_candidates(segment):
+            tokens = _shell_tokens(command)
+            executable, args, wrappers = _unwrap_command(tokens)
+            if executable == "git":
+                if (
+                    not tokens
+                    or wrappers
+                    or not _trusted_executable_token(tokens[0], "git")
+                ):
+                    return False
+                _, canonical_args = _git_scope_and_args(args, cwd)
+                subcommand, git_args, dynamic_config = _git_command(canonical_args)
+                if subcommand in {"", "transaction"} and not dynamic_config:
+                    continue
+                if _is_repository_identity_config_command(command, cwd):
+                    continue
+                if subcommand in _SCOPED_GIT_OPERATIONS and not dynamic_config:
+                    if subcommand == "commit" and "--amend" in git_args:
+                        if not _is_strict_identity_amend_command(command, cwd):
+                            return False
+                    continue
+                return False
+            if executable == "gh":
+                if wrappers or not _prompt_github_create_candidate(
+                    command,
+                    cwd,
+                    {"github_network", "github_repo_create"},
+                ):
+                    return False
+                continue
+            if _dangerous_codes(_structured_command_findings(command)):
+                return False
+    return True
+
+
+def _git_grant_usable(
+    grant: dict[str, Any] | None,
+    expected_session_hash: str = "",
+) -> bool:
+    if not isinstance(grant, dict) or not grant.get("transaction_id"):
+        return False
+    issued_at = grant.get("issued_at")
+    if not isinstance(issued_at, (int, float)) or isinstance(issued_at, bool):
+        return False
+    if not 0 <= time.time() - float(issued_at) <= _SCOPED_GIT_TRANSACTION_TTL_SECONDS:
+        return False
+    if (
+        not grant.get("issued_turn_id")
+        or not grant.get("authorization_cwd")
+        or not grant.get("session_hash")
+        or (expected_session_hash and grant.get("session_hash") != expected_session_hash)
+    ):
+        return False
+    operations = set(grant.get("operations") or [])
+    bindings = grant.get("bindings")
+    consumed = grant.get("consumed_operations") or {}
+    if not operations or not isinstance(bindings, dict) or not bindings:
+        return False
+    return any(
+        operations.difference(set(consumed.get(scope_hash) or []))
+        for scope_hash in bindings
+    )
+
+
+def _continued_git_grant_from_prompt(
+    prompt: str,
+    cwd: str,
+    session_id: str,
+    turn_id: str,
+    prior: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    authorization_text = _git_authorization_text(prompt)
+    expected_session_hash = hashlib.sha256(
+        session_id.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    if (
+        not _git_transaction_resume_requested(prompt)
+        or not _git_grant_usable(prior, expected_session_hash)
+        or prior.get("pending_digest")
+        or _normalized_cwd(cwd) != prior.get("authorization_cwd")
+        or re.search(r"(?i)--(?:public|internal|force(?:-with-lease)?)\b", authorization_text)
+        or not _git_transaction_continuation_commands_safe(authorization_text, cwd)
+    ):
+        return None
+
+    prior_bindings = prior.get("bindings")
+    if not isinstance(prior_bindings, dict):
+        return None
+    prior_operations = set(prior.get("operations") or [])
+    if len(prior_operations) < 2 or not prior_operations.intersection({"push", "repo_create"}):
+        return None
+    prior_scope_hashes = set(prior_bindings)
+    explicit_scopes = _ordered_unique(
+        [
+            *_prompt_command_scopes(authorization_text, cwd),
+            *_authorized_git_command_scopes(authorization_text, cwd),
+        ]
+    )
+    if not explicit_scopes:
+        explicit_scopes = _prompt_git_scopes(
+            authorization_text,
+            cwd,
+            None,
+            prior_operations,
+        )
+    explicit_scope_hashes = {
+        _scope_hash(scope, exact=True) for scope in explicit_scopes
+    }
+    if explicit_scope_hashes and not explicit_scope_hashes.issubset(prior_scope_hashes):
+        return None
+
+    github_targets = set(_prompt_github_targets(authorization_text))
+    allowed_targets = {
+        str(binding.get("target") or "")
+        for binding in prior_bindings.values()
+        if isinstance(binding, dict) and binding.get("target")
+    }
+    if github_targets and not github_targets.issubset(allowed_targets):
+        return None
+
+    push_target = _prompt_push_target(authorization_text, cwd, None)
+    allowed_push_targets = {
+        (
+            str(binding.get("remote") or ""),
+            str(binding.get("push_branch") or ""),
+        )
+        for binding in prior_bindings.values()
+        if isinstance(binding, dict) and binding.get("remote") and binding.get("push_branch")
+    }
+    if push_target and push_target not in allowed_push_targets:
+        return None
+
+    init_branch = _prompt_init_branch(authorization_text, cwd, None)
+    allowed_init_branches = {
+        str(binding.get("init_branch") or "")
+        for binding in prior_bindings.values()
+        if isinstance(binding, dict) and binding.get("init_branch")
+    }
+    if init_branch and init_branch not in allowed_init_branches:
+        return None
+
+    consumed = prior.get("consumed_operations") or {}
+    return {
+        **prior,
+        "turn_id": turn_id,
+        "bindings": {
+            scope_hash: dict(binding)
+            for scope_hash, binding in prior_bindings.items()
+        },
+        "consumed_operations": {
+            scope_hash: list(items)
+            for scope_hash, items in consumed.items()
+        },
     }
 
 
 def _git_grant_matches(
-    grant: dict[str, Any], candidate: dict[str, Any], event_turn: str
+    grant: dict[str, Any],
+    candidate: dict[str, Any],
+    event_turn: str,
+    expected_session_hash: str = "",
 ) -> bool:
+    if not _git_grant_usable(grant, expected_session_hash):
+        return False
     if str(grant.get("turn_id") or "") != event_turn:
         return False
     operation = str(candidate.get("operation") or "")
@@ -3513,6 +3954,12 @@ def _git_grant_matches(
     consumed = grant.get("consumed_operations") or {}
     if operation in set(consumed.get(scope_hash) or []):
         return False
+    operation_digests = binding.get("operation_digests") or {}
+    expected_digest = str(operation_digests.get(operation) or "")
+    if expected_digest and str(candidate.get("digest") or "") != expected_digest:
+        return False
+    if "downloaded_code_execution" in set(candidate.get("codes") or ()) and not expected_digest:
+        return False
     if operation == "init":
         return bool(
             binding.get("init_branch")
@@ -3527,7 +3974,13 @@ def _git_grant_matches(
         ):
             return False
         target = str(binding.get("target") or "")
-        return bool(target and tuple(candidate.get("remote_targets") or ()) == (target,))
+        if not target or tuple(candidate.get("remote_targets") or ()) != (target,):
+            return False
+        remote_identity = str(binding.get("remote_identity") or "")
+        return bool(
+            not remote_identity
+            or tuple(candidate.get("remote_identities") or ()) == (remote_identity,)
+        )
     if operation == "repo_create":
         return bool(
             candidate.get("visibility") == "private"
@@ -3615,14 +4068,33 @@ def _pure_authorization_command_candidates(segment: str) -> list[str]:
 
 
 def _transaction_operation_from_command(command: str, cwd: str) -> str:
+    dangerous = _dangerous_codes(_structured_command_findings(command))
+    candidate = _scoped_git_candidate(command, cwd, dangerous)
+    if candidate:
+        return str(candidate.get("operation") or "")
     tokens = _shell_tokens(command)
     executable, args, wrappers = _unwrap_command(tokens)
-    if not tokens or wrappers:
-        return ""
-    if executable == "git" and _trusted_executable_token(tokens[0], "git"):
+    if (
+        tokens
+        and not wrappers
+        and executable == "git"
+        and _trusted_executable_token(tokens[0], "git")
+    ):
         _, canonical_args = _git_scope_and_args(args, cwd)
         subcommand, _, _ = _git_command(canonical_args)
-        return subcommand if subcommand in _SCOPED_GIT_OPERATIONS else ""
+        if _is_strict_identity_amend_command(command, cwd):
+            return ""
+        if subcommand in _SCOPED_GIT_OPERATIONS:
+            return subcommand
+    if (
+        tokens
+        and not wrappers
+        and executable == "gh"
+        and len(args) >= 2
+        and args[:2] == ["repo", "create"]
+        and not any(separator in _strip_token_quotes(tokens[0]) for separator in ("/", "\\"))
+    ):
+        return "repo_create"
     candidate = _prompt_github_create_candidate(
         command,
         cwd,
@@ -3668,10 +4140,7 @@ def _dangerous_authorization_hashes(
     skip_scoped_candidates: bool = False,
 ) -> dict[str, list[str]]:
     policy = _policy()
-    if (
-        not policy["enable_natural_language_approvals"]
-        or _AUTH_NEGATED_RE.search(prompt)
-    ):
+    if not policy["enable_natural_language_approvals"]:
         return {}
     authorized: dict[str, set[str]] = {}
     for clause in _authorization_clauses(prompt, _DANGEROUS_APPROVAL_RE):
@@ -4181,12 +4650,23 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
     disclosure_grant = _sensitive_disclosure_grant(prompt, turn_id)
     def mutate(state: dict[str, Any]) -> None:
         pending = state.get("pending_local_git")
-        grant = _local_git_grant_from_prompt(
-            prompt,
-            cwd,
-            turn_id,
-            pending if isinstance(pending, dict) else None,
-        )
+        prior_grant = state.get("local_git_grant")
+        if _git_transaction_resume_requested(prompt):
+            grant = _continued_git_grant_from_prompt(
+                prompt,
+                cwd,
+                session_id,
+                turn_id,
+                prior_grant if isinstance(prior_grant, dict) else None,
+            )
+        else:
+            grant = _local_git_grant_from_prompt(
+                prompt,
+                cwd,
+                turn_id,
+                pending if isinstance(pending, dict) else None,
+                session_id=session_id,
+            )
         authorization_text = _git_authorization_text(prompt)
         transaction_scopes = _ordered_unique(
             _prompt_command_scopes(
@@ -4197,6 +4677,10 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
             + _prompt_absolute_paths(authorization_text)
         )
         transaction_targets = _prompt_github_targets(authorization_text)
+        declared_clone_roots = tuple(
+            candidate["destination"]
+            for candidate in _prompt_clone_candidates(authorization_text, cwd)
+        )
         transaction_intent_requires_grant = bool(
             transaction_targets
             and (
@@ -4211,7 +4695,11 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
         authorization_hashes = _dangerous_authorization_hashes(
             prompt,
             cwd,
-            _tracked_clone_roots(state),
+            tuple(
+                _ordered_unique(
+                    [*_tracked_clone_roots(state), *declared_clone_roots]
+                )
+            ),
             skip_scoped_candidates=(
                 grant is not None or transaction_intent_requires_grant
             ),
@@ -4227,7 +4715,7 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
         state["local_git_grant"] = grant
         if grant is not None:
             state["pending_local_git"] = None
-        elif _AUTH_NEGATED_RE.search(prompt) or (
+        elif _AUTH_NEGATED_RE.search(authorization_text) or (
             isinstance(pending, dict)
             and (
                 not _pending_git_usable(pending)
@@ -4294,7 +4782,7 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         if isinstance(tool_input, dict)
         else ""
     )
-    parsed_clone_candidate = (
+    constrained_clone_candidate = (
         _constrained_github_clone_candidate(
             command,
             effective_cwd=event_cwd,
@@ -4303,6 +4791,16 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         if clone_enabled and command
         else None
     )
+    exact_clone_candidate = (
+        _exact_github_clone_candidate(
+            command,
+            effective_cwd=event_cwd,
+            workspace_cwd=base_event_cwd,
+        )
+        if clone_enabled and command and constrained_clone_candidate is None
+        else None
+    )
+    parsed_clone_candidate = constrained_clone_candidate or exact_clone_candidate
     clone_candidate = (
         parsed_clone_candidate
         if (
@@ -4370,8 +4868,9 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         if not reservation_result["ready"]:
             reason = "Constrained clone provenance reservation did not match exactly."
             return _deny_pretool(reason) if event_name == "PreToolUse" else _deny_permission(reason)
-        # Native Codex policy remains responsible for network and filesystem approval.
-        dangerous -= {"git_network", "git_non_read_only"}
+        if constrained_clone_candidate:
+            # Native Codex policy remains responsible for this read-only audit lane.
+            dangerous -= {"git_network", "git_non_read_only"}
     scoped_operation = None
     if command:
         scoped_operation = _scoped_git_candidate(command, event_cwd, dangerous)
@@ -4411,8 +4910,24 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
                 == execution_options_digest
                 and set(pending.get("codes") or []) == dangerous
             )
+            if pending_matches and pending.get("transaction_id"):
+                grant = state.get("local_git_grant")
+                pending_matches = bool(
+                    isinstance(grant, dict)
+                    and scoped_operation
+                    and pending.get("transaction_id") == grant.get("transaction_id")
+                    and pending.get("scope_hash") == scoped_operation.get("scope_hash")
+                    and pending.get("operation") == scoped_operation.get("operation")
+                    and _git_grant_matches(
+                        grant,
+                        scoped_operation,
+                        event_turn,
+                        str(state.get("session_hash") or ""),
+                    )
+                )
             if pending_matches:
-                pending_permissions.pop(tool_use_id, None)
+                if not pending.get("transaction_id"):
+                    pending_permissions.pop(tool_use_id, None)
             authorization_result["unauthorized"] = [] if pending_matches else sorted(dangerous)
             authorization_result["permission_accepted"] = pending_matches
             state["pending_permission_authorizations"] = pending_permissions
@@ -4448,14 +4963,29 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         }
         grant_codes: set[str] = set()
         grant = state.get("local_git_grant")
+        transaction_reserved = False
         if (
             transaction_enabled
             and scoped_operation
             and isinstance(grant, dict)
             and turn_matches
         ):
-            if _git_grant_matches(grant, scoped_operation, event_turn):
-                grant_codes.update(scoped_operation.get("codes") or [])
+            if _git_grant_matches(
+                grant,
+                scoped_operation,
+                event_turn,
+                str(state.get("session_hash") or ""),
+            ):
+                transaction_reserved = any(
+                    other_tool_id != tool_use_id
+                    and isinstance(item, dict)
+                    and item.get("transaction_id") == grant.get("transaction_id")
+                    and item.get("scope_hash") == scoped_operation.get("scope_hash")
+                    and item.get("operation") == scoped_operation.get("operation")
+                    for other_tool_id, item in pending_permissions.items()
+                )
+                if not transaction_reserved:
+                    grant_codes.update(scoped_operation.get("codes") or [])
 
         allowed_codes = exact_codes | grant_codes
         unauthorized = sorted(code for code in dangerous if code not in allowed_codes)
@@ -4473,11 +5003,7 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
             state["dangerous_authorization_hashes"] = authorized
             state["dangerous_authorizations"] = sorted(authorized)
 
-            if grant_codes and isinstance(grant, dict) and scoped_operation:
-                _consume_git_grant(grant, scoped_operation)
-                state["local_git_grant"] = grant
-
-            pending_permissions[tool_use_id] = {
+            permission_record = {
                 "session_hash": str(state.get("session_hash") or ""),
                 "turn_id": event_turn,
                 "tool_use_id": tool_use_id,
@@ -4488,6 +5014,15 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
                 "effective_cwd": _normalized_cwd(event_cwd),
                 "execution_options_digest": execution_options_digest,
             }
+            if grant_codes and isinstance(grant, dict) and scoped_operation:
+                permission_record.update(
+                    {
+                        "transaction_id": str(grant.get("transaction_id") or ""),
+                        "scope_hash": str(scoped_operation.get("scope_hash") or ""),
+                        "operation": str(scoped_operation.get("operation") or ""),
+                    }
+                )
+            pending_permissions[tool_use_id] = permission_record
             state["pending_permission_authorizations"] = pending_permissions
 
         if unauthorized and event_name == "PreToolUse" and scoped_operation:
@@ -4611,6 +5146,18 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _tool_response_failed(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    if response.get("isError") is True or response.get("is_error") is True:
+        return True
+    for key in ("exit_code", "returncode"):
+        value = response.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value != 0:
+            return True
+    return False
+
+
 def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
     tool_name = str(event.get("tool_name") or "")
     session_id = _session_id(event)
@@ -4628,6 +5175,7 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
     digest = _command_hash(command, event_cwd) if command else ""
     execution_options_digest = _execution_options_digest(tool_name, tool_input)
     clone_enabled = _policy()["enable_constrained_github_clone"]
+    tool_failed = _tool_response_failed(event.get("tool_response"))
 
     def clear_pending(state: dict[str, Any]) -> None:
         pending = state.get("pending_permission_authorizations")
@@ -4652,6 +5200,28 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
         if isinstance(pending, dict) and permission_matches:
             pending.pop(tool_use_id, None)
             state["pending_permission_authorizations"] = pending
+            transaction_id = str(permission.get("transaction_id") or "")
+            grant = state.get("local_git_grant")
+            if (
+                transaction_id
+                and not tool_failed
+                and isinstance(grant, dict)
+                and str(grant.get("transaction_id") or "") == transaction_id
+            ):
+                _consume_git_grant(
+                    grant,
+                    {
+                        "scope_hash": str(permission.get("scope_hash") or ""),
+                        "operation": str(permission.get("operation") or ""),
+                    },
+                )
+                state["local_git_grant"] = (
+                    grant
+                    if _git_grant_usable(
+                        grant, str(state.get("session_hash") or "")
+                    )
+                    else None
+                )
         pending_clones = state.get("pending_constrained_clones")
         if not isinstance(pending_clones, dict):
             pending_clones = {}

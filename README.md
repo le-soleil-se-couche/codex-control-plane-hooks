@@ -9,7 +9,7 @@ Version-scoped reference Hooks for local Codex workflows. The plugin applies bes
 
 - Selected destructive, mutating, dynamic-eval, package-install, network, and privilege-escalation command patterns.
 - Selected credential-like strings in prompts, tool input, and tool output.
-- Exact turn, tool, working-directory, command-hash, and one-shot approval state.
+- Exact turn, tool, working-directory, command-hash, and one-shot approval state, with explicit bounded continuation for unfinished publication transactions.
 - Optional organization-specific markers and data terms from a private `policy.json`.
 - Optional private durable-destination markers from the same local policy.
 - One-shot sensitive-disclosure grants bound to every concrete configured data term in the payload and one canonical trusted tool destination.
@@ -108,6 +108,7 @@ The checker scans its own source, filenames, compound-suffix examples, and every
 
 | Codex / surface | OS / arch | Python | Protocol and packaged-command gate | Codex live install smoke | Date |
 |---|---|---|---|---|---|
+| 0.145.0-alpha.18 bundled desktop CLI | macOS arm64 | 3.9.6 | 212 local tests + manifest/release/plugin checks passed | clean-profile checkout install, Hook discovery/trust, safe allow, dangerous deny, and cross-turn publication transaction resume passed | 2026-07-21 |
 | 0.144.5 bundled desktop CLI | macOS arm64 | 3.9.6 | 205 local tests + manifest/release/plugin checks passed | clean-profile checkout install, Hook discovery/trust, safe allow, and dangerous deny passed | 2026-07-17 |
 | GitHub Actions + `@openai/codex@0.144.4` | Ubuntu 24.04 x64 | 3.9 / 3.12 | required on every push and PR | pinned clean-profile host smoke required by CI | 2026-07-17 |
 | GitHub Actions + `@openai/codex@0.144.4` | Windows Server 2022 x64 | 3.9 / 3.12 | protocol + `pwsh` + `powershell.exe` packaged-command gates required | pinned clean-profile host smoke required by CI | 2026-07-17 |
@@ -122,12 +123,12 @@ Runtime support and Codex-host compatibility are separate claims. Hook event nam
 - Unknown `mcp__*` tools are treated as external destinations when sensitive context is active. Payload text and lookalike server namespaces cannot consume a grant for a named connector.
 - Post-tool checks occur after a tool has produced output.
 - Natural-language approval parsing remains experimental even when explicitly enabled.
-- Scoped Git/GitHub transactions and the constrained GitHub HTTPS clone lane remain experimental, separately opt-in, and default to disabled. Transaction grants bind explicit repository mappings and consume each declared operation once. An exact one-shot Git command grant remains available for a single unambiguous scope when the prompt does not form a complete transaction. Exact push fallback accepts only a bounded option subset, literal `origin`, one safe branch, and one configured HTTPS/SSH/SCP push URL; cwd, command options, and the hashed URL are bound into its digest. Helper, local, insecure, bulk, recursive, multi-ref, custom receive-pack, ambiguous multi-scope, and multi-target forms fail closed. Clone provenance restricts execution or mutation inside a newly tracked checkout until one exact command is approved.
+- Scoped Git/GitHub transactions and the constrained GitHub HTTPS clone lane remain experimental, separately opt-in, and default to disabled. One authorization capsule may list exact `clone`, checkout mutation, `add`, `commit`, and `push` commands plus restrictive safety text. Exact transaction commands bind command digests, repository scope, branch, target, and the unique canonical `origin` push-URL identity. Operations reserve at `PreToolUse`, survive matching `PermissionRequest` and `Stop`, and consume after matching successful `PostToolUse`; the transaction expires after 30 minutes. A single-scope existing repository may infer its target only from one safe canonical `origin`. Helper, local, insecure, bulk, recursive, multi-ref, custom receive-pack, ambiguous multi-scope, multi-target, force, history-rewrite, and remote-drift forms fail closed. A preauthorized full GitHub HTTPS clone must still use a direct trusted Git command, a new absolute workspace destination, an exact command hash, and post-clone provenance tracking before any declared checkout mutation can run.
 - Browser, Computer Use, and connector behavior depends on the tool name and Hook events exposed by the host.
 - Ordinary PowerShell launchers and literal `.ps1` entrypoints are treated like other script runtimes. Inline `-Command` payloads receive bounded recursive classification, while complete semantic review of script-file contents remains outside this pattern-based Hook and belongs to sandboxing, approval policy, repository review, and tests.
 - The project does not defend a compromised OS account, Python runtime, Codex binary, plugin cache, or writable policy file.
-- Native Windows uses `commandWindows`, requires an absolute host-provided `PLUGIN_DATA`, rejects external `CONTROL_PLANE_POLICY`, and relies on the host directory's inherited NTFS DACL. The Hook rejects observed symlinks and reparse points but does not independently audit every DACL ACE.
-- Linux and Windows clean-profile Codex CLI host smoke is CI-gated. Desktop GUI trust prompts remain outside hosted-runner coverage.
+- Native Windows uses `commandWindows` through a bundled launcher that prefers `python.exe` and falls back to `py.exe -3`, requires an absolute host-provided `PLUGIN_DATA`, rejects external `CONTROL_PLANE_POLICY`, and relies on the host directory's inherited NTFS DACL. The Hook rejects observed symlinks and reparse points but does not independently audit every DACL ACE.
+- Ubuntu, macOS, and Windows clean-profile Codex CLI host smoke is CI-gated and includes cross-turn publication transaction resume. Desktop GUI trust prompts remain outside hosted-runner coverage.
 
 ## Publishing sanitized configurations
 
