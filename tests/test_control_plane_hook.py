@@ -860,13 +860,13 @@ class HookProtocolTests(unittest.TestCase):
                     "deny", result["hookSpecificOutput"]["permissionDecision"]
                 )
 
-    def test_public_plugin_version_remains_v0_2_4(self) -> None:
+    def test_public_plugin_version_remains_v0_2_5(self) -> None:
         manifest = json.loads(
             (SCRIPTS.parent / ".codex-plugin" / "plugin.json").read_text(
                 encoding="utf-8"
             )
         )
-        self.assertEqual("0.2.4", manifest["version"])
+        self.assertEqual("0.2.5", manifest["version"])
 
     def test_malformed_present_policy_fails_closed(self) -> None:
         Path(self.data_dir, "policy.json").write_text("{", encoding="utf-8")
