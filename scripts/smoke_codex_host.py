@@ -63,6 +63,18 @@ def child_environment(codex_home: Path) -> dict[str, str]:
     return environment
 
 
+def installed_plugin_data(codex_home: Path) -> Path:
+    root = codex_home / "plugins" / "data"
+    candidates = sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir()
+        and (path.name == PLUGIN or path.name.startswith(f"{PLUGIN}-"))
+    )
+    require(len(candidates) == 1, f"unexpected plugin-data directories: {candidates}")
+    return candidates[0]
+
+
 def run_codex(
     codex: Path, arguments: list[str], environment: dict[str, str], cwd: Path
 ) -> subprocess.CompletedProcess[str]:
@@ -507,7 +519,7 @@ def verify_transaction_resume(
     ):
         subprocess.run(arguments, check=True, capture_output=True, text=True)
 
-    plugin_data = codex_home / "plugins" / "data" / PLUGIN
+    plugin_data = installed_plugin_data(codex_home)
     plugin_data.mkdir(parents=True, exist_ok=True)
     policy_path = (
         plugin_data / "policy.json"
