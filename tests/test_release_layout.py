@@ -107,16 +107,24 @@ class ReleaseLayoutTests(unittest.TestCase):
         for handler in commands:
             self.assertIn("$PLUGIN_ROOT", handler["command"])
             self.assertIn("$env:PLUGIN_ROOT", handler["commandWindows"])
-            self.assertIn("run_control_plane_hook.cmd", handler["commandWindows"])
-        launcher = (
+            self.assertIn("run_control_plane_hook.ps1", handler["commandWindows"])
+        powershell_launcher = (
+            ROOT
+            / "plugins"
+            / "codex-control-plane-hooks"
+            / "scripts"
+            / "run_control_plane_hook.ps1"
+        ).read_text(encoding="utf-8")
+        cmd_shim = (
             ROOT
             / "plugins"
             / "codex-control-plane-hooks"
             / "scripts"
             / "run_control_plane_hook.cmd"
         ).read_text(encoding="utf-8")
-        self.assertIn("python.exe", launcher)
-        self.assertIn("py.exe -3", launcher)
+        self.assertIn('-Name "py.exe"', powershell_launcher)
+        self.assertIn('-Name "python.exe"', powershell_launcher)
+        self.assertIn("run_control_plane_hook.ps1", cmd_shim)
         attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
         self.assertIn("*.cmd text eol=crlf", attributes)
 

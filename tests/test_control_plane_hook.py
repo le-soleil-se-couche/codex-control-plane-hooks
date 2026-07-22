@@ -143,6 +143,69 @@ class HookProtocolTests(unittest.TestCase):
             }
         )
 
+    def probe_transaction_command(
+        self,
+        command: str,
+        *,
+        cwd: str,
+        tool_name: str = "Bash",
+    ) -> dict:
+        self.tool_sequence += 1
+        tool_use_id = f"transaction-probe-{self.tool_sequence}"
+        tool_input = (
+            {"cmd": command, "workdir": cwd}
+            if tool_name == "exec_command"
+            else {"command": command}
+        )
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name,
+                "tool_use_id": tool_use_id,
+                "tool_input": tool_input,
+                "cwd": cwd,
+            }
+        )
+        output = result.get("hookSpecificOutput") or {}
+        if output.get("permissionDecision") == "deny":
+            return result
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        permission = state["pending_permission_authorizations"].get(tool_use_id)
+        if not isinstance(permission, dict) or not permission.get("transaction_id"):
+            return result
+        token = str(permission.get("runner_token") or "")
+        module = __import__("control_plane_hook")
+
+        def complete_probe(current: dict) -> None:
+            pending = current.get("pending_permission_authorizations") or {}
+            current_permission = pending.pop(tool_use_id, None)
+            current["pending_permission_authorizations"] = pending
+            grant = current.get("local_git_grant")
+            if not isinstance(current_permission, dict) or not isinstance(grant, dict):
+                raise AssertionError("transaction probe lost its reservation")
+            module._consume_git_grant(
+                grant,
+                {
+                    "scope_hash": current_permission["scope_hash"],
+                    "operation": current_permission["operation"],
+                },
+            )
+            current["local_git_grant"] = (
+                grant
+                if module._git_grant_usable(
+                    grant, str(current.get("session_hash") or "")
+                )
+                else None
+            )
+
+        module._mutate_state(self.session, complete_probe)
+        if token:
+            module._unlink_owned_regular(
+                Path(self.data_dir) / f".git-runner-request-{token}.json"
+            )
+        return result
+
     def run_transaction_command(
         self,
         event: dict,
@@ -175,9 +238,23 @@ class HookProtocolTests(unittest.TestCase):
         token = str(pending.get("runner_token") or "")
         self.assertRegex(token, r"^[0-9a-f]{32}$")
         environment = os.environ.copy()
-        environment["PLUGIN_DATA"] = self.data_dir
+        environment.pop("PLUGIN_DATA", None)
+        if os.name == "nt":
+            shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+            self.assertTrue(shell, "PowerShell is required for the Windows runner test")
+            runner_argv = [
+                str(shell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                runner_command,
+            ]
+        else:
+            runner_argv = ["/bin/sh", "-c", runner_command]
         completed = subprocess.run(
-            [sys.executable, str(SCRIPT), "--run-approved-git", token],
+            runner_argv,
+            cwd=str(event.get("cwd") or DEFAULT_CWD),
             text=True,
             capture_output=True,
             env=environment,
@@ -931,7 +1008,12 @@ class HookProtocolTests(unittest.TestCase):
             powershell_launcher.index('-Name "py.exe"'),
             powershell_launcher.index('-Name "python.exe"'),
         )
-        self.assertIn("WaitForExit(2000)", powershell_launcher)
+        self.assertIn("$probeTimeoutMs = 2000", powershell_launcher)
+        self.assertIn("WaitForExit($probeTimeoutMs)", powershell_launcher)
+        self.assertIn("Kill($true)", powershell_launcher)
+        self.assertIn("taskkill.exe", powershell_launcher)
+        self.assertIn("WaitForExit($terminationTimeoutMs)", powershell_launcher)
+        self.assertNotIn("ReadToEnd", powershell_launcher)
         self.assertIn("$process.ExitCode -eq 0", powershell_launcher)
         self.assertIn("$process.StandardInput.Close()", powershell_launcher)
         self.assertIn("$process.Kill()", powershell_launcher)
@@ -948,6 +1030,30 @@ class HookProtocolTests(unittest.TestCase):
         self.assertTrue(commands)
         self.assertTrue(
             all(command.endswith("run_control_plane_hook.ps1\"") for command in commands)
+        )
+
+    def test_windows_transaction_runner_rejects_non_powershell_overrides(self) -> None:
+        module = __import__("control_plane_hook")
+        with mock.patch.object(module.os, "name", "nt"):
+            for shell in ("cmd", "bash", "sh"):
+                with self.subTest(shell=shell):
+                    with self.assertRaisesRegex(RuntimeError, "requires PowerShell"):
+                        module._git_runner_shell_kind(
+                            "exec_command", {"shell": shell}
+                        )
+            self.assertEqual(
+                "powershell",
+                module._git_runner_shell_kind(
+                    "exec_command", {"shell": "pwsh"}
+                ),
+            )
+        rendered = module._render_git_runner_command(
+            [r"C:\Program Files\Python\python.exe", "arg with spaces", "雪"],
+            "powershell",
+        )
+        self.assertEqual(
+            "& 'C:\\Program Files\\Python\\python.exe' 'arg with spaces' '雪'",
+            rendered,
         )
 
     @unittest.skipUnless(os.name == "nt", "Windows launcher runtime test")
@@ -1057,6 +1163,75 @@ class HookProtocolTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(37, completed.returncode, completed.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Windows launcher runtime test")
+    def test_windows_launcher_bounds_hung_python_process_trees(self) -> None:
+        system_root = Path(os.environ["SystemRoot"])
+        powershell = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        csc_candidates = (
+            system_root / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe",
+            system_root / "Microsoft.NET" / "Framework" / "v4.0.30319" / "csc.exe",
+        )
+        csc = next((candidate for candidate in csc_candidates if candidate.exists()), None)
+        if csc is None:
+            self.skipTest(".NET Framework C# compiler is unavailable")
+        source = r"""
+using System.Diagnostics;
+using System.Threading;
+
+public static class Program {
+    public static void Main() {
+        var child = new ProcessStartInfo("cmd.exe", "/d /c ping -n 30 127.0.0.1");
+        child.UseShellExecute = false;
+        Process.Start(child);
+        Thread.Sleep(30000);
+    }
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "Hang.cs"
+            source_path.write_text(source, encoding="utf-8")
+            fake_py = root / "py.exe"
+            compiled = subprocess.run(
+                [
+                    str(csc),
+                    "/nologo",
+                    "/target:exe",
+                    f"/out:{fake_py}",
+                    str(source_path),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, compiled.returncode, compiled.stdout + compiled.stderr)
+            shutil.copyfile(fake_py, root / "python.exe")
+            environment = os.environ.copy()
+            environment["PATH"] = os.pathsep.join(
+                [str(root), str(system_root / "System32")]
+            )
+            started = time.monotonic()
+            completed = subprocess.run(
+                [
+                    str(powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(SCRIPTS / "run_control_plane_hook.ps1"),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=12,
+                env=environment,
+                check=False,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(127, completed.returncode, completed.stderr)
+            self.assertLess(elapsed, 9.0)
 
     def test_malformed_present_policy_fails_closed(self) -> None:
         Path(self.data_dir, "policy.json").write_text("{", encoding="utf-8")
@@ -1564,12 +1739,13 @@ class HookProtocolTests(unittest.TestCase):
                 "cwd": repo,
             }
         )
+        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
         permission = self.run_hook(
             {
                 "hook_event_name": "PermissionRequest",
                 "tool_name": "Bash",
                 "tool_use_id": tool_use_id,
-                "tool_input": {"command": command},
+                "tool_input": {"command": runner_command},
                 "cwd": repo,
             }
         )
@@ -2810,19 +2986,15 @@ class HookProtocolTests(unittest.TestCase):
     def test_scoped_local_git_grant_covers_add_and_commit_once_each(self) -> None:
         repo = "/tmp/example-repo"
         self.prompt(f"批准你在 {repo} 执行上述 git add 和 git commit。")
-        add = self.run_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "tool_name": "exec_command",
-                "tool_input": {"cmd": "git add src/app.py tests/test_app.py", "workdir": repo},
-            }
+        add = self.probe_transaction_command(
+            "git add src/app.py tests/test_app.py",
+            cwd=repo,
+            tool_name="exec_command",
         )
-        commit = self.run_hook(
-            {
-                "hook_event_name": "PreToolUse",
-                "tool_name": "exec_command",
-                "tool_input": {"cmd": "git commit -m 'test: checkpoint'", "workdir": repo},
-            }
+        commit = self.probe_transaction_command(
+            "git commit -m 'test: checkpoint'",
+            cwd=repo,
+            tool_name="exec_command",
         )
         replay = self.run_hook(
             {
@@ -3562,8 +3734,10 @@ class HookProtocolTests(unittest.TestCase):
             cwd=repo,
         )
 
-        add = self.bash("git add src/app.py", cwd=repo)
-        commit = self.bash("git commit -m checkpoint", cwd=repo)
+        add = self.probe_transaction_command("git add src/app.py", cwd=repo)
+        commit = self.probe_transaction_command(
+            "git commit -m checkpoint", cwd=repo
+        )
         run = self.bash(command, cwd=repo)
 
         self.assertNotEqual("deny", add["hookSpecificOutput"].get("permissionDecision"))
@@ -3637,9 +3811,11 @@ class HookProtocolTests(unittest.TestCase):
             f"transaction-repo private repository，推送 {branch}。"
         )
         allowed = (
-            self.bash("git add src/app.py", cwd=repo),
-            self.bash("git commit -m checkpoint", cwd=repo),
-            self.bash(f"git push origin {branch}", cwd=repo),
+            self.probe_transaction_command("git add src/app.py", cwd=repo),
+            self.probe_transaction_command("git commit -m checkpoint", cwd=repo),
+            self.probe_transaction_command(
+                f"git push origin {branch}", cwd=repo
+            ),
         )
         for result in allowed:
             self.assertNotEqual("deny", result["hookSpecificOutput"].get("permissionDecision"))
@@ -3786,7 +3962,9 @@ class HookProtocolTests(unittest.TestCase):
             )
             for command in commands:
                 with self.subTest(command=command.split()[0]):
-                    result = self.bash(command, cwd=str(root))
+                    result = self.probe_transaction_command(
+                        command, cwd=str(root)
+                    )
                     self.assertNotEqual(
                         "deny",
                         result["hookSpecificOutput"].get("permissionDecision"),
@@ -3904,7 +4082,7 @@ class HookProtocolTests(unittest.TestCase):
                 "PATHEXT", ""
             )
         with mock.patch.dict(os.environ, fixture_env, clear=False):
-            create = self.bash(
+            create = self.probe_transaction_command(
                 f"gh repo create {target} --private --source '{repo}' --remote origin",
                 cwd=str(root),
             )
@@ -4867,7 +5045,13 @@ class HookProtocolTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLUGIN_DATA"] = self.data_dir
         completed = subprocess.run(
-            [sys.executable, str(SCRIPT), "--run-approved-git", token],
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--run-approved-git",
+                token,
+                self.data_dir,
+            ],
             text=True,
             capture_output=True,
             env=environment,
@@ -4989,13 +5173,237 @@ class HookProtocolTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["PLUGIN_DATA"] = self.data_dir
         replay = subprocess.run(
-            [sys.executable, str(SCRIPT), "--run-approved-git", runner_id],
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--run-approved-git",
+                runner_id,
+                self.data_dir,
+            ],
             text=True,
             capture_output=True,
             env=environment,
             check=False,
         )
         self.assertEqual(126, replay.returncode)
+
+    def test_repeated_original_pretool_keeps_runner_and_direct_permission_is_denied(
+        self,
+    ) -> None:
+        repo = Path(self.data_dir) / "runner-repeat"
+        repo.mkdir()
+        (repo / "README.md").write_text("repeat\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        add = f"git -C {repo} add README.md"
+        commit = f'git -C {repo} commit -m "fix: repeat"'
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{add}`\n`{commit}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=self.data_dir,
+        )
+        event = {
+            "tool_name": "Bash",
+            "tool_use_id": "runner-repeat-add",
+            "tool_input": {"command": add},
+            "cwd": self.data_dir,
+        }
+        first = self.run_hook({"hook_event_name": "PreToolUse", **event})
+        second = self.run_hook({"hook_event_name": "PreToolUse", **event})
+        first_runner = first["hookSpecificOutput"]["updatedInput"]["command"]
+        self.assertEqual(
+            first_runner,
+            second["hookSpecificOutput"]["updatedInput"]["command"],
+        )
+        self.assertEqual(
+            1,
+            len(list(Path(self.data_dir).glob(".git-runner-request-*.json"))),
+        )
+        direct = self.run_hook({"hook_event_name": "PermissionRequest", **event})
+        self.assertEqual(
+            "deny", direct["hookSpecificOutput"]["decision"]["behavior"]
+        )
+        rewritten = dict(event)
+        rewritten["tool_input"] = {"command": first_runner}
+        allowed = self.run_hook(
+            {"hook_event_name": "PermissionRequest", **rewritten}
+        )
+        self.assertEqual(
+            "allow", allowed["hookSpecificOutput"]["decision"]["behavior"]
+        )
+
+    def test_transaction_allows_only_one_inflight_runner(self) -> None:
+        repo = Path(self.data_dir) / "single-inflight"
+        repo.mkdir()
+        (repo / "README.md").write_text("one ticket\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        add = f"git -C {repo} add README.md"
+        commit = f'git -C {repo} commit -m "fix: one ticket"'
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{add}`\n`{commit}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=self.data_dir,
+        )
+        add_event = {
+            "tool_name": "Bash",
+            "tool_use_id": "single-inflight-add",
+            "tool_input": {"command": add},
+            "cwd": self.data_dir,
+        }
+        add_result = self.run_hook(
+            {"hook_event_name": "PreToolUse", **add_event}
+        )
+        self.assertTrue(add_result["hookSpecificOutput"]["updatedInput"]["command"])
+        commit_result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_use_id": "single-inflight-commit",
+                "tool_input": {"command": commit},
+                "cwd": self.data_dir,
+            }
+        )
+        self.assertEqual(
+            "deny", commit_result["hookSpecificOutput"]["permissionDecision"]
+        )
+        self.assertEqual(
+            1,
+            len(list(Path(self.data_dir).glob(".git-runner-request-*.json"))),
+        )
+
+    def test_runner_rejects_ticket_tampering_and_clears_transaction_tickets(
+        self,
+    ) -> None:
+        repo = Path(self.data_dir) / "ticket-tamper"
+        repo.mkdir()
+        (repo / "allowed.txt").write_text("allowed\n", encoding="utf-8")
+        (repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        add = f"git -C {repo} add allowed.txt"
+        commit = f'git -C {repo} commit -m "fix: ticket"'
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{add}`\n`{commit}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=self.data_dir,
+        )
+        event = {
+            "tool_name": "Bash",
+            "tool_use_id": "ticket-tamper-add",
+            "tool_input": {"command": add},
+            "cwd": self.data_dir,
+        }
+        self.run_hook({"hook_event_name": "PreToolUse", **event})
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        permission = state["pending_permission_authorizations"]["ticket-tamper-add"]
+        token = permission["runner_token"]
+        request_path = Path(self.data_dir) / f".git-runner-request-{token}.json"
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        request["argv"][-1] = "other.txt"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        stale_token = "f" * 32
+        stale_path = Path(self.data_dir) / f".git-runner-request-{stale_token}.json"
+        stale_path.write_text(json.dumps(request), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--run-approved-git",
+                token,
+                self.data_dir,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(126, completed.returncode)
+        self.assertFalse(stale_path.exists())
+        staged = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual([], staged.stdout.splitlines())
+        failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(failed_state["local_git_grant"])
+        self.assertEqual({}, failed_state["pending_permission_authorizations"])
+
+    def test_runner_rechecks_push_remote_after_ticket_issuance(self) -> None:
+        repo = Path(self.data_dir) / "runner-remote-drift"
+        repo.mkdir()
+        target = "sample-owner/runner-remote-drift"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                f"https://github.com/{target}.git",
+            ],
+            check=True,
+        )
+        commit = f'git -C {repo} commit -m "fix: remote drift"'
+        push = f"git -C {repo} push origin main"
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{commit}`\n`{push}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=self.data_dir,
+        )
+        event = {
+            "tool_name": "Bash",
+            "tool_use_id": "runner-remote-drift-push",
+            "tool_input": {"command": push},
+            "cwd": self.data_dir,
+        }
+        pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
+        rewritten = dict(event)
+        rewritten["tool_input"] = {"command": runner_command}
+        permission = self.run_hook(
+            {"hook_event_name": "PermissionRequest", **rewritten}
+        )
+        self.assertEqual(
+            "allow", permission["hookSpecificOutput"]["decision"]["behavior"]
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/sample-owner/changed.git",
+            ],
+            check=True,
+        )
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        token = state["pending_permission_authorizations"][
+            "runner-remote-drift-push"
+        ]["runner_token"]
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--run-approved-git",
+                token,
+                self.data_dir,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(126, completed.returncode, completed.stderr)
+        failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(failed_state["local_git_grant"])
 
     def test_missing_runner_receipt_revokes_transaction(self) -> None:
         repo = Path(self.data_dir) / "missing-runner-receipt"
@@ -5308,10 +5716,16 @@ class HookProtocolTests(unittest.TestCase):
             "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
             cwd=self.data_dir,
         )
-        allowed_add = self.bash(add_a, cwd=self.data_dir)
-        allowed_commit = self.bash(commit_b, cwd=self.data_dir)
-        allowed_create_a = self.bash(create_a, cwd=self.data_dir)
-        allowed_create_b = self.bash(create_b, cwd=self.data_dir)
+        allowed_add = self.probe_transaction_command(add_a, cwd=self.data_dir)
+        allowed_commit = self.probe_transaction_command(
+            commit_b, cwd=self.data_dir
+        )
+        allowed_create_a = self.probe_transaction_command(
+            create_a, cwd=self.data_dir
+        )
+        allowed_create_b = self.probe_transaction_command(
+            create_b, cwd=self.data_dir
+        )
         self.assertNotEqual(
             "deny", allowed_add["hookSpecificOutput"].get("permissionDecision")
         )
