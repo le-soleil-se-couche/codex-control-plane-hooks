@@ -2450,6 +2450,11 @@ def _clone_workspace_root(cwd: str) -> str:
     return root
 
 
+def _clone_parent_access_mode() -> int:
+    # Windows directory traversal does not use a POSIX executable bit.
+    return os.W_OK if os.name == "nt" else os.W_OK | os.X_OK
+
+
 def _clone_destination_allowed(destination: str, workspace_cwd: str) -> bool:
     if (
         not destination
@@ -2488,7 +2493,7 @@ def _clone_destination_allowed(destination: str, workspace_cwd: str) -> bool:
     return (
         lexical_parent.is_dir()
         and stat.S_ISDIR(lexical_info.st_mode)
-        and os.access(lexical_parent, os.W_OK | os.X_OK)
+        and os.access(lexical_parent, _clone_parent_access_mode())
     )
 
 

@@ -4747,6 +4747,13 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual("deny", altered["hookSpecificOutput"]["permissionDecision"])
 
+    def test_clone_parent_access_mode_matches_host_directory_semantics(self) -> None:
+        module = __import__("control_plane_hook")
+        with mock.patch.object(module.os, "name", "nt"):
+            self.assertEqual(os.W_OK, module._clone_parent_access_mode())
+        with mock.patch.object(module.os, "name", "posix"):
+            self.assertEqual(os.W_OK | os.X_OK, module._clone_parent_access_mode())
+
     def test_scoped_transaction_ttl_is_thirty_minutes(self) -> None:
         module = __import__("control_plane_hook")
         grant = {
