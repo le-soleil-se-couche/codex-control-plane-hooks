@@ -3612,16 +3612,31 @@ class HookProtocolTests(unittest.TestCase):
         initial_grant = json.loads(state_path.read_text(encoding="utf-8"))[
             "local_git_grant"
         ]
-        for command in (
-            f"git -C '{repo}' init -b main",
-            f"git -C '{repo}' add -- .",
-            f"git -C '{repo}' commit -m 'feat: publish workbench'",
+        for index, command in enumerate(
+            (
+                f"git -C '{repo}' init -b main",
+                f"git -C '{repo}' add -- .",
+                f"git -C '{repo}' commit -m 'feat: publish workbench'",
+            )
         ):
-            result = self.bash(command, cwd=str(root))
+            event = {
+                "tool_name": "Bash",
+                "tool_use_id": f"resume-initial-{index}",
+                "tool_input": {"command": command},
+                "cwd": str(root),
+            }
+            result = self.run_hook({"hook_event_name": "PreToolUse", **event})
             self.assertNotEqual(
                 "deny",
                 result["hookSpecificOutput"].get("permissionDecision"),
                 msg=(command, result),
+            )
+            self.run_hook(
+                {
+                    "hook_event_name": "PostToolUse",
+                    **event,
+                    "tool_response": {"output": "", "exit_code": 0},
+                }
             )
 
         self.assertEqual(

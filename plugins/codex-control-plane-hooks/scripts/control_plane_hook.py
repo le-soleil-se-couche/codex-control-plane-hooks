@@ -221,6 +221,11 @@ _AUTH_NEGATED_RE = re.compile(
     r"|(?:不要|别).{0,4}执行|\b(?:do\s+not|don't|never)\b.{0,24}\b(?:go\s+ahead|proceed|authorize|execute|run)\b"
     r"|\bnot\s+(?:authorized|approved)\b|\bwithout\s+(?:authorization|approval)\b"
 )
+_AUTHORIZATION_REVOCATION_RE = re.compile(
+    r"(?is)(?:但|但是|不过|\bbut\b|\bhowever\b).{0,32}"
+    r"(?:不要|别|禁止|不许|不得|do\s+not|don't|never).{0,32}"
+    r"(?:执行|运行|上述|前述|该命令|这些命令|execute|run|proceed)"
+)
 _DANGEROUS_APPROVAL_RE = re.compile(
     r"(?ix)^\s*(?:"
     r"(?:(?:本轮|这次|现在)\s*)?(?:并\s*)?(?:明确\s*)?"
@@ -3291,7 +3296,13 @@ def _prompt_git_operation_digests(
 ) -> dict[str, dict[str, str]] | None:
     bindings: dict[str, dict[str, str]] = {}
     for segment in _AUTH_SEGMENT_SPLIT_RE.split(prompt):
-        for command in _authorization_command_candidates(segment):
+        code_spans = re.findall(r"`([^`\n]+)`", segment)
+        commands = (
+            _authorization_command_candidates(segment)
+            if code_spans
+            else _pure_authorization_command_candidates(segment)
+        )
+        for command in commands:
             dangerous = _dangerous_codes(_structured_command_findings(command))
             candidate = _scoped_git_candidate(command, cwd, dangerous)
             if not candidate:
@@ -3556,6 +3567,7 @@ def _local_git_grant_from_prompt(
     authorization_text = _git_authorization_text(prompt)
     if (
         not authorization_text
+        or _AUTHORIZATION_REVOCATION_RE.search(prompt)
         or _AUTH_NEGATED_RE.search(authorization_text)
         or _NEGATED_GIT_OPERATION_RE.search(authorization_text)
     ):
@@ -3703,6 +3715,7 @@ def _git_transaction_resume_requested(prompt: str) -> bool:
         and policy["enable_scoped_git_transactions"]
         and authorization_text
         and _AUTHORIZED_TRANSACTION_CONTINUATION_RE.search(authorization_text)
+        and not _AUTHORIZATION_REVOCATION_RE.search(prompt)
         and not _AUTH_NEGATED_RE.search(authorization_text)
         and not _NEGATED_GIT_OPERATION_RE.search(authorization_text)
     )
@@ -4140,7 +4153,10 @@ def _dangerous_authorization_hashes(
     skip_scoped_candidates: bool = False,
 ) -> dict[str, list[str]]:
     policy = _policy()
-    if not policy["enable_natural_language_approvals"]:
+    if (
+        not policy["enable_natural_language_approvals"]
+        or _AUTHORIZATION_REVOCATION_RE.search(prompt)
+    ):
         return {}
     authorized: dict[str, set[str]] = {}
     for clause in _authorization_clauses(prompt, _DANGEROUS_APPROVAL_RE):
@@ -4715,7 +4731,9 @@ def _handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
         state["local_git_grant"] = grant
         if grant is not None:
             state["pending_local_git"] = None
-        elif _AUTH_NEGATED_RE.search(authorization_text) or (
+        elif _AUTHORIZATION_REVOCATION_RE.search(prompt) or _AUTH_NEGATED_RE.search(
+            authorization_text
+        ) or (
             isinstance(pending, dict)
             and (
                 not _pending_git_usable(pending)
