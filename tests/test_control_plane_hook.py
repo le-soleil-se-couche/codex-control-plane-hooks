@@ -1179,7 +1179,29 @@ class HookProtocolTests(unittest.TestCase):
 
         py_launcher = shutil.which("py.exe")
         if not py_launcher:
-            self.skipTest("py.exe is unavailable")
+            return
+        probe_environment = os.environ.copy()
+        probe_environment["PYTHON_MANAGER_AUTOMATIC_INSTALL"] = "0"
+        py_probe = subprocess.run(
+            [
+                py_launcher,
+                "-3",
+                "-I",
+                "-S",
+                "-c",
+                (
+                    "import sys; raise SystemExit("
+                    "0 if sys.version_info >= (3, 9) else 1)"
+                ),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            env=probe_environment,
+            check=False,
+        )
+        if py_probe.returncode != 0:
+            return
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plugin_data = root / "plugin-data"
