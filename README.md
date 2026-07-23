@@ -36,6 +36,44 @@ Total Token reduction is not the primary metric. Useful measurements include:
 
 Measure these on comparable tasks, model settings, and host versions. Call counts alone do not reveal Token allocation by model, and a heavier task mix can increase total Token use while still improving allocation quality.
 
+
+## Observed effect under `Approve for me`
+
+The following public sample uses one maintainer's official Codex Analytics data from 2026-07-09 through 2026-07-22. The comparison boundary is the thin-hook rollout on 2026-07-14.
+
+```mermaid
+xychart-beta
+    title "Call allocation under Approve for me"
+    x-axis ["Before review", "Before model", "After review", "After model"]
+    y-axis "Share of calls (%)" 0 --> 100
+    bar [78.4, 21.6, 58.8, 41.2]
+```
+
+| Metric | Before: 2026-07-09 to 2026-07-13 | After: 2026-07-14 to 2026-07-22 | Change |
+|---|---:|---:|---:|
+| Total Tokens per day | 0.834B | 1.043B | +25.1% |
+| Total calls per day | 1,534.8 | 861.9 | -43.8% |
+| `codex-auto-review` calls per day | 1,204.0 | 507.0 | -57.9% |
+| Substantive model calls per day | 330.8 | 354.9 | +7.3% |
+| GPT-5.6 Sol/Luna/Terra calls per day | 197.6 | 301.3 | +52.5% |
+| `codex-auto-review` share of calls | 78.4% | 58.8% | -19.6 percentage points |
+| Auto-review calls per GPT-5.6 call | 6.09 | 1.68 | -72.4% |
+
+The dashboard exposes total Token usage and call counts by model. It does not expose per-model Token totals. The chart therefore measures call allocation as a proxy. Higher total Token use, fewer review calls, and more GPT-5.6 calls are strongly consistent with budget moving from workflow review into substantive inference, while the exact Token transfer remains unquantified.
+
+This sample is observational. Task mix and private Hook versions changed during the period, and the current public `v0.2.6` release was not held constant throughout the window.
+
+### Approval-mode boundary
+
+This allocation benefit primarily applies to the Codex app's **Approve for me** path, where ordinary command execution can invoke `codex-auto-review`.
+
+| Access mode | Expected Hook value |
+|---|---|
+| **Approve for me** | Reduces duplicate approval review, repeated authorization, and retry loops; this is where review-budget reallocation can be material. |
+| **Full access** | Ordinary commands already bypass most host approval review, so little review budget remains to reclaim. Command safety, secret controls, sensitive-data boundaries, scoped publication state, and Agent closure still apply. |
+
+Do not select a broader access mode solely to reduce review usage. Choose the sandbox and approval mode for the required security boundary; use the Hook to reduce avoidable overhead inside that boundary.
+
 ## Design goals
 
 - **Near-zero steady-state prompt tax.** Ordinary prompts and successful tool output do not receive generic policy lectures.
