@@ -6,7 +6,7 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [0.2.6] - 2026-07-23
 
-- Pinned the single approved `origin` push URL inside the private one-time runner ticket and reset the child Git process to that URL, preserving `--set-upstream` semantics while preventing post-claim remote changes from redirecting the push.
+- Pinned the single approved `origin` push URL inside the private one-time runner ticket, replaced the child push's named-remote operand with that literal URL, and restored requested upstream metadata only after a successful push and a fresh `origin` revalidation.
 - Required a present, structurally matching, unclaimed private runner ticket before allowing either the original transaction command or its rewritten runner command; invalid runner-shaped retries revoke the transaction.
 - Prevented a reused `tool_use_id` from replacing an in-flight Git transaction reservation while retaining idempotent retries of the exact reserved command.
 - Enforced the Windows PowerShell-only transaction runner contract before reservation, covering explicit `powershell` and `pwsh` overrides while rejecting `cmd`, Bash, and `sh` overrides.

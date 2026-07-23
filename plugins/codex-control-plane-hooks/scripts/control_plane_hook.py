@@ -497,6 +497,10 @@ _EXACT_PUSH_OPTIONAL_VALUE_PREFIXES = (
     "--force-with-lease=",
     "--signed=",
 )
+_SCOPED_PUSH_OPTIONS = frozenset(
+    {"-u", "--set-upstream", "--porcelain", "-q", "--quiet", "-v", "--verbose"}
+)
+_SCOPED_PUSH_UPSTREAM_OPTIONS = frozenset({"-u", "--set-upstream"})
 _TRUSTED_EXEC_COMMAND_SHELLS = {"/bin/bash", "/bin/sh", "/bin/zsh"}
 _TRUSTED_WINDOWS_EXEC_COMMAND_SHELLS = {"bash", "cmd", "powershell", "pwsh", "sh"}
 _EXEC_COMMAND_ALLOWED_FIELDS = frozenset(
@@ -2590,16 +2594,86 @@ def _git_runner_environment(
             ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
         ):
             environment.pop(key, None)
-    environment.update(
-        {
-            "GIT_CONFIG_COUNT": "2",
-            "GIT_CONFIG_KEY_0": "remote.origin.pushurl",
-            "GIT_CONFIG_VALUE_0": "",
-            "GIT_CONFIG_KEY_1": "remote.origin.pushurl",
-            "GIT_CONFIG_VALUE_1": pinned_push_url,
-        }
-    )
     return environment
+
+
+def _pinned_git_push_argv(
+    argv: list[str], request: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[list[str], bool]:
+    pinned_push_url = str(request.get("pinned_push_url") or "")
+    executable, args, wrappers = _unwrap_command(argv)
+    subcommand, git_args, dynamic_config = _git_command(args)
+    global_arg_count = len(args) - len(git_args) - 1
+    if (
+        wrappers
+        or executable != "git"
+        or subcommand != "push"
+        or dynamic_config
+        or global_arg_count < 0
+        or candidate.get("remote") != "origin"
+        or _safe_git_push_url(pinned_push_url) != pinned_push_url
+        or tuple(candidate.get("remote_urls") or ()) != (pinned_push_url,)
+    ):
+        raise RuntimeError("Git runner cannot construct a pinned push")
+
+    rewritten_args: list[str] = []
+    positionals = 0
+    options_done = False
+    set_upstream = False
+    for token in git_args:
+        if not options_done and token == "--":
+            options_done = True
+            rewritten_args.append(token)
+            continue
+        if not options_done and token in _SCOPED_PUSH_OPTIONS:
+            if token in _SCOPED_PUSH_UPSTREAM_OPTIONS:
+                set_upstream = True
+            else:
+                rewritten_args.append(token)
+            continue
+        if token.startswith("-"):
+            raise RuntimeError("Git runner received an unsupported push option")
+        if positionals == 0:
+            if token != "origin":
+                raise RuntimeError("Git runner push remote changed")
+            rewritten_args.append(pinned_push_url)
+        elif positionals == 1:
+            if _safe_branch_name(token) != str(candidate.get("refspec") or ""):
+                raise RuntimeError("Git runner push branch changed")
+            rewritten_args.append(token)
+        else:
+            raise RuntimeError("Git runner received multiple push targets")
+        positionals += 1
+    if positionals != 2:
+        raise RuntimeError("Git runner push target is incomplete")
+
+    push_index = 1 + global_arg_count
+    return [*argv[: push_index + 1], *rewritten_args], set_upstream
+
+
+def _set_git_push_upstream(
+    candidate: dict[str, Any], pinned_push_url: str, environment: dict[str, str]
+) -> bool:
+    scope = str(candidate.get("scope") or "")
+    branch = _safe_branch_name(str(candidate.get("refspec") or ""))
+    current_urls = _git_remote_urls(scope, "origin")
+    if not scope or not branch or current_urls != (pinned_push_url,):
+        return False
+    current_identities = _git_remote_identities(scope, "origin", urls=current_urls)
+    if current_identities != (_git_push_url_identity(pinned_push_url),):
+        return False
+    for key, value in (
+        (f"branch.{branch}.remote", "origin"),
+        (f"branch.{branch}.merge", f"refs/heads/{branch}"),
+    ):
+        completed = subprocess.run(
+            ["git", "-C", scope, "config", "--local", "--replace-all", key, value],
+            env=environment,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return False
+    return True
 
 
 def _claim_git_runner_request(
@@ -2685,8 +2759,20 @@ def _run_approved_git(token: str) -> int:
 
     try:
         environment = _git_runner_environment(request, candidate)
-        completed = subprocess.run(argv, cwd=cwd, env=environment, check=False)
+        child_argv = argv
+        set_upstream = False
+        if str(candidate.get("operation") or "") == "push":
+            child_argv, set_upstream = _pinned_git_push_argv(
+                argv, request, candidate
+            )
+        completed = subprocess.run(child_argv, cwd=cwd, env=environment, check=False)
         exit_code = int(completed.returncode)
+        if exit_code == 0 and set_upstream and not _set_git_push_upstream(
+            candidate,
+            str(request.get("pinned_push_url") or ""),
+            environment,
+        ):
+            exit_code = 126
     except (OSError, RuntimeError):
         exit_code = 126
     status = {
@@ -3422,7 +3508,7 @@ def _command_uses_untrusted_clone(command: str, cwd: str, roots: tuple[str, ...]
 
 
 def _safe_push_target(git_args: list[str]) -> tuple[str, str] | None:
-    ignored = {"-u", "--set-upstream", "--porcelain", "-q", "--quiet", "-v", "--verbose", "--"}
+    ignored = _SCOPED_PUSH_OPTIONS | {"--"}
     positionals = [token for token in git_args if token not in ignored]
     if any(token.startswith("-") for token in positionals):
         return None

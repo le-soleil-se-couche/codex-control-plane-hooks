@@ -29,6 +29,7 @@ function Stop-ProbeProcessTree {
     )
 
     $killer = $null
+    $fallbackRequired = $false
     try {
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = Join-Path $env:SystemRoot "System32\taskkill.exe"
@@ -49,9 +50,21 @@ function Stop-ProbeProcessTree {
             }
             catch {
             }
+            $fallbackRequired = $true
+        }
+        elseif ($killer.ExitCode -ne 0) {
+            $fallbackRequired = $true
         }
     }
     catch {
+        $fallbackRequired = $true
+    }
+    finally {
+        if ($null -ne $killer) {
+            $killer.Dispose()
+        }
+    }
+    if ($fallbackRequired) {
         try {
             $Process.Kill($true)
         }
@@ -61,11 +74,6 @@ function Stop-ProbeProcessTree {
             }
             catch {
             }
-        }
-    }
-    finally {
-        if ($null -ne $killer) {
-            $killer.Dispose()
         }
     }
     $terminationWaitMs = Get-RemainingProbeMilliseconds -Maximum $terminationTimeoutMs

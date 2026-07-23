@@ -1017,6 +1017,18 @@ class HookProtocolTests(unittest.TestCase):
         self.assertIn("Kill($true)", powershell_launcher)
         self.assertIn("taskkill.exe", powershell_launcher)
         self.assertIn("WaitForExit($killWaitMs)", powershell_launcher)
+        taskkill_timeout = powershell_launcher.index(
+            "if (-not $killer.WaitForExit($killWaitMs))"
+        )
+        fallback_assignment = powershell_launcher.index(
+            "$fallbackRequired = $true", taskkill_timeout
+        )
+        direct_tree_kill = powershell_launcher.index(
+            "$Process.Kill($true)", fallback_assignment
+        )
+        self.assertLess(taskkill_timeout, fallback_assignment)
+        self.assertLess(fallback_assignment, direct_tree_kill)
+        self.assertIn("elseif ($killer.ExitCode -ne 0)", powershell_launcher)
         self.assertIn("WaitForExit($terminationWaitMs)", powershell_launcher)
         self.assertNotIn("ReadToEnd", powershell_launcher)
         self.assertIn("$process.ExitCode -eq 0", powershell_launcher)
@@ -5682,7 +5694,7 @@ public static class Program {
             )
 
         def capture_child(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            if argv == request["argv"]:
+            if "push" in argv:
                 captured["argv"] = list(argv)
                 captured["env"] = dict(kwargs.get("env") or {})
                 return subprocess.CompletedProcess(argv, 0, "", "")
@@ -5690,17 +5702,24 @@ public static class Program {
 
         with mock.patch.object(
             module, "_claim_git_runner_request", side_effect=claim_then_change_remote
-        ), mock.patch.object(module.subprocess, "run", side_effect=capture_child):
+        ), mock.patch.object(
+            module, "_set_git_push_upstream", return_value=True
+        ) as set_upstream, mock.patch.object(
+            module.subprocess, "run", side_effect=capture_child
+        ):
             self.assertEqual(0, module._run_approved_git(token))
 
-        self.assertEqual(request["argv"], captured["argv"])
+        child_argv = captured["argv"]
+        self.assertNotIn("-u", child_argv)
+        self.assertNotIn("origin", child_argv)
+        self.assertIn(original_url, child_argv)
         child_env = captured["env"]
         self.assertIsInstance(child_env, dict)
-        self.assertEqual("2", child_env["GIT_CONFIG_COUNT"])
-        self.assertEqual("remote.origin.pushurl", child_env["GIT_CONFIG_KEY_0"])
-        self.assertEqual("", child_env["GIT_CONFIG_VALUE_0"])
-        self.assertEqual("remote.origin.pushurl", child_env["GIT_CONFIG_KEY_1"])
-        self.assertEqual(original_url, child_env["GIT_CONFIG_VALUE_1"])
+        self.assertNotIn("GIT_CONFIG_COUNT", child_env)
+        self.assertFalse(
+            any(key.startswith("GIT_CONFIG_KEY_") for key in child_env)
+        )
+        set_upstream.assert_called_once()
         actual_origin = real_run(
             ["git", "-C", str(repo), "remote", "get-url", "origin"],
             text=True,
@@ -5708,6 +5727,47 @@ public static class Program {
             check=True,
         ).stdout.strip()
         self.assertEqual(changed_url, actual_origin)
+
+    def test_runner_sets_upstream_only_after_origin_revalidation(self) -> None:
+        module = __import__("control_plane_hook")
+        candidate = {
+            "scope": self.data_dir,
+            "operation": "push",
+            "remote": "origin",
+            "refspec": "feature/release",
+        }
+        pinned = "https://github.com/sample-owner/approved.git"
+        environment = {"GIT_TERMINAL_PROMPT": "0"}
+        with mock.patch.object(
+            module, "_git_remote_urls", return_value=(pinned,)
+        ), mock.patch.object(
+            module,
+            "_git_remote_identities",
+            return_value=(module._git_push_url_identity(pinned),),
+        ), mock.patch.object(
+            module.subprocess,
+            "run",
+            side_effect=(
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0),
+            ),
+        ) as run:
+            self.assertTrue(
+                module._set_git_push_upstream(candidate, pinned, environment)
+            )
+        self.assertEqual(2, run.call_count)
+        self.assertIn("branch.feature/release.remote", run.call_args_list[0].args[0])
+        self.assertIn("branch.feature/release.merge", run.call_args_list[1].args[0])
+
+        with mock.patch.object(
+            module,
+            "_git_remote_urls",
+            return_value=("https://github.com/sample-owner/changed.git",),
+        ), mock.patch.object(module.subprocess, "run") as blocked_run:
+            self.assertFalse(
+                module._set_git_push_upstream(candidate, pinned, environment)
+            )
+        blocked_run.assert_not_called()
 
     def test_missing_runner_receipt_revokes_transaction(self) -> None:
         repo = Path(self.data_dir) / "missing-runner-receipt"
