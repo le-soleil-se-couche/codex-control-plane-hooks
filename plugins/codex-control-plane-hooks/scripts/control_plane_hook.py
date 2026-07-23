@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -341,6 +342,7 @@ _PENDING_GIT_TTL_SECONDS = 600
 _SCOPED_GIT_TRANSACTION_TTL_SECONDS = 30 * 60
 _GIT_RUNNER_TTL_SECONDS = 5 * 60
 _GIT_RUNNER_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_EMPTY_GIT_URL_REWRITE_SNAPSHOT = hashlib.sha256(b"[]").hexdigest()
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SENSITIVE_ENV_NAMES = {
     "BASH_ENV",
@@ -497,6 +499,10 @@ _EXACT_PUSH_OPTIONAL_VALUE_PREFIXES = (
     "--force-with-lease=",
     "--signed=",
 )
+_SCOPED_PUSH_OPTIONS = frozenset(
+    {"-u", "--set-upstream", "--porcelain", "-q", "--quiet", "-v", "--verbose"}
+)
+_SCOPED_PUSH_UPSTREAM_OPTIONS = frozenset({"-u", "--set-upstream"})
 _TRUSTED_EXEC_COMMAND_SHELLS = {"/bin/bash", "/bin/sh", "/bin/zsh"}
 _TRUSTED_WINDOWS_EXEC_COMMAND_SHELLS = {"bash", "cmd", "powershell", "pwsh", "sh"}
 _EXEC_COMMAND_ALLOWED_FIELDS = frozenset(
@@ -2234,6 +2240,17 @@ def _git_runner_command(
     )
 
 
+def _git_runner_invocation_shape(command: str) -> bool:
+    tokens = _shell_tokens(command)
+    if tokens[:1] == ["&"]:
+        tokens = tokens[1:]
+    return bool(
+        len(tokens) == 7
+        and tokens[1:3] == ["-I", "-S"]
+        and tokens[4] == "--run-approved-git"
+    )
+
+
 def _matching_git_runner_permission(
     state: dict[str, Any],
     *,
@@ -2257,7 +2274,7 @@ def _matching_git_runner_permission(
     return permission if (
         _GIT_RUNNER_TOKEN_RE.fullmatch(token)
         and command_digest == expected_digest
-        and (not original or _git_runner_path("request", token).exists())
+        and _git_runner_request_matches_permission(permission)
         and str(permission.get("session_hash") or "") == str(state.get("session_hash") or "")
         and str(permission.get("turn_id") or "") == turn_id
         and str(permission.get("tool_use_id") or "") == tool_use_id
@@ -2266,6 +2283,45 @@ def _matching_git_runner_permission(
         and str(permission.get("effective_cwd") or "") == _normalized_cwd(effective_cwd)
         and str(permission.get("execution_options_digest") or "") == execution_options_digest
     ) else None
+
+
+def _git_runner_request_matches_permission(permission: dict[str, Any]) -> bool:
+    token = str(permission.get("runner_token") or "")
+    if not _GIT_RUNNER_TOKEN_RE.fullmatch(token) or permission.get("runner_claimed_at"):
+        return False
+    try:
+        request = _read_private_json(_git_runner_path("request", token))
+    except Exception:
+        return False
+    if not str(permission.get("runner_request_digest") or "") or str(
+        permission.get("runner_request_digest") or ""
+    ) != _git_runner_request_digest(request):
+        return False
+    expected = {
+        "base_event_cwd": str(permission.get("base_event_cwd") or ""),
+        "effective_cwd": str(permission.get("effective_cwd") or ""),
+        "execution_options_digest": str(permission.get("execution_options_digest") or ""),
+        "operation": str(permission.get("operation") or ""),
+        "original_digest": str(permission.get("original_digest") or ""),
+        "runner_digest": str(permission.get("digest") or ""),
+        "scope_hash": str(permission.get("scope_hash") or ""),
+        "session_hash": str(permission.get("session_hash") or ""),
+        "tool_name": str(permission.get("tool_name") or ""),
+        "tool_use_id": str(permission.get("tool_use_id") or ""),
+        "transaction_id": str(permission.get("transaction_id") or ""),
+        "turn_id": str(permission.get("turn_id") or ""),
+    }
+    return all(str(request.get(key) or "") == value for key, value in expected.items())
+
+
+def _git_runner_request_digest(request: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        request,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _git_runner_candidate_binding(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -2355,6 +2411,7 @@ def _prepare_git_runner(
     runner_digest = _command_hash(runner_command, effective_cwd)
     request = {
         "argv": argv,
+        "base_event_cwd": str(permission.get("base_event_cwd") or ""),
         "candidate_binding": _git_runner_candidate_binding(candidate),
         "created_at": time.time(),
         "effective_cwd": _normalized_cwd(effective_cwd),
@@ -2365,10 +2422,40 @@ def _prepare_git_runner(
         "scope_hash": str(permission.get("scope_hash") or ""),
         "session_id": session_id,
         "session_hash": str(permission.get("session_hash") or ""),
+        "tool_name": tool_name,
         "tool_use_id": tool_use_id,
         "transaction_id": str(permission.get("transaction_id") or ""),
         "turn_id": str(permission.get("turn_id") or ""),
     }
+    if operation == "push":
+        remote_urls = tuple(candidate.get("remote_urls") or ())
+        remote_identities = tuple(candidate.get("remote_identities") or ())
+        if (
+            len(remote_urls) != 1
+            or len(remote_identities) != 1
+            or _safe_git_push_url(str(remote_urls[0])) != remote_urls[0]
+            or _git_push_url_identity(str(remote_urls[0])) != remote_identities[0]
+        ):
+            raise RuntimeError("Git runner push URL is not uniquely safe")
+        request["pinned_push_url"] = remote_urls[0]
+        environment = _git_runner_base_environment()
+        source_branch, source_oid, object_dir, object_format = (
+            _git_push_source_snapshot(candidate, environment)
+        )
+        request["push_source"] = {
+            "branch": source_branch,
+            "object_dir": str(object_dir),
+            "object_format": object_format,
+            "oid": source_oid,
+        }
+        rewrite_snapshot = _git_url_rewrite_snapshot(
+            str(candidate.get("scope") or ""),
+            str(remote_urls[0]),
+            environment,
+        )
+        if rewrite_snapshot != _EMPTY_GIT_URL_REWRITE_SNAPSHOT:
+            raise RuntimeError("Git runner push URL is subject to Git URL rewriting")
+        request["url_rewrite_snapshot"] = rewrite_snapshot
     request_path = _git_runner_path("request", token)
     _write_private_json(request_path, request)
 
@@ -2377,10 +2464,20 @@ def _prepare_git_runner(
         current_permission = (
             current_pending.get(tool_use_id) if isinstance(current_pending, dict) else None
         )
+        same_transaction = [
+            item_id
+            for item_id, item in (
+                current_pending.items() if isinstance(current_pending, dict) else ()
+            )
+            if isinstance(item, dict)
+            and str(item.get("transaction_id") or "") == request["transaction_id"]
+        ]
         if (
             not isinstance(current_permission, dict)
+            or same_transaction != [tool_use_id]
             or str(current_permission.get("digest") or "") != original_digest
             or str(current_permission.get("transaction_id") or "") != request["transaction_id"]
+            or current_permission.get("runner_claimed_at")
         ):
             raise RuntimeError("Git runner reservation changed before binding")
         current_permission.update(
@@ -2388,6 +2485,7 @@ def _prepare_git_runner(
                 "digest": runner_digest,
                 "original_digest": original_digest,
                 "runner_command": runner_command,
+                "runner_request_digest": _git_runner_request_digest(request),
                 "runner_token": token,
             }
         )
@@ -2494,7 +2592,410 @@ def _validate_git_runner_request(
         != request.get("candidate_binding")
     ):
         raise RuntimeError("Git runner candidate validation failed")
+    pinned_push_url = str(request.get("pinned_push_url") or "")
+    if operation == "push":
+        if (
+            _safe_git_push_url(pinned_push_url) != pinned_push_url
+            or tuple(candidate.get("remote_urls") or ()) != (pinned_push_url,)
+            or tuple(candidate.get("remote_identities") or ())
+            != (_git_push_url_identity(pinned_push_url),)
+        ):
+            raise RuntimeError("Git runner pinned push URL validation failed")
+    elif pinned_push_url:
+        raise RuntimeError("Git runner request has an unexpected push URL")
     return argv, cwd, candidate
+
+
+def _git_runner_environment(
+    request: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, str]:
+    environment = _git_runner_base_environment()
+    if str(candidate.get("operation") or "") != "push":
+        return environment
+    pinned_push_url = str(request.get("pinned_push_url") or "")
+    if (
+        candidate.get("remote") != "origin"
+        or _safe_git_push_url(pinned_push_url) != pinned_push_url
+        or tuple(candidate.get("remote_urls") or ()) != (pinned_push_url,)
+    ):
+        raise RuntimeError("Git runner cannot pin the approved push destination")
+    return environment
+
+
+def _git_runner_base_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    for key in tuple(environment):
+        if (
+            key == "GIT_CONFIG_PARAMETERS"
+            or key.startswith("GIT_CONFIG_")
+            or key
+            in {
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_COMMON_DIR",
+                "GIT_DIR",
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+                "GIT_INDEX_FILE",
+                "GIT_NAMESPACE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_SHALLOW_FILE",
+                "GIT_WORK_TREE",
+            }
+        ):
+            environment.pop(key, None)
+    return environment
+
+
+def _git_url_rewrite_snapshot(
+    scope: str,
+    pinned_push_url: str,
+    environment: dict[str, str],
+) -> str:
+    if not scope or _safe_git_push_url(pinned_push_url) != pinned_push_url:
+        return ""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", scope, "config", "--get-regexp", r"^url\..*\."],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode not in {0, 1}:
+        return ""
+
+    matching: list[str] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, prefix = parts
+        match = re.fullmatch(
+            r"url\.(?P<replacement>.+)\.(?P<kind>insteadof|pushinsteadof)",
+            key,
+            re.IGNORECASE,
+        )
+        if match and prefix and pinned_push_url.startswith(prefix):
+            matching.append(
+                hashlib.sha256(
+                    (match.group("kind").casefold() + "\0" + key + "\0" + prefix).encode(
+                        "utf-8", errors="replace"
+                    )
+                ).hexdigest()
+            )
+    encoded = json.dumps(sorted(matching), separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _pinned_git_push_argv(
+    argv: list[str],
+    request: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    git_dir: Path,
+    source_oid: str,
+    branch: str,
+) -> tuple[list[str], bool]:
+    pinned_push_url = str(request.get("pinned_push_url") or "")
+    executable, args, wrappers = _unwrap_command(argv)
+    subcommand, git_args, dynamic_config = _git_command(args)
+    global_arg_count = len(args) - len(git_args) - 1
+    if (
+        wrappers
+        or executable != "git"
+        or subcommand != "push"
+        or dynamic_config
+        or global_arg_count < 0
+        or candidate.get("remote") != "origin"
+        or _safe_git_push_url(pinned_push_url) != pinned_push_url
+        or tuple(candidate.get("remote_urls") or ()) != (pinned_push_url,)
+    ):
+        raise RuntimeError("Git runner cannot construct a pinned push")
+
+    push_options: list[str] = []
+    positionals = 0
+    options_done = False
+    set_upstream = False
+    for token in git_args:
+        if not options_done and token == "--":
+            options_done = True
+            continue
+        if not options_done and token in _SCOPED_PUSH_OPTIONS:
+            if token in _SCOPED_PUSH_UPSTREAM_OPTIONS:
+                set_upstream = True
+            else:
+                push_options.append(token)
+            continue
+        if token.startswith("-"):
+            raise RuntimeError("Git runner received an unsupported push option")
+        if positionals == 0:
+            if token != "origin":
+                raise RuntimeError("Git runner push remote changed")
+        elif positionals == 1:
+            if _safe_branch_name(token) != str(candidate.get("refspec") or ""):
+                raise RuntimeError("Git runner push branch changed")
+        else:
+            raise RuntimeError("Git runner received multiple push targets")
+        positionals += 1
+    if positionals != 2:
+        raise RuntimeError("Git runner push target is incomplete")
+
+    if (
+        not git_dir.is_absolute()
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_oid)
+        or _safe_branch_name(branch) != branch
+        or branch == "HEAD"
+    ):
+        raise RuntimeError("Git runner push source is not immutable")
+    return [
+        "git",
+        "--no-replace-objects",
+        f"--git-dir={git_dir}",
+        "push",
+        *push_options,
+        "--",
+        pinned_push_url,
+        f"{source_oid}:refs/heads/{branch}",
+    ], set_upstream
+
+
+def _git_push_source_snapshot(
+    candidate: dict[str, Any], environment: dict[str, str]
+) -> tuple[str, str, Path, str]:
+    scope = str(candidate.get("scope") or "")
+    branch = _safe_branch_name(str(candidate.get("refspec") or ""))
+    if not scope or not branch:
+        raise RuntimeError("Git runner push source is invalid")
+    if branch == "HEAD":
+        resolved = subprocess.run(
+            ["git", "-C", scope, "symbolic-ref", "--quiet", "--short", "HEAD"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        branch = _safe_branch_name(resolved.stdout.strip())
+        if resolved.returncode != 0 or not branch or branch == "HEAD":
+            raise RuntimeError("Git runner cannot resolve detached HEAD")
+
+    source = subprocess.run(
+        [
+            "git",
+            "-C",
+            scope,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}^{{commit}}",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=3,
+        check=False,
+    )
+    source_oid = source.stdout.strip().casefold()
+    if (
+        source.returncode != 0
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_oid)
+    ):
+        raise RuntimeError("Git runner push source branch is unavailable")
+
+    common = subprocess.run(
+        ["git", "-C", scope, "rev-parse", "--git-common-dir"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=3,
+        check=False,
+    )
+    common_value = common.stdout.strip()
+    if common.returncode != 0 or not common_value:
+        raise RuntimeError("Git runner cannot resolve the object database")
+    common_dir = Path(common_value)
+    if not common_dir.is_absolute():
+        common_dir = Path(scope) / common_dir
+    object_dir = Path(os.path.realpath(common_dir / "objects"))
+    if not object_dir.is_dir():
+        raise RuntimeError("Git runner object database is unavailable")
+    object_format = "sha1" if len(source_oid) == 40 else "sha256"
+    return branch, source_oid, object_dir, object_format
+
+
+def _git_isolated_config_records(
+    environment: dict[str, str],
+) -> list[tuple[str, str]]:
+    records: list[tuple[str, str]] = []
+    for scope in ("--system", "--global"):
+        completed = subprocess.run(
+            ["git", "config", scope, "--includes", "--null", "--list"],
+            env=environment,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        if completed.returncode != 0:
+            if not completed.stdout:
+                continue
+            raise RuntimeError("Git runner cannot snapshot trusted Git config")
+        for record in completed.stdout.split("\0"):
+            if not record:
+                continue
+            key, separator, value = record.partition("\n")
+            normalized = key.casefold()
+            if (
+                not separator
+                or not normalized.startswith(("credential.", "http."))
+                or "\0" in value
+            ):
+                continue
+            records.append((key, value))
+    return records
+
+
+def _write_isolated_git_config(
+    path: Path,
+    records: list[tuple[str, str]],
+    environment: dict[str, str],
+) -> None:
+    with _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL):
+        pass
+    for key, value in records:
+        configured = subprocess.run(
+            ["git", "config", "--file", str(path), "--add", key, value],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        if configured.returncode != 0:
+            raise RuntimeError("Git runner cannot build isolated Git config")
+    os.chmod(path, 0o600)
+
+
+def _prepare_isolated_git_push(
+    object_dir: Path, object_format: str, environment: dict[str, str]
+) -> tuple[Path, dict[str, str]]:
+    git_dir = Path(tempfile.mkdtemp(prefix=".git-push-", dir=str(_data_dir())))
+    try:
+        config_records = _git_isolated_config_records(environment)
+        empty_template = git_dir / "empty-template"
+        empty_template.mkdir(mode=0o700)
+        isolated_environment = environment.copy()
+        isolated_environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        isolated_environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        isolated_environment["GIT_DEFAULT_HASH"] = object_format
+        init_args = [
+            "git",
+            "init",
+            "--bare",
+            "--quiet",
+            f"--template={empty_template}",
+        ]
+        if object_format == "sha256":
+            init_args.append("--object-format=sha256")
+        elif object_format != "sha1":
+            raise RuntimeError("Git runner object format is unsupported")
+        init_args.append(str(git_dir))
+        initialized = subprocess.run(
+            init_args,
+            cwd=str(_data_dir()),
+            env=isolated_environment,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if initialized.returncode != 0:
+            raise RuntimeError("Git runner cannot create an isolated push repository")
+        hooks_dir = git_dir / "disabled-hooks"
+        hooks_dir.mkdir(mode=0o700)
+        configured = subprocess.run(
+            [
+                "git",
+                f"--git-dir={git_dir}",
+                "config",
+                "--local",
+                "core.hooksPath",
+                str(hooks_dir),
+            ],
+            cwd=str(_data_dir()),
+            env=isolated_environment,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        if configured.returncode != 0:
+            raise RuntimeError("Git runner cannot disable push hooks")
+        trusted_config = git_dir / "trusted-user.gitconfig"
+        _write_isolated_git_config(
+            trusted_config, config_records, isolated_environment
+        )
+    except Exception:
+        shutil.rmtree(git_dir, ignore_errors=True)
+        raise
+    push_environment = isolated_environment.copy()
+    push_environment["GIT_CONFIG_GLOBAL"] = str(trusted_config)
+    push_environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(object_dir)
+    return git_dir, push_environment
+
+
+def _set_git_push_upstream(
+    candidate: dict[str, Any],
+    pinned_push_url: str,
+    environment: dict[str, str],
+    branch: str,
+) -> bool:
+    scope = str(candidate.get("scope") or "")
+    branch = _safe_branch_name(branch)
+    current_urls = _git_remote_urls(scope, "origin", environment=environment)
+    if not scope or not branch or current_urls != (pinned_push_url,):
+        return False
+    current_identities = _git_remote_identities(
+        scope,
+        "origin",
+        urls=current_urls,
+        environment=environment,
+    )
+    if current_identities != (_git_push_url_identity(pinned_push_url),):
+        return False
+    local_branch = subprocess.run(
+        [
+            "git",
+            "-C",
+            scope,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        env=environment,
+        check=False,
+    )
+    if local_branch.returncode != 0:
+        return False
+    for key, value in (
+        (f"branch.{branch}.remote", "origin"),
+        (f"branch.{branch}.merge", f"refs/heads/{branch}"),
+    ):
+        completed = subprocess.run(
+            ["git", "-C", scope, "config", "--local", "--replace-all", key, value],
+            env=environment,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return False
+    return True
 
 
 def _claim_git_runner_request(
@@ -2525,6 +3026,8 @@ def _claim_git_runner_request(
             != str(request.get("runner_digest") or "")
             or str(permission.get("original_digest") or "")
             != str(request.get("original_digest") or "")
+            or str(permission.get("runner_request_digest") or "")
+            != _git_runner_request_digest(request)
             or str(permission.get("transaction_id") or "") != transaction_id
             or str(permission.get("scope_hash") or "")
             != str(request.get("scope_hash") or "")
@@ -2576,19 +3079,76 @@ def _run_approved_git(token: str) -> int:
             pass
         return 126
 
-    environment = os.environ.copy()
-    environment["GIT_TERMINAL_PROMPT"] = "0"
+    isolated_git_dir: Path | None = None
+    remote_succeeded = False
     try:
-        completed = subprocess.run(argv, cwd=cwd, env=environment, check=False)
+        environment = _git_runner_environment(request, candidate)
+        child_environment = environment
+        child_cwd = cwd
+        child_argv = argv
+        set_upstream = False
+        source_branch = ""
+        if str(candidate.get("operation") or "") == "push":
+            rewrite_snapshot = str(request.get("url_rewrite_snapshot") or "")
+            if (
+                rewrite_snapshot != _EMPTY_GIT_URL_REWRITE_SNAPSHOT
+                or _git_url_rewrite_snapshot(
+                    str(candidate.get("scope") or ""),
+                    str(request.get("pinned_push_url") or ""),
+                    environment,
+                )
+                != rewrite_snapshot
+            ):
+                raise RuntimeError("Git runner push URL rewrite configuration changed")
+            source_branch, source_oid, object_dir, object_format = (
+                _git_push_source_snapshot(candidate, environment)
+            )
+            push_source = request.get("push_source")
+            if push_source != {
+                "branch": source_branch,
+                "object_dir": str(object_dir),
+                "object_format": object_format,
+                "oid": source_oid,
+            }:
+                raise RuntimeError("Git runner push source changed after ticket binding")
+            isolated_git_dir, child_environment = _prepare_isolated_git_push(
+                object_dir, object_format, environment
+            )
+            child_argv, set_upstream = _pinned_git_push_argv(
+                argv,
+                request,
+                candidate,
+                git_dir=isolated_git_dir,
+                source_oid=source_oid,
+                branch=source_branch,
+            )
+            child_cwd = str(_data_dir())
+        completed = subprocess.run(
+            child_argv, cwd=child_cwd, env=child_environment, check=False
+        )
         exit_code = int(completed.returncode)
-    except OSError:
+        remote_succeeded = bool(
+            str(candidate.get("operation") or "") == "push" and exit_code == 0
+        )
+        if exit_code == 0 and set_upstream and not _set_git_push_upstream(
+            candidate,
+            str(request.get("pinned_push_url") or ""),
+            environment,
+            source_branch,
+        ):
+            exit_code = 126
+    except (OSError, RuntimeError):
         exit_code = 126
+    finally:
+        if isolated_git_dir is not None:
+            shutil.rmtree(isolated_git_dir, ignore_errors=True)
     status = {
         "completed_at": time.time(),
         "execution_options_digest": str(request.get("execution_options_digest") or ""),
         "exit_code": exit_code,
         "operation": str(request.get("operation") or ""),
         "original_digest": str(request.get("original_digest") or ""),
+        "remote_succeeded": remote_succeeded,
         "scope_hash": str(request.get("scope_hash") or ""),
         "session_hash": str(request.get("session_hash") or ""),
         "tool_use_id": str(request.get("tool_use_id") or ""),
@@ -2644,6 +3204,11 @@ def _consume_git_runner_status(permission: dict[str, Any]) -> str:
         or isinstance(exit_code, bool)
     ):
         return "unknown"
+    if expected["operation"] == "push":
+        remote_succeeded = status.get("remote_succeeded")
+        if not isinstance(remote_succeeded, bool):
+            return "unknown"
+        return "success" if remote_succeeded else "failure"
     return "success" if exit_code == 0 else "failure"
 
 
@@ -3316,7 +3881,7 @@ def _command_uses_untrusted_clone(command: str, cwd: str, roots: tuple[str, ...]
 
 
 def _safe_push_target(git_args: list[str]) -> tuple[str, str] | None:
-    ignored = {"-u", "--set-upstream", "--porcelain", "-q", "--quiet", "-v", "--verbose", "--"}
+    ignored = _SCOPED_PUSH_OPTIONS | {"--"}
     positionals = [token for token in git_args if token not in ignored]
     if any(token.startswith("-") for token in positionals):
         return None
@@ -3394,6 +3959,7 @@ def _git_remote_urls(
     remote: str,
     *,
     exact_global_args: list[str] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
     if not remote or remote.startswith("-"):
         return ()
@@ -3415,6 +3981,7 @@ def _git_remote_urls(
         completed = subprocess.run(
             command,
             cwd=run_cwd,
+            env=environment,
             text=True,
             capture_output=True,
             timeout=3,
@@ -3434,15 +4001,18 @@ def _git_remote_targets(
     remote: str,
     *,
     exact_global_args: list[str] | None = None,
+    urls: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     if remote != "origin":
         return ()
-    urls = _git_remote_urls(
-        scope,
-        remote,
-        exact_global_args=exact_global_args,
-    )
-    targets = tuple(_github_target_from_remote(url) for url in urls)
+    captured_urls = urls
+    if captured_urls is None:
+        captured_urls = _git_remote_urls(
+            scope,
+            remote,
+            exact_global_args=exact_global_args,
+        )
+    targets = tuple(_github_target_from_remote(url) for url in captured_urls)
     return targets if targets and all(targets) else ()
 
 
@@ -3451,6 +4021,7 @@ def _git_config_values(
     key: str,
     *,
     exact_global_args: list[str] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[str, ...] | None:
     if exact_global_args is None:
         command = ["git", "-C", scope, "config", "--get-all", key]
@@ -3462,6 +4033,7 @@ def _git_config_values(
         completed = subprocess.run(
             command,
             cwd=run_cwd,
+            env=environment,
             text=True,
             capture_output=True,
             timeout=3,
@@ -3524,6 +4096,8 @@ def _git_remote_identities(
     remote: str,
     *,
     exact_global_args: list[str] | None = None,
+    urls: tuple[str, ...] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
     if remote != "origin":
         return ()
@@ -3535,6 +4109,7 @@ def _git_remote_identities(
             scope,
             key,
             exact_global_args=exact_global_args,
+            environment=environment,
         )
         if values is None or values:
             return ()
@@ -3542,18 +4117,22 @@ def _git_remote_identities(
         scope,
         "push.recurseSubmodules",
         exact_global_args=exact_global_args,
+        environment=environment,
     )
     if recurse_values is None or any(
         value.casefold() not in {"0", "false", "no", "off"}
         for value in recurse_values
     ):
         return ()
-    urls = _git_remote_urls(
-        scope,
-        remote,
-        exact_global_args=exact_global_args,
-    )
-    safe_urls = tuple(_safe_git_push_url(url) for url in urls)
+    captured_urls = urls
+    if captured_urls is None:
+        captured_urls = _git_remote_urls(
+            scope,
+            remote,
+            exact_global_args=exact_global_args,
+            environment=environment,
+        )
+    safe_urls = tuple(_safe_git_push_url(url) for url in captured_urls)
     if not safe_urls or not all(safe_urls):
         return ()
     if any(url.startswith("ssh://") or re.match(r"^[^@]+@[^:]+:", url) for url in safe_urls):
@@ -3561,8 +4140,15 @@ def _git_remote_identities(
             scope,
             "core.sshCommand",
             exact_global_args=exact_global_args,
+            environment=environment,
         )
-        if ssh_command is None or ssh_command or os.environ.get("GIT_SSH") or os.environ.get("GIT_SSH_COMMAND"):
+        git_environment = os.environ if environment is None else environment
+        if (
+            ssh_command is None
+            or ssh_command
+            or git_environment.get("GIT_SSH")
+            or git_environment.get("GIT_SSH_COMMAND")
+        ):
             return ()
     return tuple(_git_push_url_identity(url) for url in safe_urls)
 
@@ -3658,11 +4244,13 @@ def _scoped_git_candidate(
         candidate["pathspecs"] = pathspecs
     elif subcommand == "push" and push_target is not None:
         candidate["remote"], candidate["refspec"] = push_target
+        remote_urls = _git_remote_urls(scope, candidate["remote"])
+        candidate["remote_urls"] = list(remote_urls)
         candidate["remote_targets"] = list(
-            _git_remote_targets(scope, candidate["remote"])
+            _git_remote_targets(scope, candidate["remote"], urls=remote_urls)
         )
         candidate["remote_identities"] = list(
-            _git_remote_identities(scope, candidate["remote"])
+            _git_remote_identities(scope, candidate["remote"], urls=remote_urls)
         )
     elif subcommand == "init":
         candidate["branch"] = branch
@@ -5406,6 +5994,34 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         execution_options_digest=execution_options_digest,
         original=True,
     )
+    pending_snapshot = state_snapshot.get("pending_permission_authorizations")
+    stored_runner_permission = (
+        pending_snapshot.get(tool_use_id)
+        if isinstance(pending_snapshot, dict) and tool_use_id
+        else None
+    )
+    stale_runner_permission = bool(
+        isinstance(stored_runner_permission, dict)
+        and stored_runner_permission.get("transaction_id")
+        and stored_runner_permission.get("runner_token")
+        and (
+            command_digest
+            in {
+                str(stored_runner_permission.get("digest") or ""),
+                str(stored_runner_permission.get("original_digest") or ""),
+            }
+            or _git_runner_invocation_shape(command)
+        )
+        and runner_permission is None
+        and original_runner_permission is None
+    )
+    if stale_runner_permission:
+        _revoke_git_transaction(
+            session_id,
+            str(stored_runner_permission.get("transaction_id") or ""),
+        )
+        reason = "The Git transaction runner ticket is missing, invalid, or already claimed."
+        return _deny_pretool(reason) if event_name == "PreToolUse" else _deny_permission(reason)
     if original_runner_permission is not None:
         if event_name == "PermissionRequest":
             return _deny_permission(
@@ -5526,6 +6142,24 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         scoped_operation = _scoped_git_candidate(command, event_cwd, dangerous)
         if scoped_operation is None:
             scoped_operation = _scoped_github_create_candidate(command, event_cwd, dangerous)
+    current_grant = state_snapshot.get("local_git_grant")
+    if (
+        os.name == "nt"
+        and event_name == "PreToolUse"
+        and transaction_enabled
+        and scoped_operation
+        and isinstance(current_grant, dict)
+        and _git_grant_matches(
+            current_grant,
+            scoped_operation,
+            event_turn,
+            str(state_snapshot.get("session_hash") or ""),
+        )
+    ):
+        try:
+            _git_runner_shell_kind(tool_name, tool_input)
+        except RuntimeError as error:
+            return _deny_pretool(str(error))
     authorization_result: dict[str, Any] = {
         "unauthorized": sorted(dangerous),
         "permission_accepted": False,
@@ -5627,10 +6261,9 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
                 str(state.get("session_hash") or ""),
             ):
                 transaction_reserved = any(
-                    other_tool_id != tool_use_id
-                    and isinstance(item, dict)
+                    isinstance(item, dict)
                     and item.get("transaction_id") == grant.get("transaction_id")
-                    for other_tool_id, item in pending_permissions.items()
+                    for item in pending_permissions.values()
                 )
                 if not transaction_reserved:
                     grant_codes.update(scoped_operation.get("codes") or [])
