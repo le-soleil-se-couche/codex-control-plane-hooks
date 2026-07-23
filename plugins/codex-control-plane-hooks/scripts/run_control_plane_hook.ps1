@@ -118,7 +118,7 @@ function Resolve-ApplicationPath {
         }
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = Join-Path $env:SystemRoot "System32\where.exe"
-        $startInfo.Arguments = $Name
+        $startInfo.Arguments = '$PATH:' + $Name
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardInput = $true

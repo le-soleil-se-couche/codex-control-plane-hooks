@@ -6,11 +6,11 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [0.2.6] - 2026-07-23
 
-- Pinned the single approved `origin` push URL inside the private one-time runner ticket, replaced the child push's named-remote operand with that literal URL, rejected matching Git URL-rewrite configuration added after claim, and restored requested upstream metadata only after a successful push, a fresh `origin` revalidation, and verification that the source is a real local branch.
+- Bound the approved push URL, resolved source branch, commit OID, object format, and object database inside the private one-time ticket; the network child now pushes the immutable OID from an isolated bare repository with frozen credential/HTTP config and no workspace-local rewrites or hooks. Requested upstream metadata is restored only after remote success and a fresh `origin` revalidation, while the receipt preserves remote success if that local restoration fails.
 - Required a present, structurally matching, unclaimed private runner ticket before allowing either the original transaction command or its rewritten runner command; invalid runner-shaped retries revoke the transaction.
 - Prevented a reused `tool_use_id` from replacing an in-flight Git transaction reservation while retaining idempotent retries of the exact reserved command.
 - Enforced the Windows PowerShell-only transaction runner contract before reservation, covering explicit `powershell` and `pwsh` overrides while rejecting `cmd`, Bash, and `sh` overrides.
-- Applied one five-second wall-clock deadline across deadline-aware `where.exe` discovery, both Windows Python probes, and all bounded process-tree cleanup, with Windows CI checking recorded probe descendants are gone.
+- Applied one five-second wall-clock deadline across PATH-only, deadline-aware `where.exe` discovery, both Windows Python probes, and all bounded process-tree cleanup, with Windows CI checking that working-directory executables are ignored and recorded probe descendants are gone.
 
 ## [0.2.5] - 2026-07-22
 
