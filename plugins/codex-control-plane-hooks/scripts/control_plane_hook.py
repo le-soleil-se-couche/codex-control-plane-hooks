@@ -341,6 +341,7 @@ _PENDING_GIT_TTL_SECONDS = 600
 _SCOPED_GIT_TRANSACTION_TTL_SECONDS = 30 * 60
 _GIT_RUNNER_TTL_SECONDS = 5 * 60
 _GIT_RUNNER_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_EMPTY_GIT_URL_REWRITE_SNAPSHOT = hashlib.sha256(b"[]").hexdigest()
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SENSITIVE_ENV_NAMES = {
     "BASH_ENV",
@@ -2238,6 +2239,17 @@ def _git_runner_command(
     )
 
 
+def _git_runner_invocation_shape(command: str) -> bool:
+    tokens = _shell_tokens(command)
+    if tokens[:1] == ["&"]:
+        tokens = tokens[1:]
+    return bool(
+        len(tokens) == 7
+        and tokens[1:3] == ["-I", "-S"]
+        and tokens[4] == "--run-approved-git"
+    )
+
+
 def _matching_git_runner_permission(
     state: dict[str, Any],
     *,
@@ -2425,6 +2437,15 @@ def _prepare_git_runner(
         ):
             raise RuntimeError("Git runner push URL is not uniquely safe")
         request["pinned_push_url"] = remote_urls[0]
+        environment = _git_runner_base_environment()
+        rewrite_snapshot = _git_url_rewrite_snapshot(
+            str(candidate.get("scope") or ""),
+            str(remote_urls[0]),
+            environment,
+        )
+        if rewrite_snapshot != _EMPTY_GIT_URL_REWRITE_SNAPSHOT:
+            raise RuntimeError("Git runner push URL is subject to Git URL rewriting")
+        request["url_rewrite_snapshot"] = rewrite_snapshot
     request_path = _git_runner_path("request", token)
     _write_private_json(request_path, request)
 
@@ -2578,8 +2599,7 @@ def _validate_git_runner_request(
 def _git_runner_environment(
     request: dict[str, Any], candidate: dict[str, Any]
 ) -> dict[str, str]:
-    environment = os.environ.copy()
-    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment = _git_runner_base_environment()
     if str(candidate.get("operation") or "") != "push":
         return environment
     pinned_push_url = str(request.get("pinned_push_url") or "")
@@ -2589,12 +2609,60 @@ def _git_runner_environment(
         or tuple(candidate.get("remote_urls") or ()) != (pinned_push_url,)
     ):
         raise RuntimeError("Git runner cannot pin the approved push destination")
+    return environment
+
+
+def _git_runner_base_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
     for key in tuple(environment):
-        if key in {"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} or key.startswith(
-            ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
-        ):
+        if key == "GIT_CONFIG_PARAMETERS" or key.startswith("GIT_CONFIG_"):
             environment.pop(key, None)
     return environment
+
+
+def _git_url_rewrite_snapshot(
+    scope: str,
+    pinned_push_url: str,
+    environment: dict[str, str],
+) -> str:
+    if not scope or _safe_git_push_url(pinned_push_url) != pinned_push_url:
+        return ""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", scope, "config", "--get-regexp", r"^url\..*\."],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode not in {0, 1}:
+        return ""
+
+    matching: list[str] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, prefix = parts
+        match = re.fullmatch(
+            r"url\.(?P<replacement>.+)\.(?P<kind>insteadof|pushinsteadof)",
+            key,
+            re.IGNORECASE,
+        )
+        if match and prefix and pinned_push_url.startswith(prefix):
+            matching.append(
+                hashlib.sha256(
+                    (match.group("kind").casefold() + "\0" + key + "\0" + prefix).encode(
+                        "utf-8", errors="replace"
+                    )
+                ).hexdigest()
+            )
+    encoded = json.dumps(sorted(matching), separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _pinned_git_push_argv(
@@ -2661,6 +2729,21 @@ def _set_git_push_upstream(
         return False
     current_identities = _git_remote_identities(scope, "origin", urls=current_urls)
     if current_identities != (_git_push_url_identity(pinned_push_url),):
+        return False
+    local_branch = subprocess.run(
+        [
+            "git",
+            "-C",
+            scope,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        env=environment,
+        check=False,
+    )
+    if local_branch.returncode != 0:
         return False
     for key, value in (
         (f"branch.{branch}.remote", "origin"),
@@ -2762,6 +2845,17 @@ def _run_approved_git(token: str) -> int:
         child_argv = argv
         set_upstream = False
         if str(candidate.get("operation") or "") == "push":
+            rewrite_snapshot = str(request.get("url_rewrite_snapshot") or "")
+            if (
+                rewrite_snapshot != _EMPTY_GIT_URL_REWRITE_SNAPSHOT
+                or _git_url_rewrite_snapshot(
+                    str(candidate.get("scope") or ""),
+                    str(request.get("pinned_push_url") or ""),
+                    environment,
+                )
+                != rewrite_snapshot
+            ):
+                raise RuntimeError("Git runner push URL rewrite configuration changed")
             child_argv, set_upstream = _pinned_git_push_argv(
                 argv, request, candidate
             )
@@ -5616,11 +5710,14 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         isinstance(stored_runner_permission, dict)
         and stored_runner_permission.get("transaction_id")
         and stored_runner_permission.get("runner_token")
-        and command_digest
-        in {
-            str(stored_runner_permission.get("digest") or ""),
-            str(stored_runner_permission.get("original_digest") or ""),
-        }
+        and (
+            command_digest
+            in {
+                str(stored_runner_permission.get("digest") or ""),
+                str(stored_runner_permission.get("original_digest") or ""),
+            }
+            or _git_runner_invocation_shape(command)
+        )
         and runner_permission is None
         and original_runner_permission is None
     )

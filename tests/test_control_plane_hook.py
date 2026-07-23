@@ -1013,6 +1013,9 @@ class HookProtocolTests(unittest.TestCase):
         self.assertIn("$probeTimeoutMs = 1500", powershell_launcher)
         self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", powershell_launcher)
         self.assertIn("Get-RemainingProbeMilliseconds", powershell_launcher)
+        self.assertIn("Resolve-ApplicationPath", powershell_launcher)
+        self.assertIn('System32\\where.exe', powershell_launcher)
+        self.assertNotIn("Get-Command", powershell_launcher)
         self.assertIn("WaitForExit($waitMs)", powershell_launcher)
         self.assertIn("Kill($true)", powershell_launcher)
         self.assertIn("taskkill.exe", powershell_launcher)
@@ -1031,6 +1034,7 @@ class HookProtocolTests(unittest.TestCase):
         self.assertIn("elseif ($killer.ExitCode -ne 0)", powershell_launcher)
         self.assertIn("WaitForExit($terminationWaitMs)", powershell_launcher)
         self.assertNotIn("ReadToEnd", powershell_launcher)
+        self.assertIn("StandardOutput.ReadLine()", powershell_launcher)
         self.assertIn("$process.ExitCode -eq 0", powershell_launcher)
         self.assertIn("$process.StandardInput.Close()", powershell_launcher)
         self.assertIn("$Process.Kill()", powershell_launcher)
@@ -5506,6 +5510,46 @@ public static class Program {
         self.assertIsNone(failed_state["local_git_grant"])
         self.assertEqual({}, failed_state["pending_permission_authorizations"])
 
+    def test_runner_permission_revokes_altered_runner_invocation(self) -> None:
+        repo = Path(self.data_dir) / "altered-runner"
+        repo.mkdir()
+        (repo / "README.md").write_text("altered runner\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        add = f"git -C {repo} add README.md"
+        commit = f'git -C {repo} commit -m "fix: altered runner"'
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{add}`\n`{commit}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=self.data_dir,
+        )
+        event = {
+            "tool_name": "Bash",
+            "tool_use_id": "altered-runner-add",
+            "tool_input": {"command": add},
+            "cwd": self.data_dir,
+        }
+        pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        permission = state["pending_permission_authorizations"]["altered-runner-add"]
+        token = permission["runner_token"]
+        altered_token = "0" * 32 if token != "0" * 32 else "f" * 32
+        altered = runner_command.replace(token, altered_token)
+        self.assertNotEqual(runner_command, altered)
+
+        rewritten = dict(event)
+        rewritten["tool_input"] = {"command": altered}
+        denied = self.run_hook({"hook_event_name": "PermissionRequest", **rewritten})
+        self.assertEqual("deny", denied["hookSpecificOutput"]["decision"]["behavior"])
+        failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(failed_state["local_git_grant"])
+        self.assertEqual({}, failed_state["pending_permission_authorizations"])
+        self.assertEqual(
+            [], list(Path(self.data_dir).glob(".git-runner-request-*.json"))
+        )
+
     def test_runner_rejects_ticket_tampering_and_clears_transaction_tickets(
         self,
     ) -> None:
@@ -5728,6 +5772,90 @@ public static class Program {
         ).stdout.strip()
         self.assertEqual(changed_url, actual_origin)
 
+    def test_runner_rejects_url_rewrite_added_after_claim(self) -> None:
+        module = __import__("control_plane_hook")
+        repo = Path(self.data_dir) / "runner-url-rewrite"
+        repo.mkdir()
+        original_url = "https://github.com/sample-owner/approved.git"
+        redirected_url = "https://github.com/sample-owner/redirected.git"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "origin", original_url],
+            check=True,
+        )
+        commit = f'git -C {repo} commit -m "fix: url rewrite"'
+        push = f"git -C {repo} push origin main"
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{commit}`\n`{push}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=self.data_dir,
+        )
+        event = {
+            "tool_name": "Bash",
+            "tool_use_id": "runner-url-rewrite-push",
+            "tool_input": {"command": push},
+            "cwd": self.data_dir,
+        }
+        pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
+        rewritten = dict(event)
+        rewritten["tool_input"] = {"command": runner_command}
+        permission = self.run_hook(
+            {"hook_event_name": "PermissionRequest", **rewritten}
+        )
+        self.assertEqual(
+            "allow", permission["hookSpecificOutput"]["decision"]["behavior"]
+        )
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        token = state["pending_permission_authorizations"][
+            "runner-url-rewrite-push"
+        ]["runner_token"]
+
+        real_run = subprocess.run
+        real_claim = module._claim_git_runner_request
+        pushed = False
+
+        def claim_then_add_rewrite(*args: object, **kwargs: object) -> None:
+            real_claim(*args, **kwargs)
+            real_run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "--local",
+                    f"url.{redirected_url}.insteadOf",
+                    original_url,
+                ],
+                check=True,
+            )
+
+        def capture_child(
+            argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal pushed
+            if "push" in argv:
+                pushed = True
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kwargs)
+
+        with mock.patch.object(
+            module, "_claim_git_runner_request", side_effect=claim_then_add_rewrite
+        ), mock.patch.object(module.subprocess, "run", side_effect=capture_child):
+            self.assertEqual(126, module._run_approved_git(token))
+        self.assertFalse(pushed)
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                **rewritten,
+                "tool_response": {"exit_code": 126},
+            }
+        )
+        failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(failed_state["local_git_grant"])
+
     def test_runner_sets_upstream_only_after_origin_revalidation(self) -> None:
         module = __import__("control_plane_hook")
         candidate = {
@@ -5750,14 +5878,16 @@ public static class Program {
             side_effect=(
                 subprocess.CompletedProcess([], 0),
                 subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0),
             ),
         ) as run:
             self.assertTrue(
                 module._set_git_push_upstream(candidate, pinned, environment)
             )
-        self.assertEqual(2, run.call_count)
-        self.assertIn("branch.feature/release.remote", run.call_args_list[0].args[0])
-        self.assertIn("branch.feature/release.merge", run.call_args_list[1].args[0])
+        self.assertEqual(3, run.call_count)
+        self.assertIn("show-ref", run.call_args_list[0].args[0])
+        self.assertIn("branch.feature/release.remote", run.call_args_list[1].args[0])
+        self.assertIn("branch.feature/release.merge", run.call_args_list[2].args[0])
 
         with mock.patch.object(
             module,
@@ -5768,6 +5898,24 @@ public static class Program {
                 module._set_git_push_upstream(candidate, pinned, environment)
             )
         blocked_run.assert_not_called()
+
+        tag_candidate = {**candidate, "refspec": "v0.2.6"}
+        with mock.patch.object(
+            module, "_git_remote_urls", return_value=(pinned,)
+        ), mock.patch.object(
+            module,
+            "_git_remote_identities",
+            return_value=(module._git_push_url_identity(pinned),),
+        ), mock.patch.object(
+            module.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1),
+        ) as tag_run:
+            self.assertFalse(
+                module._set_git_push_upstream(tag_candidate, pinned, environment)
+            )
+        self.assertEqual(1, tag_run.call_count)
+        self.assertIn("refs/heads/v0.2.6", tag_run.call_args.args[0])
 
     def test_missing_runner_receipt_revokes_transaction(self) -> None:
         repo = Path(self.data_dir) / "missing-runner-receipt"

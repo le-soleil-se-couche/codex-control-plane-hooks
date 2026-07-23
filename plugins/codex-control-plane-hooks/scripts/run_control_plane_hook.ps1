@@ -86,6 +86,60 @@ function Stop-ProbeProcessTree {
     }
 }
 
+function Resolve-ApplicationPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    $process = $null
+    try {
+        $waitMs = Get-RemainingProbeMilliseconds -Maximum $probeTimeoutMs
+        if ($waitMs -le 0) {
+            return $null
+        }
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = Join-Path $env:SystemRoot "System32\where.exe"
+        $startInfo.Arguments = $Name
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            return $null
+        }
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit($waitMs)) {
+            Stop-ProbeProcessTree -Process $process
+            return $null
+        }
+        if ($process.ExitCode -ne 0) {
+            return $null
+        }
+        $candidate = $process.StandardOutput.ReadLine()
+        if (
+            [String]::IsNullOrWhiteSpace($candidate) -or
+            -not [System.IO.Path]::IsPathRooted($candidate) -or
+            -not [System.IO.File]::Exists($candidate)
+        ) {
+            return $null
+        }
+        return $candidate.Trim()
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+}
+
 function Find-CompatiblePython {
     param(
         [Parameter(Mandatory = $true)]
@@ -94,21 +148,15 @@ function Find-CompatiblePython {
         [string] $ProbeArguments
     )
 
-    try {
-        if ((Get-RemainingProbeMilliseconds -Maximum $probeDeadlineMs) -le 0) {
-            return $null
-        }
-        $command = Get-Command $Name -CommandType Application -ErrorAction Stop |
-            Select-Object -First 1
-    }
-    catch {
+    $applicationPath = Resolve-ApplicationPath -Name $Name
+    if ($null -eq $applicationPath) {
         return $null
     }
 
     $process = $null
     try {
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $startInfo.FileName = $command.Source
+        $startInfo.FileName = $applicationPath
         $startInfo.Arguments = $ProbeArguments
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
@@ -128,7 +176,7 @@ function Find-CompatiblePython {
             return $null
         }
         if ($process.ExitCode -eq 0) {
-            return $command.Source
+            return $applicationPath
         }
         return $null
     }
