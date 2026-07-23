@@ -1011,8 +1011,15 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertIn("$probeDeadlineMs = 5000", powershell_launcher)
         self.assertIn("$probeTimeoutMs = 1500", powershell_launcher)
+        self.assertIn("$cleanupReserveMs = $taskkillTimeoutMs", powershell_launcher)
         self.assertIn("[System.Diagnostics.Stopwatch]::StartNew()", powershell_launcher)
         self.assertIn("Get-RemainingProbeMilliseconds", powershell_launcher)
+        self.assertEqual(
+            2,
+            powershell_launcher.count(
+                "Get-RemainingProbeWorkMilliseconds -Maximum $probeTimeoutMs"
+            ),
+        )
         self.assertIn("Resolve-ApplicationPath", powershell_launcher)
         self.assertIn('System32\\where.exe', powershell_launcher)
         self.assertNotIn("Get-Command", powershell_launcher)
@@ -5890,11 +5897,11 @@ public static class Program {
         environment = {"GIT_TERMINAL_PROMPT": "0"}
         with mock.patch.object(
             module, "_git_remote_urls", return_value=(pinned,)
-        ), mock.patch.object(
+        ) as remote_urls, mock.patch.object(
             module,
             "_git_remote_identities",
             return_value=(module._git_push_url_identity(pinned),),
-        ), mock.patch.object(
+        ) as remote_identities, mock.patch.object(
             module.subprocess,
             "run",
             side_effect=(
@@ -5907,6 +5914,15 @@ public static class Program {
                 module._set_git_push_upstream(candidate, pinned, environment)
             )
         self.assertEqual(3, run.call_count)
+        remote_urls.assert_called_once_with(
+            self.data_dir, "origin", environment=environment
+        )
+        remote_identities.assert_called_once_with(
+            self.data_dir,
+            "origin",
+            urls=(pinned,),
+            environment=environment,
+        )
         self.assertIn("show-ref", run.call_args_list[0].args[0])
         self.assertIn("branch.feature/release.remote", run.call_args_list[1].args[0])
         self.assertIn("branch.feature/release.merge", run.call_args_list[2].args[0])

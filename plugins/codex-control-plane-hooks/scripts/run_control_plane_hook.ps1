@@ -7,6 +7,7 @@ $probeDeadlineMs = 5000
 $probeTimeoutMs = 1500
 $terminationTimeoutMs = 500
 $taskkillTimeoutMs = 1000
+$cleanupReserveMs = $taskkillTimeoutMs
 $probeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Get-RemainingProbeMilliseconds {
@@ -16,6 +17,23 @@ function Get-RemainingProbeMilliseconds {
     )
 
     $remaining = $probeDeadlineMs - [int] $probeStopwatch.ElapsedMilliseconds
+    if ($remaining -le 0) {
+        return 0
+    }
+    return [Math]::Min($remaining, $Maximum)
+}
+
+function Get-RemainingProbeWorkMilliseconds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int] $Maximum
+    )
+
+    $remaining = (
+        $probeDeadlineMs -
+        $cleanupReserveMs -
+        [int] $probeStopwatch.ElapsedMilliseconds
+    )
     if ($remaining -le 0) {
         return 0
     }
@@ -94,7 +112,7 @@ function Resolve-ApplicationPath {
 
     $process = $null
     try {
-        $waitMs = Get-RemainingProbeMilliseconds -Maximum $probeTimeoutMs
+        $waitMs = Get-RemainingProbeWorkMilliseconds -Maximum $probeTimeoutMs
         if ($waitMs -le 0) {
             return $null
         }
@@ -170,7 +188,7 @@ function Find-CompatiblePython {
             return $null
         }
         $process.StandardInput.Close()
-        $waitMs = Get-RemainingProbeMilliseconds -Maximum $probeTimeoutMs
+        $waitMs = Get-RemainingProbeWorkMilliseconds -Maximum $probeTimeoutMs
         if ($waitMs -le 0 -or -not $process.WaitForExit($waitMs)) {
             Stop-ProbeProcessTree -Process $process
             return $null

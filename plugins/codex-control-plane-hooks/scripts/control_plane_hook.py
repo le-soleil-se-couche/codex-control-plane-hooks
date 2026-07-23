@@ -2724,10 +2724,15 @@ def _set_git_push_upstream(
 ) -> bool:
     scope = str(candidate.get("scope") or "")
     branch = _safe_branch_name(str(candidate.get("refspec") or ""))
-    current_urls = _git_remote_urls(scope, "origin")
+    current_urls = _git_remote_urls(scope, "origin", environment=environment)
     if not scope or not branch or current_urls != (pinned_push_url,):
         return False
-    current_identities = _git_remote_identities(scope, "origin", urls=current_urls)
+    current_identities = _git_remote_identities(
+        scope,
+        "origin",
+        urls=current_urls,
+        environment=environment,
+    )
     if current_identities != (_git_push_url_identity(pinned_push_url),):
         return False
     local_branch = subprocess.run(
@@ -3680,6 +3685,7 @@ def _git_remote_urls(
     remote: str,
     *,
     exact_global_args: list[str] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
     if not remote or remote.startswith("-"):
         return ()
@@ -3701,6 +3707,7 @@ def _git_remote_urls(
         completed = subprocess.run(
             command,
             cwd=run_cwd,
+            env=environment,
             text=True,
             capture_output=True,
             timeout=3,
@@ -3740,6 +3747,7 @@ def _git_config_values(
     key: str,
     *,
     exact_global_args: list[str] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[str, ...] | None:
     if exact_global_args is None:
         command = ["git", "-C", scope, "config", "--get-all", key]
@@ -3751,6 +3759,7 @@ def _git_config_values(
         completed = subprocess.run(
             command,
             cwd=run_cwd,
+            env=environment,
             text=True,
             capture_output=True,
             timeout=3,
@@ -3814,6 +3823,7 @@ def _git_remote_identities(
     *,
     exact_global_args: list[str] | None = None,
     urls: tuple[str, ...] | None = None,
+    environment: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
     if remote != "origin":
         return ()
@@ -3825,6 +3835,7 @@ def _git_remote_identities(
             scope,
             key,
             exact_global_args=exact_global_args,
+            environment=environment,
         )
         if values is None or values:
             return ()
@@ -3832,6 +3843,7 @@ def _git_remote_identities(
         scope,
         "push.recurseSubmodules",
         exact_global_args=exact_global_args,
+        environment=environment,
     )
     if recurse_values is None or any(
         value.casefold() not in {"0", "false", "no", "off"}
@@ -3844,6 +3856,7 @@ def _git_remote_identities(
             scope,
             remote,
             exact_global_args=exact_global_args,
+            environment=environment,
         )
     safe_urls = tuple(_safe_git_push_url(url) for url in captured_urls)
     if not safe_urls or not all(safe_urls):
@@ -3853,8 +3866,15 @@ def _git_remote_identities(
             scope,
             "core.sshCommand",
             exact_global_args=exact_global_args,
+            environment=environment,
         )
-        if ssh_command is None or ssh_command or os.environ.get("GIT_SSH") or os.environ.get("GIT_SSH_COMMAND"):
+        git_environment = os.environ if environment is None else environment
+        if (
+            ssh_command is None
+            or ssh_command
+            or git_environment.get("GIT_SSH")
+            or git_environment.get("GIT_SSH_COMMAND")
+        ):
             return ()
     return tuple(_git_push_url_identity(url) for url in safe_urls)
 
