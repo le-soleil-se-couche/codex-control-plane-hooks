@@ -3,9 +3,24 @@ $env:PYTHON_MANAGER_AUTOMATIC_INSTALL = "0"
 
 $hookScript = Join-Path $PSScriptRoot "control_plane_hook.py"
 $probeCode = "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"
-$probeTimeoutMs = 2000
+$probeDeadlineMs = 5000
+$probeTimeoutMs = 1500
 $terminationTimeoutMs = 500
 $taskkillTimeoutMs = 1000
+$probeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Get-RemainingProbeMilliseconds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int] $Maximum
+    )
+
+    $remaining = $probeDeadlineMs - [int] $probeStopwatch.ElapsedMilliseconds
+    if ($remaining -le 0) {
+        return 0
+    }
+    return [Math]::Min($remaining, $Maximum)
+}
 
 function Stop-ProbeProcessTree {
     param(
@@ -13,28 +28,32 @@ function Stop-ProbeProcessTree {
         [System.Diagnostics.Process] $Process
     )
 
+    $killer = $null
     try {
-        $Process.Kill($true)
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = Join-Path $env:SystemRoot "System32\taskkill.exe"
+        $startInfo.Arguments = "/PID $($Process.Id) /T /F"
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $killer = New-Object System.Diagnostics.Process
+        $killer.StartInfo = $startInfo
+        $killWaitMs = Get-RemainingProbeMilliseconds -Maximum $taskkillTimeoutMs
+        if ($killWaitMs -le 0 -or -not $killer.Start()) {
+            throw "Probe cleanup deadline expired"
+        }
+        if (-not $killer.WaitForExit($killWaitMs)) {
+            try {
+                $killer.Kill()
+            }
+            catch {
+            }
+        }
     }
     catch {
-        $killer = $null
         try {
-            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $startInfo.FileName = Join-Path $env:SystemRoot "System32\taskkill.exe"
-            $startInfo.Arguments = "/PID $($Process.Id) /T /F"
-            $startInfo.UseShellExecute = $false
-            $startInfo.CreateNoWindow = $true
-            $startInfo.RedirectStandardOutput = $true
-            $startInfo.RedirectStandardError = $true
-            $killer = New-Object System.Diagnostics.Process
-            $killer.StartInfo = $startInfo
-            if ($killer.Start() -and -not $killer.WaitForExit($taskkillTimeoutMs)) {
-                try {
-                    $killer.Kill()
-                }
-                catch {
-                }
-            }
+            $Process.Kill($true)
         }
         catch {
             try {
@@ -43,16 +62,19 @@ function Stop-ProbeProcessTree {
             catch {
             }
         }
-        finally {
-            if ($null -ne $killer) {
-                $killer.Dispose()
-            }
+    }
+    finally {
+        if ($null -ne $killer) {
+            $killer.Dispose()
         }
     }
-    try {
-        [void] $Process.WaitForExit($terminationTimeoutMs)
-    }
-    catch {
+    $terminationWaitMs = Get-RemainingProbeMilliseconds -Maximum $terminationTimeoutMs
+    if ($terminationWaitMs -gt 0) {
+        try {
+            [void] $Process.WaitForExit($terminationWaitMs)
+        }
+        catch {
+        }
     }
 }
 
@@ -65,6 +87,9 @@ function Find-CompatiblePython {
     )
 
     try {
+        if ((Get-RemainingProbeMilliseconds -Maximum $probeDeadlineMs) -le 0) {
+            return $null
+        }
         $command = Get-Command $Name -CommandType Application -ErrorAction Stop |
             Select-Object -First 1
     }
@@ -89,7 +114,8 @@ function Find-CompatiblePython {
             return $null
         }
         $process.StandardInput.Close()
-        if (-not $process.WaitForExit($probeTimeoutMs)) {
+        $waitMs = Get-RemainingProbeMilliseconds -Maximum $probeTimeoutMs
+        if ($waitMs -le 0 -or -not $process.WaitForExit($waitMs)) {
             Stop-ProbeProcessTree -Process $process
             return $null
         }

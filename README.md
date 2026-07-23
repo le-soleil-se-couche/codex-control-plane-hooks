@@ -35,7 +35,7 @@ The plugin does not impose an Agent-count ceiling. Runtime capacity remains owne
 Review the repository and its current compatibility table before installation.
 
 ```bash
-codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.5
+codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.6
 codex plugin add codex-control-plane-hooks@codex-control-plane-hooks
 codex plugin list --marketplace codex-control-plane-hooks
 ```
@@ -50,7 +50,7 @@ To update the marketplace snapshot:
 codex plugin marketplace upgrade codex-control-plane-hooks
 ```
 
-Version `0.2.5` adds scoped Git transaction continuation, exact command binding, one-time Git exit-status receipts, and cross-platform host smoke coverage. Review the updated manifest and accept the new Hook hash before relying on the broader transaction lifecycle.
+Version `0.2.6` pins each approved push destination through child execution, hardens one-time runner tickets and reservation identity, and applies one shared deadline to Windows Python discovery and process-tree cleanup. Review the updated manifest and accept the new Hook hash before relying on the broader transaction lifecycle.
 
 ## Configure
 

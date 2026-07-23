@@ -4,6 +4,14 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-23
+
+- Pinned the single approved `origin` push URL inside the private one-time runner ticket and reset the child Git process to that URL, preserving `--set-upstream` semantics while preventing post-claim remote changes from redirecting the push.
+- Required a present, structurally matching, unclaimed private runner ticket before allowing either the original transaction command or its rewritten runner command; invalid runner-shaped retries revoke the transaction.
+- Prevented a reused `tool_use_id` from replacing an in-flight Git transaction reservation while retaining idempotent retries of the exact reserved command.
+- Enforced the Windows PowerShell-only transaction runner contract before reservation, covering explicit `powershell` and `pwsh` overrides while rejecting `cmd`, Bash, and `sh` overrides.
+- Applied one five-second wall-clock deadline across both Windows Python probes and all bounded process-tree cleanup, with Windows CI checking recorded probe descendants are gone.
+
 ## [0.2.5] - 2026-07-22
 
 - Added explicit continuation for an unfinished scoped Git/GitHub publication transaction across prompt turns. Continuation rebinds only the active turn while preserving the original session, authorization cwd, issue time, repository mappings, operations, and append-only consumption ledger.
