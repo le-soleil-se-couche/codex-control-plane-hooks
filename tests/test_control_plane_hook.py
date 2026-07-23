@@ -143,7 +143,7 @@ class HookProtocolTests(unittest.TestCase):
         repo.mkdir(parents=True)
         target = f"fixture-owner/{name}"
         subprocess.run(
-            ["git", "init", "-q", str(repo)],
+            ["git", "init", "-q", "-b", "main", str(repo)],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
