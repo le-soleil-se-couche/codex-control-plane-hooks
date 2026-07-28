@@ -26,6 +26,8 @@ Each command handler declares a POSIX `command` and a PowerShell `commandWindows
 - Missing `session_id` blocks stateful events.
 - Unknown event names return an empty response because the plugin has no declared policy for them.
 - Hook timeout behavior belongs to the host and must be verified for each supported Codex version.
+- Each dispatched event opens one shared six-second deadline. Classification-time Git children and state-lock waits draw from that single budget, and an exhausted budget is treated as an unestablished answer, so the affected check fails closed. This keeps a slow or hung Git child inside the plugin's own boundary instead of letting the host's Hook timeout decide the outcome. The approved-Git runner child is exempt: it owns its own lifetime and its rechecks are deliberate.
+- Repeated remote and config reads within one event are answered once. Reads that exist to detect drift, including every runner-side revalidation, are never served from that cache.
 
 ## Approval binding
 

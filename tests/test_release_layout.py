@@ -33,9 +33,23 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("scripts/check_release.py", scanned)
         self.assertIn("examples/AGENTS.md.example", scanned)
 
+    @staticmethod
+    def readme_marker() -> str:
+        """Derive the probe marker from README so a rewrite cannot silently break it.
+
+        A hardcoded tagline stops matching the moment the README is edited, and
+        the test then passes or fails for reasons unrelated to marker handling.
+        """
+        for line in (ROOT / "README.md").read_text(encoding="utf-8").splitlines():
+            heading = line.strip()
+            if heading.startswith("# "):
+                return heading[2:].strip()
+        raise AssertionError("README.md must contain a top-level heading")
+
     @unittest.skipIf(os.name == "nt", "private marker ACL verification requires POSIX")
     def test_external_private_markers_are_detected_without_value_echo(self) -> None:
-        marker = "Version-scoped reference Hooks"
+        marker = self.readme_marker()
+        self.assertGreaterEqual(len(marker), 8)
         with tempfile.TemporaryDirectory() as directory:
             marker_file = Path(directory) / "private-patterns"
             marker_file.write_text(marker + "\n", encoding="utf-8")

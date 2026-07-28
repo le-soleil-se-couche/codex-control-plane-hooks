@@ -341,7 +341,18 @@ _COMMAND_NEGATION_RE = re.compile(
 _PENDING_GIT_TTL_SECONDS = 600
 _SCOPED_GIT_TRANSACTION_TTL_SECONDS = 30 * 60
 _GIT_RUNNER_TTL_SECONDS = 5 * 60
+# The manifest declares a ten-second host timeout, and a host timeout is a
+# fail-open path the plugin cannot convert into enforcement. One shared
+# per-event deadline keeps Git children and state locks inside that window so
+# the plugin fails closed on its own terms instead of being timed out.
+_EVENT_BUDGET_SECONDS = 6.0
+_GIT_QUERY_TIMEOUT_SECONDS = 3.0
+_STATE_LOCK_TIMEOUT_SECONDS = 5.0
+_EVENT_DEADLINE: float | None = None
+_RUNNER_MODE = False
+_GIT_QUERY_CACHE: dict[tuple[Any, ...], Any] = {}
 _GIT_RUNNER_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_GIT_PUSH_DIR_PREFIX = ".git-push-"
 _EMPTY_GIT_URL_REWRITE_SNAPSHOT = hashlib.sha256(b"[]").hexdigest()
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SENSITIVE_ENV_NAMES = {
@@ -683,6 +694,72 @@ _QUOTED_WINDOWS_EXECUTABLE_RE = re.compile(
 
 def _finding(code: str, severity: str = "high") -> dict[str, str]:
     return {"severity": severity, "category": "dangerous_command", "code": code}
+
+
+def _begin_event_budget() -> None:
+    """Open one shared deadline and read cache for a single dispatched event."""
+    global _EVENT_DEADLINE
+    _EVENT_DEADLINE = time.monotonic() + _EVENT_BUDGET_SECONDS
+    _GIT_QUERY_CACHE.clear()
+
+
+def _enter_runner_mode() -> None:
+    """The approved-Git child owns its own lifetime and revalidates deliberately."""
+    global _RUNNER_MODE
+    _RUNNER_MODE = True
+
+
+def _event_budget_active() -> bool:
+    return _EVENT_DEADLINE is not None and not _RUNNER_MODE
+
+
+def _remaining_event_seconds(ceiling: float) -> float:
+    """Clamp one bounded wait to the remaining shared event budget."""
+    if not _event_budget_active():
+        return ceiling
+    return min(ceiling, _EVENT_DEADLINE - time.monotonic())
+
+
+def _run_git_query(
+    command: list[str],
+    *,
+    cwd: str | None = None,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one bounded read-only Git child; None means the answer is unestablished."""
+    timeout = _remaining_event_seconds(_GIT_QUERY_TIMEOUT_SECONDS)
+    if timeout <= 0:
+        return None
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_query_cache_key(
+    kind: str,
+    scope: str,
+    selector: str,
+    exact_global_args: list[str] | None,
+    environment: dict[str, str] | None,
+) -> tuple[Any, ...] | None:
+    """Classification reads repeat within one event; deliberate rechecks do not."""
+    if environment is not None or not _event_budget_active():
+        return None
+    return (
+        kind,
+        scope,
+        selector,
+        None if exact_global_args is None else tuple(exact_global_args),
+    )
 
 
 def _windows_segment_findings(
@@ -1951,7 +2028,7 @@ def _open_private(path: Path, flags: int, mode: int = 0o600):
 
 
 def _lock_state(stream) -> str:
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + _remaining_event_seconds(_STATE_LOCK_TIMEOUT_SECONDS)
     if fcntl is not None:
         while True:
             try:
@@ -2190,6 +2267,33 @@ def _cleanup_stale_git_runner_records() -> None:
                 continue
             if info.st_mtime < cutoff:
                 _unlink_owned_regular(candidate)
+    _cleanup_stale_git_push_directories(cutoff)
+
+
+def _git_push_directory_token(name: str) -> str:
+    token = name[len(_GIT_PUSH_DIR_PREFIX) :].split("-", 1)[0]
+    return token if _GIT_RUNNER_TOKEN_RE.fullmatch(token) else ""
+
+
+def _cleanup_stale_git_push_directories(cutoff: float) -> None:
+    """A killed runner cannot unlink its own isolated push repository.
+
+    That repository holds a frozen credential and HTTP config snapshot, so it
+    must not outlive the runner that created it.
+    """
+    for candidate in _data_dir().glob(f"{_GIT_PUSH_DIR_PREFIX}*"):
+        try:
+            info = os.stat(candidate, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        owned = os.name == "nt" or not hasattr(os, "getuid") or info.st_uid == os.getuid()
+        if not owned or _is_reparse_info(info) or not stat.S_ISDIR(info.st_mode):
+            continue
+        candidate_token = _git_push_directory_token(candidate.name)
+        if candidate_token and _git_runner_path("running", candidate_token).exists():
+            continue
+        if info.st_mtime < cutoff:
+            shutil.rmtree(candidate, ignore_errors=True)
 
 
 def _powershell_quote(value: str) -> str:
@@ -2654,18 +2758,11 @@ def _git_url_rewrite_snapshot(
 ) -> str:
     if not scope or _safe_git_push_url(pinned_push_url) != pinned_push_url:
         return ""
-    try:
-        completed = subprocess.run(
-            ["git", "-C", scope, "config", "--get-regexp", r"^url\..*\."],
-            env=environment,
-            text=True,
-            capture_output=True,
-            timeout=3,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if completed.returncode not in {0, 1}:
+    completed = _run_git_query(
+        ["git", "-C", scope, "config", "--get-regexp", r"^url\..*\."],
+        environment=environment,
+    )
+    if completed is None or completed.returncode not in {0, 1}:
         return ""
 
     matching: list[str] = []
@@ -2771,19 +2868,17 @@ def _git_push_source_snapshot(
     if not scope or not branch:
         raise RuntimeError("Git runner push source is invalid")
     if branch == "HEAD":
-        resolved = subprocess.run(
+        resolved = _run_git_query(
             ["git", "-C", scope, "symbolic-ref", "--quiet", "--short", "HEAD"],
-            env=environment,
-            text=True,
-            capture_output=True,
-            timeout=3,
-            check=False,
+            environment=environment,
         )
+        if resolved is None:
+            raise RuntimeError("Git runner cannot resolve detached HEAD")
         branch = _safe_branch_name(resolved.stdout.strip())
         if resolved.returncode != 0 or not branch or branch == "HEAD":
             raise RuntimeError("Git runner cannot resolve detached HEAD")
 
-    source = subprocess.run(
+    source = _run_git_query(
         [
             "git",
             "-C",
@@ -2793,12 +2888,10 @@ def _git_push_source_snapshot(
             "--quiet",
             f"refs/heads/{branch}^{{commit}}",
         ],
-        env=environment,
-        text=True,
-        capture_output=True,
-        timeout=3,
-        check=False,
+        environment=environment,
     )
+    if source is None:
+        raise RuntimeError("Git runner push source branch is unavailable")
     source_oid = source.stdout.strip().casefold()
     if (
         source.returncode != 0
@@ -2806,14 +2899,12 @@ def _git_push_source_snapshot(
     ):
         raise RuntimeError("Git runner push source branch is unavailable")
 
-    common = subprocess.run(
+    common = _run_git_query(
         ["git", "-C", scope, "rev-parse", "--git-common-dir"],
-        env=environment,
-        text=True,
-        capture_output=True,
-        timeout=3,
-        check=False,
+        environment=environment,
     )
+    if common is None:
+        raise RuntimeError("Git runner cannot resolve the object database")
     common_value = common.stdout.strip()
     if common.returncode != 0 or not common_value:
         raise RuntimeError("Git runner cannot resolve the object database")
@@ -2883,9 +2974,13 @@ def _write_isolated_git_config(
 
 
 def _prepare_isolated_git_push(
-    object_dir: Path, object_format: str, environment: dict[str, str]
+    object_dir: Path, object_format: str, environment: dict[str, str], token: str
 ) -> tuple[Path, dict[str, str]]:
-    git_dir = Path(tempfile.mkdtemp(prefix=".git-push-", dir=str(_data_dir())))
+    if not _GIT_RUNNER_TOKEN_RE.fullmatch(token):
+        raise RuntimeError("Git runner token is invalid")
+    git_dir = Path(
+        tempfile.mkdtemp(prefix=f"{_GIT_PUSH_DIR_PREFIX}{token}-", dir=str(_data_dir()))
+    )
     try:
         config_records = _git_isolated_config_records(environment)
         empty_template = git_dir / "empty-template"
@@ -3112,7 +3207,7 @@ def _run_approved_git(token: str) -> int:
             }:
                 raise RuntimeError("Git runner push source changed after ticket binding")
             isolated_git_dir, child_environment = _prepare_isolated_git_push(
-                object_dir, object_format, environment
+                object_dir, object_format, environment, token
             )
             child_argv, set_upstream = _pinned_git_push_argv(
                 argv,
@@ -3963,6 +4058,11 @@ def _git_remote_urls(
 ) -> tuple[str, ...]:
     if not remote or remote.startswith("-"):
         return ()
+    cache_key = _git_query_cache_key(
+        "remote-urls", scope, remote, exact_global_args, environment
+    )
+    if cache_key is not None and cache_key in _GIT_QUERY_CACHE:
+        return _GIT_QUERY_CACHE[cache_key]
     if exact_global_args is None:
         command = ["git", "-C", scope, "remote", "get-url", "--push", "--all", remote]
         run_cwd = None
@@ -3977,23 +4077,16 @@ def _git_remote_urls(
             remote,
         ]
         run_cwd = scope
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=run_cwd,
-            env=environment,
-            text=True,
-            capture_output=True,
-            timeout=3,
-            check=False,
+    completed = _run_git_query(command, cwd=run_cwd, environment=environment)
+    if completed is None or completed.returncode != 0:
+        urls: tuple[str, ...] = ()
+    else:
+        urls = tuple(
+            line.strip() for line in completed.stdout.splitlines() if line.strip()
         )
-    except (OSError, subprocess.SubprocessError):
-        return ()
-    if completed.returncode != 0:
-        return ()
-    return tuple(
-        line.strip() for line in completed.stdout.splitlines() if line.strip()
-    )
+    if cache_key is not None:
+        _GIT_QUERY_CACHE[cache_key] = urls
+    return urls
 
 
 def _git_remote_targets(
@@ -4023,31 +4116,30 @@ def _git_config_values(
     exact_global_args: list[str] | None = None,
     environment: dict[str, str] | None = None,
 ) -> tuple[str, ...] | None:
+    cache_key = _git_query_cache_key(
+        "config-values", scope, key, exact_global_args, environment
+    )
+    if cache_key is not None and cache_key in _GIT_QUERY_CACHE:
+        return _GIT_QUERY_CACHE[cache_key]
     if exact_global_args is None:
         command = ["git", "-C", scope, "config", "--get-all", key]
         run_cwd = None
     else:
         command = ["git", *exact_global_args, "config", "--get-all", key]
         run_cwd = scope
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=run_cwd,
-            env=environment,
-            text=True,
-            capture_output=True,
-            timeout=3,
-            check=False,
+    completed = _run_git_query(command, cwd=run_cwd, environment=environment)
+    values: tuple[str, ...] | None
+    if completed is None or completed.returncode not in {0, 1}:
+        values = None
+    elif completed.returncode == 1:
+        values = ()
+    else:
+        values = tuple(
+            line.strip() for line in completed.stdout.splitlines() if line.strip()
         )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode == 1:
-        return ()
-    if completed.returncode != 0:
-        return None
-    return tuple(
-        line.strip() for line in completed.stdout.splitlines() if line.strip()
-    )
+    if cache_key is not None:
+        _GIT_QUERY_CACHE[cache_key] = values
+    return values
 
 
 def _safe_git_push_url(url: str) -> str:
@@ -6689,6 +6781,7 @@ def _handle_stop(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def dispatch(event: dict[str, Any]) -> dict[str, Any]:
+    _begin_event_budget()
     event_name = str(event.get("hook_event_name") or "")
     if event_name == "UserPromptSubmit":
         return _handle_user_prompt(event)
@@ -6723,6 +6816,7 @@ def _internal_error_response(event: dict[str, Any], *, parse_error: bool = False
 
 def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] == "--run-approved-git":
+        _enter_runner_mode()
         try:
             _configure_runner_data_dir(sys.argv[3])
         except Exception:

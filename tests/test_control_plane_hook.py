@@ -25,17 +25,93 @@ DEFAULT_CWD = tempfile.gettempdir()
 
 
 class HookProtocolTests(unittest.TestCase):
+    @staticmethod
+    def restore_environment(name: str, previous: str | None) -> None:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+    def apply_environment(self, overrides: dict[str, str | None]) -> None:
+        for name, value in overrides.items():
+            self.addCleanup(self.restore_environment, name, os.environ.get(name))
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def gh_fixture_environment(self, directory: Path) -> dict[str, str]:
+        """Resolve `gh` from a host-independent stub instead of the host install."""
+        fixture = directory / ("gh.exe" if os.name == "nt" else "gh")
+        if not fixture.exists():
+            fixture.touch()
+            if os.name != "nt":
+                fixture.chmod(0o700)
+        current_path = os.environ.get("PATH", "")
+        environment = {
+            "PATH": (
+                f"{directory}{os.pathsep}{current_path}"
+                if current_path
+                else str(directory)
+            )
+        }
+        if os.name == "nt":
+            current_pathext = os.environ.get("PATHEXT", "")
+            environment["PATHEXT"] = (
+                f".EXE{os.pathsep}{current_pathext}" if current_pathext else ".EXE"
+            )
+        return environment
+
+    def isolate_host_environment(self) -> None:
+        """Host Git configuration and tool installs must not decide these results.
+
+        A URL rewrite, an `ssh` override, or a missing `gh` on the developer's
+        machine otherwise reports failures that CI never sees, which is exactly
+        the moment the install flow asks the operator to trust this Hook.
+        """
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        home = Path(fixture.name)
+        (home / ".gitconfig").write_text(
+            "[init]\n\tdefaultBranch = main\n"
+            "[user]\n\tname = Control Plane Tests\n"
+            "\temail = tests@example.invalid\n",
+            encoding="utf-8",
+        )
+        stub_bin = home / "bin"
+        stub_bin.mkdir()
+        overrides: dict[str, str | None] = {
+            name: None for name in os.environ if name.startswith("GIT_")
+        }
+        overrides.update(
+            {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                **self.gh_fixture_environment(stub_bin),
+            }
+        )
+        self.apply_environment(overrides)
+
+    def reset_event_budget(self) -> None:
+        """In-process dispatch leaves a deadline behind; tests must not inherit it."""
+        module = __import__("control_plane_hook")
+        for reset in (
+            lambda: setattr(module, "_EVENT_DEADLINE", None),
+            module._GIT_QUERY_CACHE.clear,
+        ):
+            reset()
+            self.addCleanup(reset)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.data_dir = self.temp.name
-        previous_plugin_data = os.environ.get("PLUGIN_DATA")
-        os.environ["PLUGIN_DATA"] = self.data_dir
-        self.addCleanup(
-            lambda: os.environ.__setitem__("PLUGIN_DATA", previous_plugin_data)
-            if previous_plugin_data is not None
-            else os.environ.pop("PLUGIN_DATA", None)
-        )
+        self.isolate_host_environment()
+        self.apply_environment({"PLUGIN_DATA": self.data_dir})
+        self.reset_event_budget()
         Path(self.data_dir, "policy.json").write_text(
             json.dumps(
                 {
@@ -779,6 +855,155 @@ class HookProtocolTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 module._lock_state(stream)
 
+    def seed_remote_repository(self, name: str) -> Path:
+        repo = Path(self.data_dir) / name
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "remote",
+                "add",
+                "origin",
+                f"https://github.com/fixture-owner/{name}.git",
+            ],
+            check=True,
+        )
+        return repo
+
+    def push_authorization_event(self, repositories: list[Path]) -> dict:
+        commands = "\n".join(
+            f"`git -C {repo} push origin main`" for repo in repositories
+        )
+        return {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": self.session,
+            "turn_id": self.turn,
+            "cwd": self.data_dir,
+            "prompt": f"本轮批准你依次执行以下字面命令：\n{commands}\n推送 main。",
+        }
+
+    def test_event_budget_bounds_hanging_git_children_and_fails_closed(self) -> None:
+        module = __import__("control_plane_hook")
+        repositories = [
+            self.seed_remote_repository(f"budget-repo-{index}") for index in range(4)
+        ]
+        real_run = module.subprocess.run
+        spawned: list[tuple[str, ...]] = []
+
+        def hanging(command, **kwargs):
+            spawned.append(tuple(command))
+            sleep_for = float(kwargs.get("timeout") or 1.0) + 5.0
+            return real_run(
+                [sys.executable, "-c", f"import time; time.sleep({sleep_for})"],
+                **kwargs,
+            )
+
+        event = self.push_authorization_event(repositories)
+        with mock.patch.object(module, "_EVENT_BUDGET_SECONDS", 1.0), mock.patch.object(
+            module.subprocess, "run", side_effect=hanging
+        ):
+            started = time.monotonic()
+            module.dispatch(event)
+            elapsed = time.monotonic() - started
+
+        # Unbounded per-child timeouts would have taken far longer than the
+        # host's ten-second hook timeout, which is a fail-open path.
+        self.assertTrue(spawned)
+        self.assertLess(elapsed, 4.0)
+        self.assertLess(len(spawned), 4 * len(repositories))
+        state = json.loads(
+            module._state_path(self.session).read_text(encoding="utf-8")
+        )
+        self.assertIsNone(state["local_git_grant"])
+
+    def test_git_classification_reads_are_memoized_within_one_event(self) -> None:
+        module = __import__("control_plane_hook")
+        repo = self.seed_remote_repository("memoized-remote")
+        self.seed_git_branch(repo)
+        real_run = module.subprocess.run
+        observed: list[tuple[tuple[str, ...], str | None]] = []
+
+        def counting(command, **kwargs):
+            observed.append((tuple(command), kwargs.get("cwd")))
+            return real_run(command, **kwargs)
+
+        with mock.patch.object(module.subprocess, "run", side_effect=counting):
+            module.dispatch(self.push_authorization_event([repo]))
+
+        self.assertTrue(observed)
+        self.assertEqual(len(observed), len(set(observed)))
+
+    def test_memoized_reads_do_not_leak_across_events(self) -> None:
+        module = __import__("control_plane_hook")
+        repo = self.seed_remote_repository("recheck-remote")
+        self.seed_git_branch(repo)
+        event = self.push_authorization_event([repo])
+        module.dispatch(event)
+        real_run = module.subprocess.run
+        observed: list[tuple[str, ...]] = []
+
+        def counting(command, **kwargs):
+            observed.append(tuple(command))
+            return real_run(command, **kwargs)
+
+        with mock.patch.object(module.subprocess, "run", side_effect=counting):
+            module.dispatch(event)
+
+        self.assertTrue(
+            any("get-url" in command for command in observed),
+            msg="a later event must re-read the remote instead of reusing a cache",
+        )
+
+    def test_orphaned_isolated_push_repository_is_removed(self) -> None:
+        module = __import__("control_plane_hook")
+        data = Path(self.data_dir)
+        stale_token, live_token, fresh_token = "0" * 32, "1" * 32, "2" * 32
+        stale = data / f".git-push-{stale_token}-stale"
+        live = data / f".git-push-{live_token}-live"
+        fresh = data / f".git-push-{fresh_token}-fresh"
+        for directory in (stale, live, fresh):
+            directory.mkdir()
+            (directory / "trusted-user.gitconfig").write_text(
+                "[http]\n\textraheader = fixture\n", encoding="utf-8"
+            )
+        expired = time.time() - module._GIT_RUNNER_TTL_SECONDS - 60
+        for directory in (stale, live):
+            os.utime(directory, (expired, expired))
+        module._write_private_json(
+            module._git_runner_path("running", live_token), {"transaction_id": "live"}
+        )
+
+        module._cleanup_stale_git_runner_records()
+
+        self.assertFalse(stale.exists())
+        self.assertTrue(live.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_isolated_push_repository_is_named_for_its_runner_token(self) -> None:
+        module = __import__("control_plane_hook")
+        token = "3" * 32
+        object_dir = Path(self.data_dir) / "fixture-objects"
+        object_dir.mkdir()
+        environment = module._git_runner_base_environment()
+        git_dir, _ = module._prepare_isolated_git_push(
+            object_dir, "sha1", environment, token
+        )
+        self.addCleanup(shutil.rmtree, str(git_dir), True)
+        self.assertTrue(git_dir.name.startswith(f".git-push-{token}-"))
+        self.assertEqual(token, module._git_push_directory_token(git_dir.name))
+        with self.assertRaises(RuntimeError):
+            module._prepare_isolated_git_push(
+                object_dir, "sha1", environment, "not-a-runner-token"
+            )
+
     def test_failed_atomic_state_replace_preserves_existing_state(self) -> None:
         module = __import__("control_plane_hook")
         self.prompt("Inspect the project.")
@@ -1018,13 +1243,30 @@ class HookProtocolTests(unittest.TestCase):
                     "deny", result["hookSpecificOutput"]["permissionDecision"]
                 )
 
-    def test_public_plugin_version_remains_v0_2_6(self) -> None:
+    def test_public_plugin_version_matches_changelog_and_readme(self) -> None:
+        """Assert consistency, not a literal.
+
+        A hardcoded version has to be hand-edited at every release and its own
+        test name goes stale; the invariant worth enforcing is that the manifest,
+        the newest CHANGELOG section, and the documented install ref agree.
+        """
+        root = SCRIPTS.parents[2]
         manifest = json.loads(
             (SCRIPTS.parent / ".codex-plugin" / "plugin.json").read_text(
                 encoding="utf-8"
             )
         )
-        self.assertEqual("0.2.6", manifest["version"])
+        version = manifest["version"]
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$")
+        released = re.findall(
+            r"^## \[(\d+\.\d+\.\d+)\]",
+            (root / "CHANGELOG.md").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        self.assertEqual([version], released[:1])
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"--ref v{version}", readme)
+        self.assertNotIn("--ref main", readme)
 
     def test_windows_launcher_validates_python3_before_selection(self) -> None:
         powershell_launcher = (
@@ -4156,23 +4398,7 @@ public static class Program {
             f"git -C '{repo}' push -u origin main",
         )
         fixture_gh = root / ("gh.exe" if os.name == "nt" else "gh")
-        fixture_gh.touch()
-        if os.name != "nt":
-            fixture_gh.chmod(0o700)
-
-        original_path = os.environ.get("PATH", "")
-        fixture_env = {
-            "PATH": (
-                f"{root}{os.pathsep}{original_path}" if original_path else str(root)
-            )
-        }
-        if os.name == "nt":
-            original_pathext = os.environ.get("PATHEXT", "")
-            fixture_env["PATHEXT"] = (
-                f".EXE{os.pathsep}{original_pathext}"
-                if original_pathext
-                else ".EXE"
-            )
+        fixture_env = self.gh_fixture_environment(root)
 
         with mock.patch.dict(os.environ, fixture_env, clear=False):
             resolved_gh = module.shutil.which("gh")
@@ -4286,23 +4512,9 @@ public static class Program {
             "deny", replayed_add["hookSpecificOutput"]["permissionDecision"]
         )
 
-        fixture_gh = root / ("gh.exe" if os.name == "nt" else "gh")
-        fixture_gh.touch()
-        if os.name != "nt":
-            fixture_gh.chmod(0o700)
-        original_path = os.environ.get("PATH", "")
-        fixture_env = {
-            "PATH": (
-                f"{root}{os.pathsep}{original_path}"
-                if original_path
-                else str(root)
-            )
-        }
-        if os.name == "nt":
-            fixture_env["PATHEXT"] = ".EXE" + os.pathsep + os.environ.get(
-                "PATHEXT", ""
-            )
-        with mock.patch.dict(os.environ, fixture_env, clear=False):
+        with mock.patch.dict(
+            os.environ, self.gh_fixture_environment(root), clear=False
+        ):
             create = self.probe_transaction_command(
                 f"gh repo create {target} --private --source '{repo}' --remote origin",
                 cwd=str(root),
@@ -6130,7 +6342,7 @@ public static class Program {
         self.assertEqual(64, len(source_oid))
         self.assertEqual("sha256", object_format)
         git_dir, push_environment = module._prepare_isolated_git_push(
-            object_dir, object_format, module._git_runner_base_environment()
+            object_dir, object_format, module._git_runner_base_environment(), "4" * 32
         )
         try:
             actual_format = subprocess.run(

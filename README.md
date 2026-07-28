@@ -61,7 +61,7 @@ xychart-beta
 
 The dashboard exposes total Token usage and call counts by model. It does not expose per-model Token totals. The chart therefore measures call allocation as a proxy. Higher total Token use, fewer review calls, and more GPT-5.6 calls are strongly consistent with budget moving from workflow review into substantive inference, while the exact Token transfer remains unquantified.
 
-This sample is observational. Task mix and private Hook versions changed during the period, and the current public `v0.2.6` release was not held constant throughout the window.
+This sample is observational. Task mix and private Hook versions changed during the period, and the current public `v0.2.7` release was not held constant throughout the window.
 
 ### Approval-mode boundary
 
@@ -124,7 +124,7 @@ The public package contains no organization marker, private data term, credentia
 Review the repository and compatibility table before installation.
 
 ```bash
-codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.6
+codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.7
 codex plugin add codex-control-plane-hooks@codex-control-plane-hooks
 codex plugin list --marketplace codex-control-plane-hooks
 ```
@@ -137,7 +137,7 @@ Use the version tag for reproducible installation. Review builds may select an e
 codex plugin marketplace upgrade codex-control-plane-hooks
 ```
 
-`v0.2.6` binds each approved push destination and source commit into a one-time ticket, runs the network child from an isolated bare repository, hardens reservation identity, and applies one shared deadline to Windows Python discovery and process-tree cleanup.
+`v0.2.7` applies one shared per-event deadline to classification-time Git children, memoizes repeated remote and config reads inside a single event, and removes orphaned isolated push repositories that a killed runner would otherwise leave behind.
 
 ## Configure
 
@@ -223,7 +223,7 @@ Runtime support and Codex-host compatibility are separate claims. Hook event nam
 ## Known limits
 
 - Checks run only for events matched by the manifest and emitted by the host.
-- Hook launch, timeout, and fail-open behavior remain host-owned.
+- Hook launch, timeout, and fail-open behavior remain host-owned. Classification-time Git children and state-lock waits share one six-second per-event deadline so the plugin can fail closed before that host timeout is reached; a repository slow enough to exhaust the budget is rejected rather than approved.
 - Secret detection covers selected patterns and bounded text.
 - Post-tool checks occur after a tool has produced output.
 - Natural-language approvals, scoped Git/GitHub transactions, and constrained clone remain experimental and opt-in.

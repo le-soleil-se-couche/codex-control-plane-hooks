@@ -4,6 +4,13 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-27
+
+- Bounded every classification-time Git child by one shared per-event deadline and memoized repeated remote and config reads within a single event. A hung or slow Git child now fails closed inside the plugin instead of running past the host's ten-second Hook timeout, which is a host-owned fail-open path. The approved-Git runner child keeps its deliberate rechecks uncached and outside that deadline because it owns its own lifetime.
+- Removed orphaned isolated push repositories. A killed runner previously left its bare repository, including the frozen credential and HTTP config snapshot, in the plugin data directory indefinitely. The repository is now named for its runner token and is swept once no live runner record claims it.
+- Isolated the protocol tests from host Git configuration and host tool installs. A global `url.<base>.insteadOf` rewrite or an absent `gh` previously produced local failures that CI never sees, at exactly the moment the install flow asks the operator to review the plugin before accepting Hook trust.
+- Derived the release-checker private-marker probe from the current README heading instead of a hardcoded tagline that a documentation rewrite silently invalidated.
+
 ## [0.2.6] - 2026-07-23
 
 - Bound the approved push URL, resolved source branch, commit OID, object format, and object database inside the private one-time ticket; the network child now pushes the immutable OID from an isolated bare repository with frozen credential/HTTP config and no workspace-local rewrites or hooks. Requested upstream metadata is restored only after remote success and a fresh `origin` revalidation, while the receipt preserves remote success if that local restoration fails.

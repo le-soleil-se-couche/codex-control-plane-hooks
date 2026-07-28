@@ -53,7 +53,9 @@ The host-provided plugin-data directory is preferred. On macOS and Linux, the fa
 
 Windows requires an absolute host-provided `PLUGIN_DATA` path. The Hook rejects observed symlinks and Windows reparse points. On POSIX it checks ownership and enforces mode `0700` for the directory and `0600` for files. Windows relies on the host directory's inherited DACL and does not independently audit every ACE. Session identifiers are hashed before they become filenames.
 
-State mutations use bounded cross-process locks: `flock` on macOS/Linux and `msvcrt.locking` on Windows. Stop checks and session-state removal share the same lock. A stable lock sentinel remains after Stop so a concurrent lifecycle event cannot switch to a different lock inode.
+State mutations use bounded cross-process locks: `flock` on macOS/Linux and `msvcrt.locking` on Windows. Stop checks and session-state removal share the same lock. A stable lock sentinel remains after Stop so a concurrent lifecycle event cannot switch to a different lock inode. Lock waits and classification-time Git children draw from one shared six-second per-event deadline, so the plugin fails closed on its own terms before the host's Hook timeout can fail open.
+
+The isolated bare repository that a transaction runner creates for a push is named for its runner token. It is removed when the runner finishes, and a later event sweeps it once no live runner record claims it, so a killed runner cannot leave its frozen credential and HTTP config snapshot in the plugin data directory.
 
 State includes hashes and workflow metadata: current turn, one-shot command grants, pending permission requests, sensitive-context flags, configured disclosure-grant hashes, Agent identifiers, and timestamps. It does not intentionally persist prompt text, command text, policy values, tool payloads, or tool output.
 
