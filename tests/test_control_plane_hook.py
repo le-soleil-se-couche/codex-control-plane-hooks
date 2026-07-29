@@ -1584,6 +1584,23 @@ class HookProtocolTests(unittest.TestCase):
             )
             self.assertEqual(37, completed.returncode, completed.stderr)
 
+    @staticmethod
+    def launcher_deadline_bound(jitter_seconds: float = 4.0) -> float:
+        """Derive the bound from the launcher's declared deadline, not a literal.
+
+        What this asserts is that the launcher honours its own shared deadline.
+        A hardcoded ceiling instead measures the CI runner: the previous 7.0
+        left only two seconds over a five-second deadline for PowerShell
+        startup, a compiled probe, and process-tree cleanup, and it failed at
+        7.11s on a run whose sibling job passed on the same commit. The outer
+        subprocess timeout remains the real backstop against an unbounded
+        launcher, so this bound only has to exclude "deadline not honoured".
+        """
+        launcher = (SCRIPTS / "run_control_plane_hook.ps1").read_text(encoding="utf-8")
+        match = re.search(r"^\$probeDeadlineMs\s*=\s*(\d+)$", launcher, re.MULTILINE)
+        assert match, "launcher must declare $probeDeadlineMs"
+        return int(match.group(1)) / 1000.0 + jitter_seconds
+
     @unittest.skipUnless(os.name == "nt", "Windows launcher runtime test")
     def test_windows_launcher_bounds_hung_python_process_trees(self) -> None:
         system_root = Path(os.environ["SystemRoot"])
@@ -1663,7 +1680,7 @@ public static class Program {
             )
             elapsed = time.monotonic() - started
             self.assertEqual(127, completed.returncode, completed.stderr)
-            self.assertLess(elapsed, 7.0)
+            self.assertLess(elapsed, self.launcher_deadline_bound())
             pids = {
                 int(line)
                 for line in pid_file.read_text(encoding="utf-8").splitlines()
