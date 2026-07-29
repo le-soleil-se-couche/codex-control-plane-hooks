@@ -37,3 +37,4 @@ The user may explicitly request a quick draft, skip adversarial review, or limit
 ## Delivery receipt
 
 Use the compact receipt in `references/contracts.md`. Keep it proportional to the task.
+

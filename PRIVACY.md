@@ -21,3 +21,4 @@ The optional release-boundary marker file must remain outside the repository wit
 ## Third parties
 
 Codex, GitHub, connectors, and other tools have their own data practices. This document covers only code in this repository.
+

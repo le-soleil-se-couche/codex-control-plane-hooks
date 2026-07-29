@@ -23,3 +23,4 @@ Target response windows are three business days for acknowledgement, seven for i
 Changes to command classification, approvals, Hook matchers, policy parsing, state handling, or external-destination detection require regression tests and an update to the compatibility notes.
 
 Release changes must pass protocol tests, the packaged Hook command smoke, the repository checker on Ubuntu/macOS/Windows, and the full-history Gitleaks job. Installation-specific private markers belong in a repository-external `0600` file on a POSIX host and must never be committed.
+

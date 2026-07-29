@@ -3,3 +3,4 @@ contact_links:
   - name: Security report
     url: https://github.com/le-soleil-se-couche/codex-control-plane-hooks/security/advisories/new
     about: Report vulnerabilities privately without live credentials or private data.
+

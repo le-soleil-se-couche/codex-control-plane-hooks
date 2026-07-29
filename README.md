@@ -89,6 +89,9 @@ Do not select a broader access mode solely to reduce review usage. Choose the sa
 ### Command and publication safety
 
 - Selected destructive, mutating, dynamic-eval, package-install, network, and privilege-escalation patterns.
+- Bounded output-redirection checks for `/etc/*`, macOS `/private/etc/*`, shell profiles, home SSH authorized keys, user Git config,
+  and selected Codex control files (`config.toml`, `AGENTS.md`, `hooks.json`, and `rules/*.rules`). Targets are
+  normalized lexically across POSIX and Windows separators before matching `>`, `>>`, `>|`, `&>`, and `&>>`.
 - Exact, one-shot Git/GitHub transaction state across turn, tool, working directory, command hash, repository scope, branch, and destination.
 - Bounded continuation for unfinished publication transactions.
 - Immutable push tickets bound to the resolved source commit and canonical remote identity.
@@ -137,7 +140,7 @@ Use the version tag for reproducible installation. Review builds may select an e
 codex plugin marketplace upgrade codex-control-plane-hooks
 ```
 
-`v0.2.7` applies one shared per-event deadline to classification-time Git children, memoizes repeated remote and config reads inside a single event, and removes orphaned isolated push repositories that a killed runner would otherwise leave behind.
+`v0.2.7` applies one shared per-event deadline to classification-time Git children, memoizes repeated remote and config reads inside a single event, and removes orphaned isolated push repositories through deadline-bound cleanup after a runner-held lease proves they are no longer live.
 
 ## Configure
 

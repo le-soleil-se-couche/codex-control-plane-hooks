@@ -120,6 +120,10 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertTrue(commands)
         for handler in commands:
             self.assertIn("$PLUGIN_ROOT", handler["command"])
+            self.assertTrue(
+                handler["command"].startswith("python3 -I -S "),
+                handler["command"],
+            )
             self.assertIn("$env:PLUGIN_ROOT", handler["commandWindows"])
             self.assertIn("run_control_plane_hook.ps1", handler["commandWindows"])
         powershell_launcher = (
@@ -141,6 +145,50 @@ class ReleaseLayoutTests(unittest.TestCase):
         self.assertIn("run_control_plane_hook.ps1", cmd_shim)
         attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
         self.assertIn("*.cmd text eol=crlf", attributes)
+
+    @unittest.skipIf(os.name == "nt", "POSIX Python startup isolation test")
+    def test_posix_command_hooks_ignore_python_startup_customization(self) -> None:
+        plugin_root = ROOT / "plugins" / "codex-control-plane-hooks"
+        hooks = json.loads(
+            (plugin_root / "hooks" / "hooks.json").read_text(encoding="utf-8")
+        )
+        command = hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        event = json.dumps(
+            {
+                "session_id": "posix-isolation",
+                "turn_id": "posix-isolation-turn",
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "hello",
+                "cwd": str(ROOT),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "plugin-data"
+            data_dir.mkdir()
+            (root / "sitecustomize.py").write_text(
+                'print("SITE_CUSTOMIZE_INJECTED")\n',
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PLUGIN_ROOT"] = str(plugin_root)
+            environment["PLUGIN_DATA"] = str(data_dir)
+            environment["PYTHONPATH"] = str(root)
+            completed = subprocess.run(
+                ["/bin/sh", "-c", command],
+                input=event,
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                env=environment,
+                check=False,
+            )
+
+        output = completed.stdout + completed.stderr
+        self.assertEqual(0, completed.returncode, output)
+        self.assertEqual({}, json.loads(completed.stdout))
+        self.assertNotIn("SITE_CUSTOMIZE_INJECTED", output)
 
     def test_manifest_covers_nested_exec_and_posttool_reads(self) -> None:
         hooks = json.loads(
@@ -195,6 +243,52 @@ class ReleaseLayoutTests(unittest.TestCase):
         assignment = "password=" + "B" * 24
         self.assertTrue(any(pattern.search(bearer) for _, pattern in CHECKER.SECRET_PATTERNS))
         self.assertTrue(any(pattern.search(assignment) for _, pattern in CHECKER.SECRET_PATTERNS))
+
+    def test_release_checker_ignores_only_ast_proven_python_call_assignments(self) -> None:
+        rule_id, pattern = next(
+            (rule_id, pattern)
+            for rule_id, pattern in CHECKER.SECRET_PATTERNS
+            if rule_id == "credential-assignment"
+        )
+        callable_name = "_load_" + "credential_from_local_store"
+        source = f"def {callable_name}():\n    return object()\n\ntoken = {callable_name}()\n"
+
+        self.assertIsNotNone(pattern.search(source))
+        self.assertFalse(
+            CHECKER._secret_pattern_found(Path("fixture.py"), source, rule_id, pattern)
+        )
+        self.assertTrue(
+            CHECKER._secret_pattern_found(Path("fixture.txt"), source, rule_id, pattern)
+        )
+
+        literal = "B" * 24
+        call_with_literal = f'token = {callable_name}("{literal}")\n'
+        malformed_call = f"token = {callable_name}(\n"
+        quoted_assignment = f'password="{literal}"\n'
+        self.assertTrue(
+            CHECKER._secret_pattern_found(
+                Path("fixture.py"),
+                call_with_literal,
+                rule_id,
+                pattern,
+            )
+        )
+        self.assertTrue(
+            CHECKER._secret_pattern_found(
+                Path("fixture.py"),
+                malformed_call,
+                rule_id,
+                pattern,
+            )
+        )
+        self.assertTrue(
+            CHECKER._secret_pattern_found(
+                Path("fixture.py"),
+                quoted_assignment,
+                rule_id,
+                pattern,
+            )
+        )
 
     def test_examples_are_reference_only_and_inert(self) -> None:
         rules = (ROOT / "examples" / "rules" / "default.rules").read_text(encoding="utf-8")

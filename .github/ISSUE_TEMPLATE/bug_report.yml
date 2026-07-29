@@ -20,3 +20,4 @@ body:
       description: Hook event, tool name, minimal input, observed output, and expected output
     validations:
       required: true
+

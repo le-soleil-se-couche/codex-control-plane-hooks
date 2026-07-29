@@ -21,3 +21,4 @@ body:
       label: Events exercised and redacted results
     validations:
       required: true
+

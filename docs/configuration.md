@@ -9,6 +9,8 @@ On macOS and Linux, the Hook resolves policy in this order:
 
 On Windows, `PLUGIN_DATA` is required and policy must remain at `PLUGIN_DATA/policy.json`. External policy paths fail closed because this dependency-free Hook cannot independently validate arbitrary NTFS DACLs. If the default policy does not exist, organization-specific detection and all natural-language approvals remain disabled.
 
+Directory resolution and parsed policy are lazy one-event snapshots. The first access performs the existing path and file validation; later reads in the same dispatch reuse the exact resolved directory and parsed policy. The snapshot is cleared when dispatch exits, so the next event observes legitimate configuration changes without allowing one event to split its decisions across two policy versions.
+
 ## Policy fields
 
 | Field | Type | Default | Meaning |
@@ -30,7 +32,7 @@ On Windows, scoped transaction command rewriting uses a PowerShell contract. The
 
 `enable_constrained_github_clone` admits the documented read-only shallow form and an explicitly preauthorized full GitHub HTTPS clone. Both require a direct trusted Git executable, a new absolute destination under the active workspace, an exact local execution tool, a non-empty tool-use identifier, default execution options, and successful provenance reservation. The full form keeps network and mutation risk codes and runs only when its exact command hash is authorized. Later checkout mutations must also appear as exact commands in the same capsule or receive a separate exact grant. Native Codex sandbox and network policy remain authoritative.
 
-Structured `Write`, `Edit`, and `apply_patch` calls count as durable local persistence when configured concrete sensitive data would remain. Non-empty nested objects and lists under a configured term count as concrete values. Recognized `{{redacted}}`-style placeholders are removed before evaluating the assigned value, so a placeholder alone is clean while line-wrapped or post-placeholder content remains concrete. A redaction edit is allowed only when its newly persisted text is clean. All `mcp__*` tools default to external for this check. Named disclosure grants use exact prompt-side connector phrases or complete trusted MCP identities, never payload text or substring matches against lookalike namespaces. A complete MCP tool named in the grant is bound to that exact tool; a natural connector name remains destination-scoped. Grant terms use identifier boundaries, exclude common pre-term and post-term negations, and must cover every concrete configured term in the payload. Add installation-specific durable path markers to the private policy instead of hard-coding them in public source.
+Structured `Write`, `Edit`, and `apply_patch` calls count as durable local persistence when configured concrete sensitive data would remain. Non-empty nested objects and lists under a configured term count as concrete values. Recognized `{{redacted}}`-style placeholders are removed before evaluating the assigned value, so a placeholder alone is clean while line-wrapped or post-placeholder content remains concrete. A redaction edit is allowed only when its newly persisted text is clean. External-command matching reads actual `command` or `cmd` fields, not file content that merely documents a command. Durable-destination matching reads command and destination metadata surfaces; bare `public`, `publish`, and `marketplace` prose does not identify a destination. All `mcp__*` tools default to external for this check. Named disclosure grants use exact prompt-side connector phrases or complete trusted MCP identities, never payload text or substring matches against lookalike namespaces. A complete MCP tool named in the grant is bound to that exact tool; a natural connector name remains destination-scoped. Grant terms use identifier boundaries, exclude common pre-term and post-term negations, and must cover every concrete configured term in the payload. Add installation-specific durable path or workflow markers to the private policy instead of hard-coding them in public source.
 
 ## Private release-boundary markers
 
@@ -44,6 +46,8 @@ python3 scripts/check_release.py \
 
 Blank lines and lines beginning with `#` are ignored. The file must be a current-user-owned regular file, no larger than 64 KiB, with no group or other permissions. `RELEASE_PRIVATE_PATTERNS_FILE` is also supported for controlled POSIX CI environments. Findings identify the private rule by number and never print its value. Windows rejects this optional input because owner and DACL validation would otherwise be incomplete.
 
+For Python source, an assignment-like credential match is suppressed only when AST parsing proves that a lowercase credential-shaped target receives a call expression with no string or bytes literal of 16 or more characters. Quoted assignments, ambiguous or malformed source, non-Python files, and every provider-specific credential pattern remain findings.
+
 ## State
 
 The host-provided plugin-data directory is preferred. On macOS and Linux, the fallback is:
@@ -55,9 +59,13 @@ Windows requires an absolute host-provided `PLUGIN_DATA` path. The Hook rejects 
 
 State mutations use bounded cross-process locks: `flock` on macOS/Linux and `msvcrt.locking` on Windows. Stop checks and session-state removal share the same lock. A stable lock sentinel remains after Stop so a concurrent lifecycle event cannot switch to a different lock inode. Lock waits and classification-time Git children draw from one shared six-second per-event deadline, so the plugin fails closed on its own terms before the host's Hook timeout can fail open.
 
-The isolated bare repository that a transaction runner creates for a push is named for its runner token. It is removed when the runner finishes, and a later event sweeps it once no live runner record claims it, so a killed runner cannot leave its frozen credential and HTTP config snapshot in the plugin data directory.
+The isolated bare repository that a transaction runner creates for a push is named for its runner token. The runner acquires a private token lease before creating that repository and holds it until the Git child exits. A later event sweeps an expired repository only when the lease is inactive, so cleanup cannot delete a live push repository and a killed runner cannot leave its frozen credential and HTTP config snapshot in the plugin data directory. Ordinary-event cleanup stops at the shared event deadline and after 64 candidates; a live lease protects every matching runner record and push repository, and later events resume bounded cleanup.
 
 State includes hashes and workflow metadata: current turn, one-shot command grants, pending permission requests, sensitive-context flags, configured disclosure-grant hashes, Agent identifiers, and timestamps. It does not intentionally persist prompt text, command text, policy values, tool payloads, or tool output.
+
+State schemas 1 through 3 remain readable and normalize to schema 4 while they are inside the seven-day TTL. This rolling-upgrade boundary avoids silently discarding still-live Agent, approval, or transaction state. `dangerous_authorizations` remains a validated compatibility mirror of the keys in `dangerous_authorization_hashes`; decisions use the hashed mapping, and removing the mirror requires a versioned schema migration.
+
+The five-level severity order also remains an internal decision contract: dangerous-command findings are admitted at the explicit `medium` threshold or above. Current producers concentrating on `medium` and `high` does not make that threshold table unused.
 
 State older than seven days is logically reinitialized on its next access. A successful Stop removes the session JSON when no observed Agent remains active; the lock sentinel is retained. Corrupt, unreadable, unsupported-schema, foreign-owner, symlinked, or reparse-point state fails closed and is left in place for diagnosis.
 

@@ -7,3 +7,4 @@
 - Require explicit current-turn authorization for destructive actions, publication, production writes, and credential changes.
 - Keep concrete private data local unless the user authorizes an exact data scope, destination, and purpose.
 - Use project-level `AGENTS.md` files and Skills for detailed workflows; keep this file small and stable.
+

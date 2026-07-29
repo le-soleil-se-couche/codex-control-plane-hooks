@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Checking prompt safety"
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Checking command and data safety"
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Reviewing approval boundary"
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Checking tool output"
@@ -60,7 +60,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Recording Agent lifecycle"
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Closing Agent lifecycle"
@@ -87,7 +87,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Recording control-plane state checkpoint"
@@ -100,7 +100,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
+            "command": "python3 -I -S \"$PLUGIN_ROOT/scripts/control_plane_hook.py\"",
             "commandWindows": "& \"$env:PLUGIN_ROOT/scripts/run_control_plane_hook.ps1\"",
             "timeout": 10,
             "statusMessage": "Reconciling active Agents"

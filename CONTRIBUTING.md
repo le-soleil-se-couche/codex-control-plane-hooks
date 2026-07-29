@@ -38,3 +38,4 @@ python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py \
 - Retire the head branch after a squash merge so it cannot produce a duplicate no-op pull request.
 
 Pull requests are accepted under the repository license unless explicitly stated otherwise.
+

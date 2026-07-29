@@ -16,3 +16,4 @@ For material work, report:
 - Residual risk, rollback path, and `[UNRUN]` items.
 
 Never include credentials, private customer records, live holdings, account data, or other configured sensitive-business details in the receipt.
+

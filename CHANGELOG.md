@@ -4,12 +4,19 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
-## [0.2.7] - 2026-07-27
+## [0.2.7] - 2026-07-29
 
 - Bounded every classification-time Git child by one shared per-event deadline and memoized repeated remote and config reads within a single event. A hung or slow Git child now fails closed inside the plugin instead of running past the host's ten-second Hook timeout, which is a host-owned fail-open path. The approved-Git runner child keeps its deliberate rechecks uncached and outside that deadline because it owns its own lifetime.
-- Removed orphaned isolated push repositories. A killed runner previously left its bare repository, including the frozen credential and HTTP config snapshot, in the plugin data directory indefinitely. The repository is now named for its runner token and is swept once no live runner record claims it.
+- Removed orphaned isolated push repositories. A killed runner previously left its bare repository, including the frozen credential and HTTP config snapshot, in the plugin data directory indefinitely. Each runner now holds a private lease before creating its token-named repository; ordinary events inspect at most 64 cleanup candidates within their shared deadline, execute recursive tree removal in a deadline-bound isolated child, and never remove records or repositories protected by a live lease.
 - Isolated the protocol tests from host Git configuration and host tool installs. A global `url.<base>.insteadOf` rewrite or an absent `gh` previously produced local failures that CI never sees, at exactly the moment the install flow asks the operator to review the plugin before accepting Hook trust.
 - Derived the release-checker private-marker probe from the current README heading instead of a hardcoded tagline that a documentation rewrite silently invalidated.
+- Scoped external-command and durable-destination classification to actual command and destination metadata surfaces. Bare `public`, `publish`, and `marketplace` prose and command examples inside file content no longer create transfer gates, while MCP tools, real external commands, structured local writes, built-in memory paths, and private durable markers remain covered.
+- Added bounded output-redirection checks for `/etc/*`, macOS `/private/etc/*`, shell profiles, home SSH authorized keys, user Git config, and selected Codex control files while leaving read-only mentions plus similar workspace and backup paths outside the finding. Target matching now normalizes `.`/`..`, macOS system and home path case, and POSIX/Windows separators and covers `>`, `>>`, `>|`, `&>`, and `&>>`.
+- Snapshotted the validated plugin-data directory and parsed policy for one Hook event, eliminating repeated filesystem work and preventing checks within one event from observing different policy versions.
+- Limited release-checker suppression of assignment-like credential matches to AST-proven Python call assignments without long string or bytes literals.
+- Removed the unused scanner attribution parameter, made the isolated-push token and structured external-tool input signatures explicit, and added an event signature smoke while retaining the live severity threshold and state-schema compatibility surfaces.
+- Cleared the shared event deadline and Git read cache on normal and exceptional dispatch exits.
+- Isolated every POSIX Hook interpreter with `python3 -I -S`, preventing inherited Python startup customization from running before the Hook, and made Windows CI fail when advertised launcher fallbacks or process-tree fixtures are unavailable.
 
 ## [0.2.6] - 2026-07-23
 

@@ -234,3 +234,4 @@ if ($null -ne $pythonPath) {
     "codex-control-plane-hooks requires Python 3.9+ via py.exe -3 or python.exe"
 )
 exit 127
+
