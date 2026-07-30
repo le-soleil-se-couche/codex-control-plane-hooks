@@ -61,7 +61,7 @@ xychart-beta
 
 The dashboard exposes total Token usage and call counts by model. It does not expose per-model Token totals. The chart therefore measures call allocation as a proxy. Higher total Token use, fewer review calls, and more GPT-5.6 calls are strongly consistent with budget moving from workflow review into substantive inference, while the exact Token transfer remains unquantified.
 
-This sample is observational. Task mix and private Hook versions changed during the period, and the current public `v0.2.7` release was not held constant throughout the window.
+This sample is observational. Task mix and private Hook versions changed during the period, and the current public `v0.2.8` release was not held constant throughout the window.
 
 ### Approval-mode boundary
 
@@ -127,7 +127,7 @@ The public package contains no organization marker, private data term, credentia
 Review the repository and compatibility table before installation.
 
 ```bash
-codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.7
+codex plugin marketplace add le-soleil-se-couche/codex-control-plane-hooks --ref v0.2.8
 codex plugin add codex-control-plane-hooks@codex-control-plane-hooks
 codex plugin list --marketplace codex-control-plane-hooks
 ```
@@ -140,7 +140,7 @@ Use the version tag for reproducible installation. Review builds may select an e
 codex plugin marketplace upgrade codex-control-plane-hooks
 ```
 
-`v0.2.7` applies one shared per-event deadline to classification-time Git children, memoizes repeated remote and config reads inside a single event, and removes orphaned isolated push repositories through deadline-bound cleanup after a runner-held lease proves they are no longer live.
+`v0.2.8` keeps classification and authorization on the Hook decision path while moving stale Git-runner and isolated-push housekeeping into a detached, single-flight worker started by the approved-Git runner. Slow or unavailable cleanup can no longer consume the Hook's authorization budget.
 
 ## Configure
 
