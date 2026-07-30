@@ -2647,13 +2647,7 @@ def _configured_data_dir_argument() -> str:
 
 
 def _orphan_cleanup_lock_path(data_dir: Path) -> Path:
-    identity = str(os.getuid()) if hasattr(os, "getuid") else "windows"
-    lock_root = _private_directory(
-        Path(tempfile.gettempdir()) / f"codex-control-plane-cleanup-{identity}"
-    )
-    normalized = os.path.normcase(os.path.abspath(str(data_dir)))
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
-    return lock_root / f"{digest}-{_ORPHAN_CLEANUP_LOCK_NAME}"
+    return data_dir / _ORPHAN_CLEANUP_LOCK_NAME
 
 
 def _read_orphan_cleanup_cursor(lock_stream) -> int:
@@ -2677,6 +2671,8 @@ def _run_orphan_cleanup_worker(data_dir_value: str) -> int:
             data_dir_value,
             "cleanup data directory",
         )
+        _configure_runner_data_dir(str(data_dir))
+        data_dir = _data_dir()
         with _open_private(
             _orphan_cleanup_lock_path(data_dir),
             os.O_RDWR | os.O_CREAT,
@@ -2691,7 +2687,6 @@ def _run_orphan_cleanup_worker(data_dir_value: str) -> int:
             if not lock_backend:
                 return 0
             try:
-                _configure_runner_data_dir(str(data_dir))
                 cursor = _read_orphan_cleanup_cursor(lock_stream)
                 next_cursor = _cleanup_stale_git_runner_records(
                     directory_cursor=cursor,
@@ -2702,6 +2697,13 @@ def _run_orphan_cleanup_worker(data_dir_value: str) -> int:
     except Exception:
         return 0
     return 0
+
+
+def _neutral_cleanup_cwd() -> str:
+    anchor = Path(sys.executable).resolve().anchor
+    if not anchor or not Path(anchor).is_dir():
+        raise RuntimeError("cleanup worker requires a stable filesystem anchor")
+    return anchor
 
 
 def _reap_orphan_cleanup_process(process: subprocess.Popen[Any]) -> None:
@@ -2727,6 +2729,7 @@ def _schedule_orphan_cleanup() -> None:
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
             "close_fds": True,
+            "cwd": _neutral_cleanup_cwd(),
         }
         if os.name == "nt":
             options["creationflags"] = (

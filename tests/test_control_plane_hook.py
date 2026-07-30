@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1409,6 +1410,112 @@ class HookProtocolTests(unittest.TestCase):
         )
         self.assertLess(elapsed, 1.0)
 
+    def test_orphan_cleanup_lock_is_data_local_persistent_and_private(self) -> None:
+        module = __import__("control_plane_hook")
+        data_dir = Path(self.data_dir)
+        lock_path = module._orphan_cleanup_lock_path(data_dir)
+        self.assertEqual(
+            data_dir / module._ORPHAN_CLEANUP_LOCK_NAME,
+            lock_path,
+        )
+        self.assertEqual(0, module._run_orphan_cleanup_worker(self.data_dir))
+        first_info = os.stat(lock_path, follow_symlinks=False)
+        self.assertTrue(stat.S_ISREG(first_info.st_mode))
+        if os.name != "nt":
+            self.assertEqual(0, first_info.st_mode & 0o077)
+        self.assertTrue(lock_path.read_text(encoding="utf-8").strip().isdecimal())
+
+        self.assertEqual(0, module._run_orphan_cleanup_worker(self.data_dir))
+        second_info = os.stat(lock_path, follow_symlinks=False)
+        self.assertEqual(
+            (first_info.st_dev, first_info.st_ino),
+            (second_info.st_dev, second_info.st_ino),
+        )
+        self.assertNotIn(
+            lock_path,
+            data_dir.glob(f"{module._GIT_PUSH_DIR_PREFIX}*"),
+        )
+
+    def test_orphan_cleanup_validates_data_dir_before_creating_lock(self) -> None:
+        module = __import__("control_plane_hook")
+        data_dir = Path(self.data_dir)
+        missing = data_dir / "missing" / "plugin-data"
+        self.assertEqual(0, module._run_orphan_cleanup_worker(str(missing)))
+        self.assertFalse(missing.exists())
+
+        if os.name != "nt":
+            broad = data_dir / "broad"
+            broad.mkdir(mode=0o755)
+            broad.chmod(0o755)
+            self.assertEqual(0, module._run_orphan_cleanup_worker(str(broad)))
+            self.assertFalse(module._orphan_cleanup_lock_path(broad).exists())
+
+            target = data_dir / "target"
+            target.mkdir(mode=0o700)
+            linked = data_dir / "linked"
+            linked.symlink_to(target, target_is_directory=True)
+            self.assertEqual(0, module._run_orphan_cleanup_worker(str(linked)))
+            self.assertFalse(module._orphan_cleanup_lock_path(target).exists())
+
+    @unittest.skipIf(os.name == "nt", "directory symlink fixture requires POSIX")
+    def test_parent_alias_uses_one_physical_cleanup_lock(self) -> None:
+        module = __import__("control_plane_hook")
+        data_dir = Path(self.data_dir)
+        real_parent = data_dir / "real"
+        real_data = real_parent / "plugin-data"
+        real_data.mkdir(parents=True, mode=0o700)
+        alias_parent = data_dir / "alias"
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+        alias_data = alias_parent / "plugin-data"
+        self.assertTrue(os.path.samefile(real_data, alias_data))
+
+        stale = real_data / f".git-push-{'7' * 32}-stale"
+        stale.mkdir()
+        expired = time.time() - module._GIT_RUNNER_TTL_SECONDS - 60
+        os.utime(stale, (expired, expired))
+
+        lock_path = module._orphan_cleanup_lock_path(real_data)
+        lock_stream = module._open_private(
+            lock_path,
+            os.O_RDWR | os.O_CREAT,
+        )
+        lock_backend = module._lock_state(lock_stream)
+        command = [
+            sys.executable,
+            "-I",
+            "-S",
+            str(SCRIPT),
+            "--cleanup-orphans",
+            str(alias_data),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            self.assertEqual(0, completed.returncode)
+            self.assertEqual("", completed.stdout)
+            self.assertEqual("", completed.stderr)
+            self.assertTrue(stale.exists())
+        finally:
+            module._unlock_state(lock_stream, lock_backend)
+            lock_stream.close()
+
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+        self.assertEqual(0, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertEqual("", completed.stderr)
+        self.assertFalse(stale.exists())
+
     def test_dispatch_does_not_schedule_cleanup_on_decision_path(self) -> None:
         module = __import__("control_plane_hook")
         expected = {"decision": "block", "reason": "fixture"}
@@ -1474,6 +1581,8 @@ class HookProtocolTests(unittest.TestCase):
     def test_cleanup_scheduler_uses_detached_isolated_worker(self) -> None:
         module = __import__("control_plane_hook")
         process = mock.Mock()
+        neutral = module._neutral_cleanup_cwd()
+        self.assertEqual(Path(sys.executable).resolve().anchor, neutral)
 
         with (
             mock.patch.object(module.subprocess, "Popen", return_value=process) as popen,
@@ -1505,10 +1614,14 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual(subprocess.DEVNULL, options["stdout"])
         self.assertEqual(subprocess.DEVNULL, options["stderr"])
         self.assertTrue(options["close_fds"])
+        self.assertEqual(neutral, options["cwd"])
         if os.name == "nt":
             self.assertIn("creationflags", options)
         else:
             self.assertTrue(options["start_new_session"])
+        self.assertFalse(
+            module._orphan_cleanup_lock_path(Path(self.data_dir)).exists()
+        )
 
     def test_failed_cleanup_window_advances_to_later_orphan(self) -> None:
         module = __import__("control_plane_hook")
@@ -1593,7 +1706,10 @@ class HookProtocolTests(unittest.TestCase):
     def test_orphan_cleanup_worker_is_single_flight(self) -> None:
         module = __import__("control_plane_hook")
         lock_path = module._orphan_cleanup_lock_path(Path(self.data_dir))
-        self.assertFalse(str(lock_path).startswith(self.data_dir + os.sep))
+        self.assertEqual(
+            Path(self.data_dir) / module._ORPHAN_CLEANUP_LOCK_NAME,
+            lock_path,
+        )
         lock_stream = module._open_private(
             lock_path,
             os.O_RDWR | os.O_CREAT,
@@ -1604,6 +1720,7 @@ class HookProtocolTests(unittest.TestCase):
                 mock.patch.object(
                     module,
                     "_configure_runner_data_dir",
+                    wraps=module._configure_runner_data_dir,
                 ) as configure,
                 mock.patch.object(
                     module,
@@ -1611,7 +1728,7 @@ class HookProtocolTests(unittest.TestCase):
                 ) as cleanup,
             ):
                 self.assertEqual(0, module._run_orphan_cleanup_worker(self.data_dir))
-            configure.assert_not_called()
+            configure.assert_called_once_with(self.data_dir)
             cleanup.assert_not_called()
         finally:
             module._unlock_state(lock_stream, lock_backend)
