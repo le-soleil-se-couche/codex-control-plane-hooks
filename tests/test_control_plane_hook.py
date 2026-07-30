@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import json
@@ -107,9 +108,21 @@ class HookProtocolTests(unittest.TestCase):
         module._end_event_budget()
         self.addCleanup(module._end_event_budget)
 
+    def cleanup_test_directory(self) -> None:
+        """Allow the detached cleanup worker to finish before fixture teardown."""
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                self.temp.cleanup()
+                return
+            except OSError as error:
+                if error.errno != errno.ENOTEMPTY or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self.cleanup_test_directory)
         data_dir = Path(self.temp.name) / "plugin-data"
         data_dir.mkdir(mode=0o700)
         if os.name != "nt":
