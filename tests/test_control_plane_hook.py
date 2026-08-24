@@ -6705,6 +6705,7 @@ public static class Program {
 
     def test_exec_runner_rewrite_binds_original_and_runner_option_pairs(self) -> None:
         module = __import__("control_plane_hook")
+        shell = "pwsh" if os.name == "nt" else "/bin/zsh"
         cases = (
             ("cmd", "use_default", None),
             ("command", "require_escalated", "Preserve this approval question?"),
@@ -6714,7 +6715,7 @@ public static class Program {
                 self.session = f"runner-option-pairs-{index}"
                 self.turn = f"runner-option-pairs-turn-{index}"
                 options: dict[str, object] = {
-                    "shell": "/bin/zsh",
+                    "shell": shell,
                     "login": False,
                     "tty": True,
                     "yield_time_ms": 1234,
@@ -6791,9 +6792,11 @@ public static class Program {
                 )
 
     def test_runner_permission_rejects_option_drift_and_crossed_pairs(self) -> None:
+        shell = "pwsh" if os.name == "nt" else "/bin/zsh"
+        alternate_shell = "powershell" if os.name == "nt" else "/bin/bash"
         cases = (
             ("sandbox", {"sandbox_permissions": "use_default"}),
-            ("shell", {"shell": "/bin/bash"}),
+            ("shell", {"shell": alternate_shell}),
             ("login", {"login": False}),
             ("tty", {"tty": True}),
             ("workdir", {"workdir": "other"}),
@@ -6806,7 +6809,7 @@ public static class Program {
                 self.turn = f"runner-option-drift-turn-{index}"
                 repo, _, event, state_path = self.prepare_exec_add_transaction(
                     f"runner-option-drift-{index}",
-                    shell="/bin/zsh",
+                    shell=shell,
                     login=True,
                     tty=False,
                     sandbox_permissions="use_default",
@@ -6846,9 +6849,10 @@ public static class Program {
                 self.assertEqual({}, state["pending_permission_authorizations"])
 
     def test_exec_runner_receipt_consumes_with_exact_rewritten_input(self) -> None:
+        shell = "pwsh" if os.name == "nt" else "/bin/zsh"
         repo, _, event, state_path = self.prepare_exec_add_transaction(
             "exec-runner-receipt",
-            shell="/bin/zsh",
+            shell=shell,
             login=False,
             tty=False,
             yield_time_ms=250,
@@ -6860,7 +6864,7 @@ public static class Program {
         self.assertEqual({}, posttool)
         updated = pretool["hookSpecificOutput"]["updatedInput"]
         self.assertEqual("require_escalated", updated["sandbox_permissions"])
-        self.assertEqual("/bin/zsh", updated["shell"])
+        self.assertEqual(shell, updated["shell"])
         staged = subprocess.run(
             ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
             check=True,
@@ -6881,9 +6885,10 @@ public static class Program {
         )
 
     def test_posttool_runner_option_drift_revokes_verified_receipt(self) -> None:
+        shell = "pwsh" if os.name == "nt" else "/bin/zsh"
         _, commit, event, state_path = self.prepare_exec_add_transaction(
             "posttool-runner-option-drift",
-            shell="/bin/zsh",
+            shell=shell,
             login=True,
             tty=False,
             sandbox_permissions="use_default",

@@ -564,8 +564,8 @@ def verify_transaction_resume(
             "-c", provider,
             "-c", f'model_provider="{PROVIDER}"',
             "-c", "analytics.enabled=false",
-            "--ask-for-approval", "on-request",
-            "--sandbox", "read-only",
+            "--ask-for-approval", "never",
+            "--sandbox", "danger-full-access",
         ]
         first = run_codex(
             codex,
