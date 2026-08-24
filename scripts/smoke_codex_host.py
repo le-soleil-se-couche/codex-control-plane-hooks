@@ -260,7 +260,14 @@ def verify_discovery_and_trust(
         )
         sources = {Path(str(row.get("sourcePath"))) for row in initial}
         require(len(sources) == 1, "plugin Hooks did not share one manifest")
-        require(json.loads(sources.pop().read_text(encoding="utf-8")) == manifest, "installed manifest differs")
+        installed_manifest = sources.pop()
+        require(json.loads(installed_manifest.read_text(encoding="utf-8")) == manifest, "installed manifest differs")
+        installed_script = installed_manifest.parent.parent / "scripts" / "control_plane_hook.py"
+        checkout_script = ROOT / "plugins" / PLUGIN / "scripts" / "control_plane_hook.py"
+        require(
+            installed_script.read_bytes() == checkout_script.read_bytes(),
+            "installed Hook script differs from the checkout",
+        )
         hashes = {str(row["key"]): str(row["currentHash"]) for row in initial}
         trust = {key: {"enabled": True, "trusted_hash": digest} for key, digest in hashes.items()}
         written = server.request(
@@ -304,11 +311,11 @@ def response_events(state: MockState, index: int, body: dict[str, Any]) -> list[
             for tool in tools
             if isinstance(tool, dict) and isinstance(tool.get("name"), str)
         }
-        if "shell" in names or "shell_command" in names:
+        if "exec_command" in names:
+            tool_name, arguments = "exec_command", {"cmd": command, "yield_time_ms": 10000}
+        elif "shell" in names or "shell_command" in names:
             tool_name = "shell" if "shell" in names else "shell_command"
             arguments = {"command": command}
-        elif "exec_command" in names:
-            tool_name, arguments = "exec_command", {"cmd": command, "yield_time_ms": 10000}
         else:
             raise RuntimeError(f"Codex exposed no supported shell tool: {sorted(names)}")
         item = {
@@ -711,4 +718,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

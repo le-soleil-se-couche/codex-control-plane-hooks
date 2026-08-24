@@ -573,6 +573,10 @@ _EXEC_COMMAND_ALLOWED_FIELDS = frozenset(
     "cmd command justification login max_output_tokens sandbox_permissions shell tty "
     "workdir yield_time_ms".split()
 )
+_GIT_RUNNER_ESCALATION_JUSTIFICATION = (
+    "Do you want to allow the approved Git transaction runner to execute its bound operation "
+    "outside the workspace sandbox?"
+)
 _CONSTRAINED_CLONE_BOOLEAN_OPTIONS = frozenset(
     "--no-checkout --no-tags --progress --quiet --single-branch".split()
 )
@@ -982,7 +986,7 @@ def _exec_command_validation_error(tool_name: str, tool_input: Any) -> str:
 
 
 def _execution_options_digest(tool_name: str, tool_input: Any) -> str:
-    if not _is_exec_command_tool(tool_name):
+    if _tool_family(tool_name) not in {"bash", "exec_command"}:
         return hashlib.sha256(b"{}").hexdigest()
     if not isinstance(tool_input, dict):
         return ""
@@ -2796,6 +2800,25 @@ def _git_runner_command(
     )
 
 
+def _bound_git_runner_updated_input(
+    tool_name: str,
+    tool_input: Any,
+    runner_command: str,
+) -> dict[str, Any]:
+    if not isinstance(tool_input, dict) or not runner_command:
+        raise RuntimeError("Git runner requires structured command input")
+    command_fields = [key for key in ("cmd", "command") if key in tool_input]
+    if len(command_fields) != 1 or not isinstance(tool_input.get(command_fields[0]), str):
+        raise RuntimeError("Git runner requires exactly one command field")
+    updated_input = dict(tool_input)
+    updated_input[command_fields[0]] = runner_command
+    updated_input["sandbox_permissions"] = "require_escalated"
+    justification = updated_input.get("justification")
+    if not isinstance(justification, str) or not justification.strip():
+        updated_input["justification"] = _GIT_RUNNER_ESCALATION_JUSTIFICATION
+    return updated_input
+
+
 def _git_runner_invocation_shape(command: str) -> bool:
     tokens = _shell_tokens(command)
     if tokens[:1] == ["&"]:
@@ -2804,6 +2827,54 @@ def _git_runner_invocation_shape(command: str) -> bool:
         len(tokens) == 7
         and tokens[1:3] == ["-I", "-S"]
         and tokens[4] == "--run-approved-git"
+    )
+
+
+def _git_runner_command_options_match(
+    permission: dict[str, Any],
+    command_digest: str,
+    execution_options_digest: str,
+    *,
+    original: bool | None = None,
+) -> bool:
+    actual = (command_digest, execution_options_digest)
+    original_pair = (
+        str(permission.get("original_digest") or ""),
+        str(permission.get("execution_options_digest") or ""),
+    )
+    runner_pair = (
+        str(permission.get("digest") or ""),
+        str(permission.get("runner_execution_options_digest") or ""),
+    )
+
+    def pair_matches(expected: tuple[str, str]) -> bool:
+        return bool(all(actual) and all(expected) and actual == expected)
+
+    if original is True:
+        return pair_matches(original_pair)
+    if original is False:
+        return pair_matches(runner_pair)
+    return pair_matches(original_pair) or pair_matches(runner_pair)
+
+
+def _git_runner_posttool_command_options_match(
+    permission: dict[str, Any],
+    command_digest: str,
+    execution_options_digest: str,
+) -> bool:
+    if _git_runner_command_options_match(
+        permission,
+        command_digest,
+        execution_options_digest,
+        original=None,
+    ):
+        return True
+    return bool(
+        command_digest
+        and execution_options_digest
+        and command_digest == str(permission.get("digest") or "")
+        and execution_options_digest
+        == str(permission.get("execution_options_digest") or "")
     )
 
 
@@ -2824,12 +2895,14 @@ def _matching_git_runner_permission(
     if not isinstance(permission, dict) or not permission.get("transaction_id"):
         return None
     token = str(permission.get("runner_token") or "")
-    expected_digest = str(
-        permission.get("original_digest" if original else "digest") or ""
-    )
     return permission if (
         _GIT_RUNNER_TOKEN_RE.fullmatch(token)
-        and command_digest == expected_digest
+        and _git_runner_command_options_match(
+            permission,
+            command_digest,
+            execution_options_digest,
+            original=original,
+        )
         and _git_runner_request_matches_permission(permission)
         and str(permission.get("session_hash") or "") == str(state.get("session_hash") or "")
         and str(permission.get("turn_id") or "") == turn_id
@@ -2837,7 +2910,6 @@ def _matching_git_runner_permission(
         and str(permission.get("tool_name") or "") == tool_name
         and str(permission.get("base_event_cwd") or "") == _normalized_cwd(base_event_cwd)
         and str(permission.get("effective_cwd") or "") == _normalized_cwd(effective_cwd)
-        and str(permission.get("execution_options_digest") or "") == execution_options_digest
     ) else None
 
 
@@ -2860,6 +2932,9 @@ def _git_runner_request_matches_permission(permission: dict[str, Any]) -> bool:
         "operation": str(permission.get("operation") or ""),
         "original_digest": str(permission.get("original_digest") or ""),
         "runner_digest": str(permission.get("digest") or ""),
+        "runner_execution_options_digest": str(
+            permission.get("runner_execution_options_digest") or ""
+        ),
         "scope_hash": str(permission.get("scope_hash") or ""),
         "session_hash": str(permission.get("session_hash") or ""),
         "tool_name": str(permission.get("tool_name") or ""),
@@ -2911,7 +2986,7 @@ def _prepare_git_runner(
     original_command: str,
     original_digest: str,
     effective_cwd: str,
-) -> str:
+) -> dict[str, Any]:
     state = _read_state(session_id)
     pending = state.get("pending_permission_authorizations")
     permission = pending.get(tool_use_id) if isinstance(pending, dict) else None
@@ -2923,12 +2998,19 @@ def _prepare_git_runner(
     existing_token = str(permission.get("runner_token") or "")
     if existing_token:
         command = str(permission.get("runner_command") or "")
+        updated_input = _bound_git_runner_updated_input(
+            tool_name,
+            tool_input,
+            command,
+        )
         if (
             _GIT_RUNNER_TOKEN_RE.fullmatch(existing_token)
             and command
             and _git_runner_path("request", existing_token).exists()
+            and _execution_options_digest(tool_name, updated_input)
+            == str(permission.get("runner_execution_options_digest") or "")
         ):
-            return command
+            return updated_input
         raise RuntimeError("Git runner reservation is no longer reusable")
 
     argv = _shell_tokens(original_command)
@@ -2964,6 +3046,15 @@ def _prepare_git_runner(
         tool_input=tool_input,
     )
     runner_digest = _command_hash(runner_command, effective_cwd)
+    updated_input = _bound_git_runner_updated_input(
+        tool_name,
+        tool_input,
+        runner_command,
+    )
+    runner_execution_options_digest = _execution_options_digest(
+        tool_name,
+        updated_input,
+    )
     request = {
         "argv": argv,
         "base_event_cwd": str(permission.get("base_event_cwd") or ""),
@@ -2974,6 +3065,7 @@ def _prepare_git_runner(
         "operation": operation,
         "original_digest": original_digest,
         "runner_digest": runner_digest,
+        "runner_execution_options_digest": runner_execution_options_digest,
         "scope_hash": str(permission.get("scope_hash") or ""),
         "session_id": session_id,
         "session_hash": str(permission.get("session_hash") or ""),
@@ -3040,6 +3132,7 @@ def _prepare_git_runner(
                 "digest": runner_digest,
                 "original_digest": original_digest,
                 "runner_command": runner_command,
+                "runner_execution_options_digest": runner_execution_options_digest,
                 "runner_request_digest": _git_runner_request_digest(request),
                 "runner_token": token,
             }
@@ -3050,7 +3143,7 @@ def _prepare_git_runner(
     except Exception:
         _unlink_owned_regular(request_path)
         raise
-    return runner_command
+    return updated_input
 
 
 def _clear_git_transaction_state(state: dict[str, Any], transaction_id: str) -> None:
@@ -3107,9 +3200,13 @@ def _validate_git_runner_request(
     argv = request.get("argv")
     cwd = str(request.get("effective_cwd") or "")
     created_at = request.get("created_at")
+    execution_options_digest = str(request.get("execution_options_digest") or "")
     operation = str(request.get("operation") or "")
     original_digest = str(request.get("original_digest") or "")
     runner_digest = str(request.get("runner_digest") or "")
+    runner_execution_options_digest = str(
+        request.get("runner_execution_options_digest") or ""
+    )
     session_id = str(request.get("session_id") or "")
     session_hash = str(request.get("session_hash") or "")
     if (
@@ -3122,8 +3219,10 @@ def _validate_git_runner_request(
         or isinstance(created_at, bool)
         or not 0 <= time.time() - float(created_at) <= _GIT_RUNNER_TTL_SECONDS
         or operation not in _SCOPED_TRANSACTION_OPERATIONS
+        or not execution_options_digest
         or not original_digest
         or not runner_digest
+        or not runner_execution_options_digest
         or not session_id
         or len(session_id) > 512
         or hashlib.sha256(session_id.encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -3585,6 +3684,8 @@ def _claim_git_runner_request(
             != str(request.get("turn_id") or "")
             or str(permission.get("execution_options_digest") or "")
             != str(request.get("execution_options_digest") or "")
+            or str(permission.get("runner_execution_options_digest") or "")
+            != str(request.get("runner_execution_options_digest") or "")
             or permission.get("runner_claimed_at")
             or not isinstance(grant, dict)
             or str(grant.get("transaction_id") or "") != transaction_id
@@ -3721,6 +3822,9 @@ def _run_approved_git_with_lease(token: str) -> int:
         "operation": str(request.get("operation") or ""),
         "original_digest": str(request.get("original_digest") or ""),
         "remote_succeeded": remote_succeeded,
+        "runner_execution_options_digest": str(
+            request.get("runner_execution_options_digest") or ""
+        ),
         "scope_hash": str(request.get("scope_hash") or ""),
         "session_hash": str(request.get("session_hash") or ""),
         "tool_use_id": str(request.get("tool_use_id") or ""),
@@ -3758,6 +3862,9 @@ def _consume_git_runner_status(permission: dict[str, Any]) -> str:
         "execution_options_digest": str(permission.get("execution_options_digest") or ""),
         "operation": str(permission.get("operation") or ""),
         "original_digest": str(permission.get("original_digest") or ""),
+        "runner_execution_options_digest": str(
+            permission.get("runner_execution_options_digest") or ""
+        ),
         "scope_hash": str(permission.get("scope_hash") or ""),
         "session_hash": str(permission.get("session_hash") or ""),
         "tool_use_id": str(permission.get("tool_use_id") or ""),
@@ -6626,6 +6733,25 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
             return _deny_permission(
                 "The approved Git transaction must execute through its bound runner."
             )
+        updated_input = _bound_git_runner_updated_input(
+            tool_name,
+            tool_input,
+            str(original_runner_permission.get("runner_command") or ""),
+        )
+        if (
+            _execution_options_digest(tool_name, updated_input)
+            != str(
+                original_runner_permission.get("runner_execution_options_digest")
+                or ""
+            )
+        ):
+            _revoke_git_transaction(
+                session_id,
+                str(original_runner_permission.get("transaction_id") or ""),
+            )
+            return _deny_pretool(
+                "The Git transaction runner execution options changed after binding."
+            )
         output = _context(
             "PreToolUse",
             "The scoped authorization remains active for this exact transaction step.",
@@ -6633,9 +6759,7 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         output["hookSpecificOutput"].update(
             {
                 "permissionDecision": "allow",
-                "updatedInput": {
-                    "command": str(original_runner_permission.get("runner_command") or "")
-                },
+                "updatedInput": updated_input,
             }
         )
         return output
@@ -7040,7 +7164,7 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
         )
         if dangerous and isinstance(permission, dict) and permission.get("transaction_id"):
             try:
-                runner_command = _prepare_git_runner(
+                updated_input = _prepare_git_runner(
                     session_id,
                     tool_use_id=tool_use_id,
                     tool_name=tool_name,
@@ -7056,7 +7180,7 @@ def _handle_tool_gate(event: dict[str, Any]) -> dict[str, Any]:
             output["hookSpecificOutput"].update(
                 {
                     "permissionDecision": "allow",
-                    "updatedInput": {"command": runner_command},
+                    "updatedInput": updated_input,
                 }
             )
         return output
@@ -7103,20 +7227,39 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
         permission_matches = bool(
             isinstance(permission, dict)
             and not validation_error
-            and digest
             and str(permission.get("session_hash") or "")
             == str(state.get("session_hash") or "")
             and str(permission.get("turn_id") or "") == event_turn
             and str(permission.get("tool_use_id") or "") == tool_use_id
             and str(permission.get("tool_name") or "") == tool_name
-            and digest == str(permission.get("digest") or "")
             and str(permission.get("base_event_cwd") or "")
             == _normalized_cwd(base_event_cwd)
             and str(permission.get("effective_cwd") or "")
             == _normalized_cwd(event_cwd)
-            and str(permission.get("execution_options_digest") or "")
-            == execution_options_digest
+            and (
+                _git_runner_posttool_command_options_match(
+                    permission,
+                    digest,
+                    execution_options_digest,
+                )
+                if permission.get("runner_token")
+                else bool(
+                    digest
+                    and digest == str(permission.get("digest") or "")
+                    and str(permission.get("execution_options_digest") or "")
+                    == execution_options_digest
+                )
+            )
         )
+        if (
+            isinstance(permission, dict)
+            and permission.get("runner_token")
+            and not permission_matches
+        ):
+            transaction_id = str(permission.get("transaction_id") or "")
+            _clear_git_transaction_state(state, transaction_id)
+            _cleanup_git_runner_transaction_records(transaction_id)
+            permission = None
         if isinstance(pending, dict) and permission_matches:
             pending.pop(tool_use_id, None)
             state["pending_permission_authorizations"] = pending
