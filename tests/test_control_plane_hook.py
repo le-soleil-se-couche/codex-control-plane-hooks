@@ -375,14 +375,14 @@ class HookProtocolTests(unittest.TestCase):
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
         output = pretool.get("hookSpecificOutput") or {}
         self.assertNotEqual("deny", output.get("permissionDecision"), pretool)
-        runner_command = str((output.get("updatedInput") or {}).get("command") or "")
+        updated_input = output.get("updatedInput") or {}
+        self.assertIsInstance(updated_input, dict, pretool)
+        command_key = "cmd" if "cmd" in updated_input else "command"
+        runner_command = str(updated_input.get(command_key) or "")
         self.assertTrue(runner_command, pretool)
 
         rewritten_event = dict(event)
-        rewritten_input = dict(event.get("tool_input") or {})
-        command_key = "cmd" if "cmd" in rewritten_input else "command"
-        rewritten_input[command_key] = runner_command
-        rewritten_event["tool_input"] = rewritten_input
+        rewritten_event["tool_input"] = dict(updated_input)
         permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten_event}
         )
@@ -414,7 +414,7 @@ class HookProtocolTests(unittest.TestCase):
             runner_argv = ["/bin/sh", "-c", runner_command]
         completed = subprocess.run(
             runner_argv,
-            cwd=str(event.get("cwd") or DEFAULT_CWD),
+            cwd=str(updated_input.get("workdir") or event.get("cwd") or DEFAULT_CWD),
             text=True,
             capture_output=True,
             env=environment,
@@ -429,6 +429,36 @@ class HookProtocolTests(unittest.TestCase):
             }
         )
         return pretool, completed, posttool, token
+
+    def prepare_exec_add_transaction(
+        self,
+        name: str,
+        *,
+        command_key: str = "cmd",
+        **options: object,
+    ) -> tuple[Path, str, dict, Path]:
+        repo = Path(self.data_dir) / name
+        repo.mkdir()
+        (repo / "README.md").write_text("bound runner\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        add = f"git -C {repo} add README.md"
+        commit = f'git -C {repo} commit -m "fix: bound runner"'
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{add}`\n`{commit}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=str(repo),
+        )
+        tool_input = {command_key: add, "workdir": str(repo), **options}
+        event = {
+            "tool_name": "exec_command",
+            "tool_use_id": f"{name}-add",
+            "tool_input": tool_input,
+            "cwd": str(repo),
+        }
+        state_hash = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
+        state_path = Path(self.data_dir) / f"session-{state_hash}.json"
+        return repo, commit, event, state_path
 
     def exec_command(
         self,
@@ -3115,13 +3145,15 @@ public static class Program {
                 "cwd": repo,
             }
         )
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
+        updated_input = dict(pretool["hookSpecificOutput"]["updatedInput"])
+        self.assertEqual("require_escalated", updated_input["sandbox_permissions"])
+        self.assertTrue(updated_input["justification"])
         permission = self.run_hook(
             {
                 "hook_event_name": "PermissionRequest",
                 "tool_name": "Bash",
                 "tool_use_id": tool_use_id,
-                "tool_input": {"command": runner_command},
+                "tool_input": updated_input,
                 "cwd": repo,
             }
         )
@@ -6437,9 +6469,10 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
         rewritten_event = dict(event)
-        rewritten_event["tool_input"] = {"command": runner_command}
+        rewritten_event["tool_input"] = dict(
+            pretool["hookSpecificOutput"]["updatedInput"]
+        )
         permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten_event}
         )
@@ -6557,6 +6590,346 @@ public static class Program {
             with self.subTest(response=response):
                 self.assertEqual(expected, module._tool_response_status(response))
 
+    def test_bound_runner_updated_input_preserves_exec_shape_and_escalates(self) -> None:
+        module = __import__("control_plane_hook")
+        runner_command = "python runner.py --run-approved-git"
+        preserved = {
+            "workdir": self.data_dir,
+            "shell": "/bin/zsh",
+            "login": False,
+            "tty": True,
+            "yield_time_ms": 1234,
+            "max_output_tokens": 4321,
+        }
+        cases = (
+            ("exec_command", "cmd", "use_default", None),
+            ("Bash", "command", "use_default", None),
+            (
+                "exec_command",
+                "command",
+                "require_escalated",
+                "Keep this exact approval question?",
+            ),
+        )
+        for tool_name, command_key, sandbox, justification in cases:
+            with self.subTest(
+                tool_name=tool_name,
+                command_key=command_key,
+                sandbox=sandbox,
+            ):
+                original = {
+                    command_key: "git add README.md",
+                    "sandbox_permissions": sandbox,
+                    **preserved,
+                }
+                if justification is not None:
+                    original["justification"] = justification
+                before = dict(original)
+                updated = module._bound_git_runner_updated_input(
+                    tool_name,
+                    original,
+                    runner_command,
+                )
+                self.assertEqual(before, original)
+                self.assertEqual(runner_command, updated[command_key])
+                other_key = "command" if command_key == "cmd" else "cmd"
+                self.assertNotIn(other_key, updated)
+                for key, value in preserved.items():
+                    self.assertEqual(value, updated[key])
+                self.assertEqual("require_escalated", updated["sandbox_permissions"])
+                self.assertEqual(
+                    justification or module._GIT_RUNNER_ESCALATION_JUSTIFICATION,
+                    updated["justification"],
+                )
+
+    def test_windows_bound_runner_preserves_powershell_and_pwsh_shape(self) -> None:
+        module = __import__("control_plane_hook")
+        runner_id = "a" * 32
+        with mock.patch.object(module.os, "name", "nt"):
+            for command_key, shell in (("cmd", "powershell"), ("command", "pwsh")):
+                with self.subTest(command_key=command_key, shell=shell):
+                    original = {
+                        command_key: "git add README.md",
+                        "workdir": self.data_dir,
+                        "shell": shell,
+                        "login": False,
+                        "tty": False,
+                    }
+                    shell_kind = module._git_runner_shell_kind(
+                        "exec_command",
+                        original,
+                    )
+                    runner_command = module._render_git_runner_command(
+                        [
+                            r"C:\Program Files\Python\python.exe",
+                            "-I",
+                            "-S",
+                            r"C:\plugin\control_plane_hook.py",
+                            "--run-approved-git",
+                            runner_id,
+                            r"C:\plugin-data",
+                        ],
+                        shell_kind,
+                    )
+                    updated = module._bound_git_runner_updated_input(
+                        "exec_command",
+                        original,
+                        runner_command,
+                    )
+                    self.assertTrue(runner_command.startswith("& '"), runner_command)
+                    self.assertIn(f"'{runner_id}'", runner_command)
+                    self.assertEqual(shell, updated["shell"])
+                    self.assertEqual(runner_command, updated[command_key])
+                    self.assertEqual(
+                        "require_escalated", updated["sandbox_permissions"]
+                    )
+
+    def test_ordinary_exec_command_is_not_upgraded(self) -> None:
+        tool_input = {
+            "cmd": "pwd",
+            "workdir": self.data_dir,
+            "sandbox_permissions": "use_default",
+        }
+        before = dict(tool_input)
+        result = self.run_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "exec_command",
+                "tool_use_id": "ordinary-exec-command",
+                "tool_input": tool_input,
+                "cwd": self.data_dir,
+            }
+        )
+        self.assertEqual({}, result)
+        self.assertEqual(before, tool_input)
+
+    def test_exec_runner_rewrite_binds_original_and_runner_option_pairs(self) -> None:
+        module = __import__("control_plane_hook")
+        cases = (
+            ("cmd", "use_default", None),
+            ("command", "require_escalated", "Preserve this approval question?"),
+        )
+        for index, (command_key, sandbox, justification) in enumerate(cases):
+            with self.subTest(command_key=command_key, sandbox=sandbox):
+                self.session = f"runner-option-pairs-{index}"
+                self.turn = f"runner-option-pairs-turn-{index}"
+                options: dict[str, object] = {
+                    "shell": "/bin/zsh",
+                    "login": False,
+                    "tty": True,
+                    "yield_time_ms": 1234,
+                    "max_output_tokens": 4321,
+                    "sandbox_permissions": sandbox,
+                }
+                if justification is not None:
+                    options["justification"] = justification
+                _, _, event, state_path = self.prepare_exec_add_transaction(
+                    f"runner-option-pairs-{index}",
+                    command_key=command_key,
+                    **options,
+                )
+                original_input = dict(event["tool_input"])
+                pretool = self.run_hook(
+                    {"hook_event_name": "PreToolUse", **event}
+                )
+                updated = pretool["hookSpecificOutput"]["updatedInput"]
+                self.assertEqual(
+                    set(original_input) | {"justification"},
+                    set(updated),
+                )
+                self.assertEqual(
+                    "require_escalated", updated["sandbox_permissions"]
+                )
+                for key in (
+                    "workdir",
+                    "shell",
+                    "login",
+                    "tty",
+                    "yield_time_ms",
+                    "max_output_tokens",
+                ):
+                    self.assertEqual(original_input[key], updated[key])
+                self.assertEqual(
+                    justification or module._GIT_RUNNER_ESCALATION_JUSTIFICATION,
+                    updated["justification"],
+                )
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                pending = state["pending_permission_authorizations"][
+                    event["tool_use_id"]
+                ]
+                original_options_digest = module._execution_options_digest(
+                    "exec_command", original_input
+                )
+                runner_options_digest = module._execution_options_digest(
+                    "exec_command", updated
+                )
+                self.assertEqual(
+                    original_options_digest,
+                    pending["execution_options_digest"],
+                )
+                self.assertEqual(
+                    runner_options_digest,
+                    pending["runner_execution_options_digest"],
+                )
+                if sandbox == "use_default":
+                    self.assertNotEqual(
+                        original_options_digest,
+                        runner_options_digest,
+                    )
+                else:
+                    self.assertEqual(
+                        original_options_digest,
+                        runner_options_digest,
+                    )
+                rewritten = {**event, "tool_input": dict(updated)}
+                permission = self.run_hook(
+                    {"hook_event_name": "PermissionRequest", **rewritten}
+                )
+                self.assertEqual(
+                    "allow",
+                    permission["hookSpecificOutput"]["decision"]["behavior"],
+                )
+
+    def test_runner_permission_rejects_option_drift_and_crossed_pairs(self) -> None:
+        cases = (
+            ("sandbox", {"sandbox_permissions": "use_default"}),
+            ("shell", {"shell": "/bin/bash"}),
+            ("login", {"login": False}),
+            ("tty", {"tty": True}),
+            ("workdir", {"workdir": "other"}),
+            ("runner-command-original-options", {}),
+            ("original-command-runner-options", {}),
+        )
+        for index, (name, change) in enumerate(cases):
+            with self.subTest(name=name):
+                self.session = f"runner-option-drift-{index}"
+                self.turn = f"runner-option-drift-turn-{index}"
+                repo, _, event, state_path = self.prepare_exec_add_transaction(
+                    f"runner-option-drift-{index}",
+                    shell="/bin/zsh",
+                    login=True,
+                    tty=False,
+                    sandbox_permissions="use_default",
+                )
+                original = dict(event["tool_input"])
+                pretool = self.run_hook(
+                    {"hook_event_name": "PreToolUse", **event}
+                )
+                updated = dict(pretool["hookSpecificOutput"]["updatedInput"])
+                if name == "runner-command-original-options":
+                    drifted = dict(original)
+                    drifted["cmd"] = updated["cmd"]
+                elif name == "original-command-runner-options":
+                    drifted = dict(updated)
+                    drifted["cmd"] = original["cmd"]
+                else:
+                    drifted = dict(updated)
+                    if name == "workdir":
+                        other = repo / "other"
+                        other.mkdir()
+                        drifted["workdir"] = str(other)
+                    else:
+                        drifted.update(change)
+                denied = self.run_hook(
+                    {
+                        "hook_event_name": "PermissionRequest",
+                        **event,
+                        "tool_input": drifted,
+                    }
+                )
+                self.assertEqual(
+                    "deny",
+                    denied["hookSpecificOutput"]["decision"]["behavior"],
+                )
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertIsNone(state["local_git_grant"])
+                self.assertEqual({}, state["pending_permission_authorizations"])
+
+    def test_exec_runner_receipt_consumes_with_exact_rewritten_input(self) -> None:
+        repo, _, event, state_path = self.prepare_exec_add_transaction(
+            "exec-runner-receipt",
+            shell="/bin/zsh",
+            login=False,
+            tty=False,
+            yield_time_ms=250,
+            max_output_tokens=2048,
+            sandbox_permissions="use_default",
+        )
+        pretool, completed, posttool, runner_id = self.run_transaction_command(event)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual({}, posttool)
+        updated = pretool["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual("require_escalated", updated["sandbox_permissions"])
+        self.assertEqual("/bin/zsh", updated["shell"])
+        staged = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(["README.md"], staged)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertNotIn(
+            event["tool_use_id"], state["pending_permission_authorizations"]
+        )
+        grant = state["local_git_grant"]
+        self.assertIsInstance(grant, dict)
+        scope_hash = next(iter(grant["bindings"]))
+        self.assertIn("add", grant["consumed_operations"][scope_hash])
+        self.assertFalse(
+            (Path(self.data_dir) / f".git-runner-status-{runner_id}.json").exists()
+        )
+
+    def test_posttool_runner_option_drift_revokes_verified_receipt(self) -> None:
+        _, commit, event, state_path = self.prepare_exec_add_transaction(
+            "posttool-runner-option-drift",
+            shell="/bin/zsh",
+            login=True,
+            tty=False,
+            sandbox_permissions="use_default",
+        )
+        pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+        updated = dict(pretool["hookSpecificOutput"]["updatedInput"])
+        rewritten = {**event, "tool_input": updated}
+        permission = self.run_hook(
+            {"hook_event_name": "PermissionRequest", **rewritten}
+        )
+        self.assertEqual(
+            "allow", permission["hookSpecificOutput"]["decision"]["behavior"]
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        runner_id = state["pending_permission_authorizations"][event["tool_use_id"]][
+            "runner_token"
+        ]
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--run-approved-git",
+                runner_id,
+                self.data_dir,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        drifted = dict(updated)
+        drifted["sandbox_permissions"] = "use_default"
+        self.run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                **event,
+                "tool_input": drifted,
+                "tool_response": {"exit_code": 0},
+            }
+        )
+        revoked = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(revoked["local_git_grant"])
+        self.assertEqual({}, revoked["pending_permission_authorizations"])
+        denied = self.bash(commit, cwd=self.data_dir)
+        self.assertEqual("deny", denied["hookSpecificOutput"]["permissionDecision"])
+
     def test_string_tool_success_consumes_verified_add_operation(self) -> None:
         repo = Path(self.data_dir) / "string-tool-success"
         repo.mkdir()
@@ -6632,10 +7005,10 @@ public static class Program {
         }
         first = self.run_hook({"hook_event_name": "PreToolUse", **event})
         second = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        first_runner = first["hookSpecificOutput"]["updatedInput"]["command"]
+        first_updated = dict(first["hookSpecificOutput"]["updatedInput"])
         self.assertEqual(
-            first_runner,
-            second["hookSpecificOutput"]["updatedInput"]["command"],
+            first_updated,
+            second["hookSpecificOutput"]["updatedInput"],
         )
         self.assertEqual(
             1,
@@ -6646,7 +7019,7 @@ public static class Program {
             "deny", direct["hookSpecificOutput"]["decision"]["behavior"]
         )
         rewritten = dict(event)
-        rewritten["tool_input"] = {"command": first_runner}
+        rewritten["tool_input"] = first_updated
         allowed = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten}
         )
@@ -6767,13 +7140,13 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
+        updated_input = dict(pretool["hookSpecificOutput"]["updatedInput"])
         state_path = next(Path(self.data_dir).glob("session-*.json"))
         state = json.loads(state_path.read_text(encoding="utf-8"))
         permission = state["pending_permission_authorizations"]["missing-ticket-add"]
         (Path(self.data_dir) / f".git-runner-request-{permission['runner_token']}.json").unlink()
         rewritten = dict(event)
-        rewritten["tool_input"] = {"command": runner_command}
+        rewritten["tool_input"] = updated_input
         denied = self.run_hook({"hook_event_name": "PermissionRequest", **rewritten})
         self.assertEqual("deny", denied["hookSpecificOutput"]["decision"]["behavior"])
         failed_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -6800,7 +7173,7 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
+        updated_input = dict(pretool["hookSpecificOutput"]["updatedInput"])
         state_path = next(Path(self.data_dir).glob("session-*.json"))
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["pending_permission_authorizations"]["claimed-ticket-add"][
@@ -6808,7 +7181,7 @@ public static class Program {
         ] = time.time()
         state_path.write_text(json.dumps(state), encoding="utf-8")
         rewritten = dict(event)
-        rewritten["tool_input"] = {"command": runner_command}
+        rewritten["tool_input"] = updated_input
         denied = self.run_hook({"hook_event_name": "PermissionRequest", **rewritten})
         self.assertEqual("deny", denied["hookSpecificOutput"]["decision"]["behavior"])
         failed_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -6835,7 +7208,8 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
+        updated_input = dict(pretool["hookSpecificOutput"]["updatedInput"])
+        runner_command = updated_input["command"]
         state_path = next(Path(self.data_dir).glob("session-*.json"))
         state = json.loads(state_path.read_text(encoding="utf-8"))
         permission = state["pending_permission_authorizations"]["altered-runner-add"]
@@ -6845,7 +7219,8 @@ public static class Program {
         self.assertNotEqual(runner_command, altered)
 
         rewritten = dict(event)
-        rewritten["tool_input"] = {"command": altered}
+        updated_input["command"] = altered
+        rewritten["tool_input"] = updated_input
         denied = self.run_hook({"hook_event_name": "PermissionRequest", **rewritten})
         self.assertEqual("deny", denied["hookSpecificOutput"]["decision"]["behavior"])
         failed_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -6947,9 +7322,10 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
         rewritten = dict(event)
-        rewritten["tool_input"] = {"command": runner_command}
+        rewritten["tool_input"] = dict(
+            pretool["hookSpecificOutput"]["updatedInput"]
+        )
         permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten}
         )
@@ -7042,9 +7418,10 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
         rewritten = dict(event)
-        rewritten["tool_input"] = {"command": runner_command}
+        rewritten["tool_input"] = dict(
+            pretool["hookSpecificOutput"]["updatedInput"]
+        )
         permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten}
         )
@@ -7181,8 +7558,10 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
-        rewritten = {**event, "tool_input": {"command": runner_command}}
+        rewritten = {
+            **event,
+            "tool_input": dict(pretool["hookSpecificOutput"]["updatedInput"]),
+        }
         permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten}
         )
@@ -7369,8 +7748,10 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
-        rewritten = {**event, "tool_input": {"command": runner_command}}
+        rewritten = {
+            **event,
+            "tool_input": dict(pretool["hookSpecificOutput"]["updatedInput"]),
+        }
         permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten}
         )
@@ -7453,9 +7834,10 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
         rewritten = dict(event)
-        rewritten["tool_input"] = {"command": runner_command}
+        rewritten["tool_input"] = dict(
+            pretool["hookSpecificOutput"]["updatedInput"]
+        )
         permission = self.run_hook(
             {"hook_event_name": "PermissionRequest", **rewritten}
         )
@@ -7639,9 +8021,10 @@ public static class Program {
             "cwd": self.data_dir,
         }
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
-        runner_command = pretool["hookSpecificOutput"]["updatedInput"]["command"]
         rewritten_event = dict(event)
-        rewritten_event["tool_input"] = {"command": runner_command}
+        rewritten_event["tool_input"] = dict(
+            pretool["hookSpecificOutput"]["updatedInput"]
+        )
         self.run_hook(
             {
                 "hook_event_name": "PostToolUse",

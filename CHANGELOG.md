@@ -4,6 +4,8 @@ All notable changes are documented here. The project follows Semantic Versioning
 
 ## [Unreleased]
 
+- Rewrote approved Git runners with their complete bound command-tool input, preserving the original command key and execution shape while forcing only the runner to `sandbox_permissions=require_escalated`. Original and runner command/options digests are now paired independently through permission and receipt validation, so sandbox downgrade plus shell, working-directory, TTY, or login drift fails closed without changing ordinary command permissions.
+
 ## [0.2.8] - 2026-07-30
 
 - Moved stale Git-runner and isolated-push cleanup out of the Hook decision process into an isolated, detached worker launched only by approved-Git runner startup. Housekeeping can no longer consume the Hook authorization path's six-second budget or suppress its result. A user-scoped temporary lock establishes nonblocking single-flight before the worker validates plugin data; a persisted cursor advances the active window across stable directory listings. Each best-effort run admits at most 64 directory candidates into that window, attempts at most two directory removals, caps each removal child at 500 ms, and applies a one-second cleanup deadline after candidate enumeration yields control. Filesystem enumeration itself cannot be given a portable hard timeout.
