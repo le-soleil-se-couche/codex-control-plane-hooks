@@ -2835,19 +2835,46 @@ def _git_runner_command_options_match(
     command_digest: str,
     execution_options_digest: str,
     *,
-    original: bool,
+    original: bool | None = None,
 ) -> bool:
-    command_key = "original_digest" if original else "digest"
-    options_key = (
-        "execution_options_digest"
-        if original
-        else "runner_execution_options_digest"
+    actual = (command_digest, execution_options_digest)
+    original_pair = (
+        str(permission.get("original_digest") or ""),
+        str(permission.get("execution_options_digest") or ""),
     )
+    runner_pair = (
+        str(permission.get("digest") or ""),
+        str(permission.get("runner_execution_options_digest") or ""),
+    )
+
+    def pair_matches(expected: tuple[str, str]) -> bool:
+        return bool(all(actual) and all(expected) and actual == expected)
+
+    if original is True:
+        return pair_matches(original_pair)
+    if original is False:
+        return pair_matches(runner_pair)
+    return pair_matches(original_pair) or pair_matches(runner_pair)
+
+
+def _git_runner_posttool_command_options_match(
+    permission: dict[str, Any],
+    command_digest: str,
+    execution_options_digest: str,
+) -> bool:
+    if _git_runner_command_options_match(
+        permission,
+        command_digest,
+        execution_options_digest,
+        original=None,
+    ):
+        return True
     return bool(
         command_digest
         and execution_options_digest
-        and command_digest == str(permission.get(command_key) or "")
-        and execution_options_digest == str(permission.get(options_key) or "")
+        and command_digest == str(permission.get("digest") or "")
+        and execution_options_digest
+        == str(permission.get("execution_options_digest") or "")
     )
 
 
@@ -7210,11 +7237,10 @@ def _handle_post_tool(event: dict[str, Any]) -> dict[str, Any]:
             and str(permission.get("effective_cwd") or "")
             == _normalized_cwd(event_cwd)
             and (
-                _git_runner_command_options_match(
+                _git_runner_posttool_command_options_match(
                     permission,
                     digest,
                     execution_options_digest,
-                    original=False,
                 )
                 if permission.get("runner_token")
                 else bool(

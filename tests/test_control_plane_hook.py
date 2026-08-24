@@ -460,6 +460,32 @@ class HookProtocolTests(unittest.TestCase):
         state_path = Path(self.data_dir) / f"session-{state_hash}.json"
         return repo, commit, event, state_path
 
+    def prepare_bash_add_transaction(
+        self,
+        name: str,
+    ) -> tuple[Path, str, dict, Path]:
+        repo = Path(self.data_dir) / name
+        repo.mkdir()
+        (repo / "README.md").write_text("bound runner\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        add = f"git -C {repo} add README.md"
+        commit = f'git -C {repo} commit -m "fix: bound runner"'
+        self.prompt(
+            "本轮批准你依次执行以下字面命令：\n"
+            f"`{add}`\n`{commit}`\n"
+            "权限只覆盖以上字面命令；其余 Git 操作均未授权。",
+            cwd=str(repo),
+        )
+        event = {
+            "tool_name": "Bash",
+            "tool_use_id": f"{name}-add",
+            "tool_input": {"command": add},
+            "cwd": str(repo),
+        }
+        state_hash = hashlib.sha256(self.session.encode("utf-8")).hexdigest()[:24]
+        state_path = Path(self.data_dir) / f"session-{state_hash}.json"
+        return repo, commit, event, state_path
+
     def exec_command(
         self,
         command: str,
@@ -6848,50 +6874,85 @@ public static class Program {
                 self.assertIsNone(state["local_git_grant"])
                 self.assertEqual({}, state["pending_permission_authorizations"])
 
-    def test_exec_runner_receipt_consumes_with_exact_rewritten_input(self) -> None:
+    def test_posttool_accepts_strict_original_and_runner_pairs(self) -> None:
         shell = "pwsh" if os.name == "nt" else "/bin/zsh"
-        repo, _, event, state_path = self.prepare_exec_add_transaction(
-            "exec-runner-receipt",
-            shell=shell,
-            login=False,
-            tty=False,
-            yield_time_ms=250,
-            max_output_tokens=2048,
-            sandbox_permissions="use_default",
-        )
-        pretool, completed, posttool, runner_id = self.run_transaction_command(event)
-        self.assertEqual(0, completed.returncode, completed.stderr)
-        self.assertEqual({}, posttool)
-        updated = pretool["hookSpecificOutput"]["updatedInput"]
-        self.assertEqual("require_escalated", updated["sandbox_permissions"])
-        self.assertEqual(shell, updated["shell"])
-        staged = subprocess.run(
-            ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.splitlines()
-        self.assertEqual(["README.md"], staged)
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertNotIn(
-            event["tool_use_id"], state["pending_permission_authorizations"]
-        )
-        grant = state["local_git_grant"]
-        self.assertIsInstance(grant, dict)
-        scope_hash = next(iter(grant["bindings"]))
-        self.assertIn("add", grant["consumed_operations"][scope_hash])
-        self.assertFalse(
-            (Path(self.data_dir) / f".git-runner-status-{runner_id}.json").exists()
-        )
+        for index, posttool_pair in enumerate(("original", "runner")):
+            with self.subTest(posttool_pair=posttool_pair):
+                self.session = f"posttool-valid-pair-{index}"
+                self.turn = f"posttool-valid-pair-turn-{index}"
+                repo, _, event, state_path = self.prepare_exec_add_transaction(
+                    f"posttool-valid-pair-{index}",
+                    shell=shell,
+                    login=False,
+                    tty=False,
+                    yield_time_ms=250,
+                    max_output_tokens=2048,
+                    sandbox_permissions="use_default",
+                )
+                original = dict(event["tool_input"])
+                pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+                updated = dict(pretool["hookSpecificOutput"]["updatedInput"])
+                rewritten = {**event, "tool_input": updated}
+                permission = self.run_hook(
+                    {"hook_event_name": "PermissionRequest", **rewritten}
+                )
+                self.assertEqual(
+                    "allow", permission["hookSpecificOutput"]["decision"]["behavior"]
+                )
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                runner_id = state["pending_permission_authorizations"][
+                    event["tool_use_id"]
+                ]["runner_token"]
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPT),
+                        "--run-approved-git",
+                        runner_id,
+                        self.data_dir,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                if posttool_pair == "original":
+                    posttool_input = original
+                else:
+                    posttool_input = updated
+                posttool = self.run_hook(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        **event,
+                        "tool_input": posttool_input,
+                        "tool_response": {"exit_code": 0},
+                    }
+                )
+                self.assertEqual({}, posttool)
+                staged = subprocess.run(
+                    ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                self.assertEqual(["README.md"], staged)
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    event["tool_use_id"], state["pending_permission_authorizations"]
+                )
+                grant = state["local_git_grant"]
+                self.assertIsInstance(grant, dict)
+                scope_hash = next(iter(grant["bindings"]))
+                self.assertIn("add", grant["consumed_operations"][scope_hash])
+                self.assertFalse(
+                    (Path(self.data_dir) / f".git-runner-status-{runner_id}.json").exists()
+                )
 
-    def test_posttool_runner_option_drift_revokes_verified_receipt(self) -> None:
-        shell = "pwsh" if os.name == "nt" else "/bin/zsh"
-        _, commit, event, state_path = self.prepare_exec_add_transaction(
-            "posttool-runner-option-drift",
-            shell=shell,
-            login=True,
-            tty=False,
-            sandbox_permissions="use_default",
+    def test_posttool_accepts_receipted_bash_host_projection(self) -> None:
+        self.session = "posttool-bash-host-projection"
+        self.turn = "posttool-bash-host-projection-turn"
+        repo, _, event, state_path = self.prepare_bash_add_transaction(
+            "posttool-bash-host-projection"
         )
         pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
         updated = dict(pretool["hookSpecificOutput"]["updatedInput"])
@@ -6919,21 +6980,179 @@ public static class Program {
             check=False,
         )
         self.assertEqual(0, completed.returncode, completed.stderr)
-        drifted = dict(updated)
-        drifted["sandbox_permissions"] = "use_default"
-        self.run_hook(
+        projected = {"command": updated["command"]}
+        posttool = self.run_hook(
             {
                 "hook_event_name": "PostToolUse",
                 **event,
-                "tool_input": drifted,
+                "tool_input": projected,
                 "tool_response": {"exit_code": 0},
             }
         )
-        revoked = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertIsNone(revoked["local_git_grant"])
-        self.assertEqual({}, revoked["pending_permission_authorizations"])
-        denied = self.bash(commit, cwd=self.data_dir)
-        self.assertEqual("deny", denied["hookSpecificOutput"]["permissionDecision"])
+        self.assertEqual({}, posttool)
+        staged = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(["README.md"], staged)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertNotIn(event["tool_use_id"], state["pending_permission_authorizations"])
+        grant = state["local_git_grant"]
+        self.assertIsInstance(grant, dict)
+        scope_hash = next(iter(grant["bindings"]))
+        self.assertIn("add", grant["consumed_operations"][scope_hash])
+
+    def test_bash_host_projection_is_rejected_before_posttool(self) -> None:
+        for index, event_name in enumerate(("PreToolUse", "PermissionRequest")):
+            with self.subTest(event_name=event_name):
+                self.session = f"host-projection-gate-{index}"
+                self.turn = f"host-projection-gate-turn-{index}"
+                _, _, event, state_path = self.prepare_bash_add_transaction(
+                    f"host-projection-gate-{index}"
+                )
+                pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+                updated = dict(pretool["hookSpecificOutput"]["updatedInput"])
+                projected = {"command": updated["command"]}
+                denied = self.run_hook(
+                    {
+                        "hook_event_name": event_name,
+                        **event,
+                        "tool_input": projected,
+                    }
+                )
+                output = denied["hookSpecificOutput"]
+                if event_name == "PreToolUse":
+                    self.assertEqual("deny", output["permissionDecision"])
+                else:
+                    self.assertEqual("deny", output["decision"]["behavior"])
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertIsNone(state["local_git_grant"])
+                self.assertEqual({}, state["pending_permission_authorizations"])
+
+    def test_posttool_rejects_crossed_pairs_and_execution_option_drift(self) -> None:
+        shell = "pwsh" if os.name == "nt" else "/bin/zsh"
+        alternate_shell = "powershell" if os.name == "nt" else "/bin/bash"
+        for index, case in enumerate(
+            (
+                "original-command-runner-options",
+                "sandbox-drift",
+                "shell-drift",
+            )
+        ):
+            with self.subTest(case=case):
+                self.session = f"posttool-invalid-pair-{index}"
+                self.turn = f"posttool-invalid-pair-turn-{index}"
+                _, commit, event, state_path = self.prepare_exec_add_transaction(
+                    f"posttool-invalid-pair-{index}",
+                    shell=shell,
+                    login=True,
+                    tty=False,
+                    sandbox_permissions="use_default",
+                )
+                original = dict(event["tool_input"])
+                pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+                updated = dict(pretool["hookSpecificOutput"]["updatedInput"])
+                rewritten = {**event, "tool_input": updated}
+                permission = self.run_hook(
+                    {"hook_event_name": "PermissionRequest", **rewritten}
+                )
+                self.assertEqual(
+                    "allow", permission["hookSpecificOutput"]["decision"]["behavior"]
+                )
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                runner_id = state["pending_permission_authorizations"][
+                    event["tool_use_id"]
+                ]["runner_token"]
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPT),
+                        "--run-approved-git",
+                        runner_id,
+                        self.data_dir,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                if case == "original-command-runner-options":
+                    posttool_input = dict(updated)
+                    posttool_input["cmd"] = original["cmd"]
+                elif case == "sandbox-drift":
+                    posttool_input = dict(updated)
+                    posttool_input.pop("sandbox_permissions")
+                else:
+                    posttool_input = dict(updated)
+                    posttool_input["shell"] = alternate_shell
+                self.run_hook(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        **event,
+                        "tool_input": posttool_input,
+                        "tool_response": {"exit_code": 0},
+                    }
+                )
+                revoked = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertIsNone(revoked["local_git_grant"])
+                self.assertEqual({}, revoked["pending_permission_authorizations"])
+                denied = self.bash(commit, cwd=self.data_dir)
+                self.assertEqual(
+                    "deny", denied["hookSpecificOutput"]["permissionDecision"]
+                )
+
+    def test_posttool_host_projection_requires_valid_private_runner_receipt(self) -> None:
+        module = __import__("control_plane_hook")
+        for index, receipt in enumerate(("missing", "invalid")):
+            with self.subTest(receipt=receipt):
+                self.session = f"posttool-projection-receipt-{index}"
+                self.turn = f"posttool-projection-receipt-turn-{index}"
+                _, commit, event, state_path = self.prepare_bash_add_transaction(
+                    f"posttool-projection-receipt-{index}"
+                )
+                pretool = self.run_hook({"hook_event_name": "PreToolUse", **event})
+                updated = dict(pretool["hookSpecificOutput"]["updatedInput"])
+                rewritten = {**event, "tool_input": updated}
+                permission = self.run_hook(
+                    {"hook_event_name": "PermissionRequest", **rewritten}
+                )
+                self.assertEqual(
+                    "allow", permission["hookSpecificOutput"]["decision"]["behavior"]
+                )
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                pending = state["pending_permission_authorizations"][
+                    event["tool_use_id"]
+                ]
+                runner_id = pending["runner_token"]
+                if receipt == "invalid":
+                    module._write_private_json(
+                        module._git_runner_path("status", runner_id),
+                        {
+                            "completed_at": time.time(),
+                            "exit_code": 0,
+                            "transaction_id": pending["transaction_id"],
+                        },
+                    )
+                projected = {"command": updated["command"]}
+                self.run_hook(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        **event,
+                        "tool_input": projected,
+                        "tool_response": {"exit_code": 0},
+                    }
+                )
+                revoked = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertIsNone(revoked["local_git_grant"])
+                self.assertEqual({}, revoked["pending_permission_authorizations"])
+                for kind in ("request", "running", "status"):
+                    self.assertFalse(module._git_runner_path(kind, runner_id).exists())
+                denied = self.bash(commit, cwd=self.data_dir)
+                self.assertEqual(
+                    "deny", denied["hookSpecificOutput"]["permissionDecision"]
+                )
 
     def test_string_tool_success_consumes_verified_add_operation(self) -> None:
         repo = Path(self.data_dir) / "string-tool-success"

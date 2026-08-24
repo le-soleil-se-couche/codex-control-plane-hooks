@@ -311,11 +311,11 @@ def response_events(state: MockState, index: int, body: dict[str, Any]) -> list[
             for tool in tools
             if isinstance(tool, dict) and isinstance(tool.get("name"), str)
         }
-        if "shell" in names or "shell_command" in names:
+        if "exec_command" in names:
+            tool_name, arguments = "exec_command", {"cmd": command, "yield_time_ms": 10000}
+        elif "shell" in names or "shell_command" in names:
             tool_name = "shell" if "shell" in names else "shell_command"
             arguments = {"command": command}
-        elif "exec_command" in names:
-            tool_name, arguments = "exec_command", {"cmd": command, "yield_time_ms": 10000}
         else:
             raise RuntimeError(f"Codex exposed no supported shell tool: {sorted(names)}")
         item = {
