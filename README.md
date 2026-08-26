@@ -3,19 +3,15 @@
 > Spend expensive model inference on the work itself. Keep repeated approvals, mechanical auto-review, and retry churn small.
 
 > [!CAUTION]
-> **Current maintainer recommendation: disable this Hook for normal Codex work.**
+> **Do not disable the entire plugin if you rely on its other lifecycle hooks.**
 >
-> Repeated real-world Git workflows have been falsely blocked even after the user gave explicit authorization, causing extra approval rounds, retries, and Token spend—the opposite of this project's goal. I do not currently know how to optimize the Git/GitHub authorization design reliably without weakening its intended safeguards, so I recommend leaving the plugin disabled until that path is redesigned.
+> Repeated real-world Git workflows have been falsely blocked even after the user gave explicit authorization, causing extra approval rounds, retries, and Token spend—the opposite of this project's goal.
 >
-> Disable the public plugin with:
+> The blocking path is implemented inside the `PreToolUse` and `PermissionRequest` event handlers, with Git transaction state also passing through `UserPromptSubmit` and `PostToolUse`. It is not a standalone Git hook, and `v0.2.8` does not provide a safe switch that disables only Git/GitHub authorization. Disabling the plugin would disable all eight registered event hooks.
 >
-> ```bash
-> codex plugin disable codex-control-plane-hooks@codex-control-plane-hooks --json
-> ```
+> Temporary workaround for affected installations: remove only the `PreToolUse` and `PermissionRequest` registrations from [`hooks.json`](plugins/codex-control-plane-hooks/hooks/hooks.json), then restart Codex or begin a fresh task. This leaves the other six event hooks registered, but it also removes all pre-execution command checks—not only Git checks—so Codex's native sandbox and approval system become the execution gate.
 >
-> Restart Codex or begin a fresh task after disabling it; an already-running task may retain the Hook state loaded at startup.
->
-> If you can improve this design, please open an [Issue](https://github.com/le-soleil-se-couche/codex-control-plane-hooks/issues) or [Pull Request](https://github.com/le-soleil-se-couche/codex-control-plane-hooks/pulls). Reproductions and fixes for Windows, Linux, and macOS are welcome.
+> I do not currently know how to separate the Git/GitHub authorization path reliably without redesigning it. If you can improve this design, please open an [Issue](https://github.com/le-soleil-se-couche/codex-control-plane-hooks/issues) or [Pull Request](https://github.com/le-soleil-se-couche/codex-control-plane-hooks/pulls). Reproductions and fixes for Windows, Linux, and macOS are welcome.
 
 Codex Control Plane Hooks is a versioned, local guardrail plugin for Codex. It adds event-scoped command checks, one-shot approval transactions, secret and sensitive-data controls, Agent lifecycle tracking, and evidence-backed completion checks.
 
